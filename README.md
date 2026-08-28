@@ -2,7 +2,11 @@
 
 **A low-cost, portable reaction-time and photo-finish system for track & field, built around a single microcontroller.**
 
-> On 4 August 2024, Noah Lyles won the Olympic 100 m final in Paris by **five thousandths of a second** (0.005 s) over Kishane Thompson — a margin smaller than a single frame of standard video. Reaction time is one of the few things an athlete can deliberately train, yet the instruments precise enough to measure it are reserved for elite competitions and cost hundreds of thousands of krona. This project closes that gap. 🎽
+> On 4 August 2024, Noah Lyles won the Olympic 100 m final in Paris by **five thousandths of a second** (0.005 s) over Kishane Thompson — a margin smaller than a single frame of standard video. Reaction time is one of the few things an athlete can deliberately train, yet the instruments precise enough to measure it are reserved for elite competitions and cost hundreds of thousands of krona. This project closes that gap.
+
+---
+
+> 🧭 **Hardware direction under evaluation:** the **Arduino Nano 33 IoT** looks like the best fit so far — it integrates Wi-Fi, Bluetooth/BLE, and a 6-axis IMU (LSM6DS3) on a single Arduino-compatible board, avoiding the need for external IMU wiring. Alternatives considered: the **ESP32-WROOM-32U** (Wi-Fi + BLE, no onboard IMU — would need an external MPU6050/ICM-42688 wired via I2C, as originally planned), and the **M5Stack Core2/StickC** (Wi-Fi + BLE + onboard IMU, plus a built-in display, speaker and mic — trading compactness and Arduino-IDE simplicity for a more all-in-one, if slightly bulkier, package).
 
 ---
 
