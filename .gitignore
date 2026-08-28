@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Flutter/Dart
+prostart/build/
+prostart/.dart_tool/
+prostart/.flutter-plugins
+prostart/.flutter-plugins-dependencies
+prostart/ios/Pods/
+prostart/ios/.symlinks/
