@@ -6,6 +6,14 @@
 
 ---
 
+## 🖼️ System at a glance
+
+![System overview: the starting-block box (button, OLED, speaker, IMU, ESP32 with external antenna, LiPo battery) and the eight-step end-to-end flow from connection and clock calibration, through the local start sequence and reaction-time measurement, to video analysis and results on the phone.](docs/reaction_time_diagram.png)
+
+*The device runs the whole start sequence and computes reaction time locally in microseconds. The phone is used only for calibration, receiving the timestamp, recording video, and post-processing.*
+
+---
+
 > 🧭 **Hardware direction under evaluation:** the **Arduino Nano 33 IoT** looks like the best fit so far — it integrates Wi-Fi, Bluetooth/BLE, and a 6-axis IMU (LSM6DS3) on a single Arduino-compatible board, avoiding the need for external IMU wiring. Alternatives considered: the **ESP32-WROOM-32U** (Wi-Fi + BLE, no onboard IMU — would need an external MPU6050/ICM-42688 wired via I2C, as originally planned), and the **M5Stack Core2/StickC** (Wi-Fi + BLE + onboard IMU, plus a built-in display, speaker and mic — trading compactness and Arduino-IDE simplicity for a more all-in-one, if slightly bulkier, package).
 
 ---
@@ -102,6 +110,8 @@ Reaction-Time-System/
 │   ├── I2C_Scanner/       # I2C bus debug sketch
 │   └── libraries/         # vendored board libraries (Seeed LSM6DS3)
 ├── prostart/              # Flutter companion app
+├── playground_IMU/        # IMU evaluation: notebook, capture, findings
+├── docs/                  # diagrams and figures
 ├── HANDOFF.md             # working notes for the live IMU data view
 └── README.md
 ```
