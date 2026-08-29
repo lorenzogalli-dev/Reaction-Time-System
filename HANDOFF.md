@@ -1,8 +1,13 @@
-# HANDOFF — Prostart live IMU data view
+# HANDOFF — Prostart live IMU data view & sensor evaluation
 
 Last updated: 2026-08-29. Written for an agent starting with no prior context.
 
-## Goal
+Two pieces of work, in order: the live accelerometer view in the Flutter app,
+and then an evaluation of what the captured data says about the sensor's
+suitability for false-start detection. The second is the one with consequences
+for the firmware — see **Sensor evaluation** below.
+
+## Goal (part 1)
 
 Add a live accelerometer view to the Prostart Flutter app, and move device
 connection out of the Home screen.
@@ -24,14 +29,17 @@ All three are implemented. See Next Steps for what remains unverified.
 
 ## Project layout
 
-Note the root `README.md` describes a `firmware/` and `app/` layout that does
-not exist. The real one:
-
 - `prostart/` — Flutter app (Dart, `provider` for state, `flutter_blue_plus` for BLE)
 - `Arduino/BLEtest/BLEtest.ino` — the firmware actually flashed to the board
 - `Arduino/I2C_Scanner/` — I2C debug sketch
 - `Arduino/libraries/Seeed_Arduino_LSM6DS3/` — vendored IMU library
-- `report/` — LaTeX project report
+- `playground_IMU/` — sensor evaluation: notebook, the capture it analyses, and a README of findings
+- `docs/` — diagrams and figures used by the root README
+
+The root `README.md` used to describe a `firmware/` and `app/` layout that does
+not exist; that is now corrected. It still links to `report/main.tex`, but no
+`report/` directory has ever been committed here — left alone deliberately,
+since it may live elsewhere.
 
 Hardware in use for prototyping: **Seeed XIAO nRF52840 Sense** (BLE only),
 onboard **LSM6DS3** IMU at I2C address `0x6A`. The final target per the README
@@ -90,7 +98,19 @@ IMU config, all deliberate departures from the library defaults:
 ### Verified
 
 `flutter analyze` clean, `flutter test` passing (one pre-existing onboarding
-widget test). **Nothing has been run on hardware or a simulator by the agent.**
+widget test).
+
+The end-to-end path has since been exercised **by hand on real hardware**: the
+sketch was flashed, the app connected, the live chart streamed, and a recording
+was exported to CSV — that file is `playground_IMU/prostart_imu_20260829_213017.csv`
+and is the basis of the sensor evaluation below. No agent has run anything on
+hardware or a simulator; treat the automated checks as covering the Dart side
+only.
+
+> `flutter test` may fail to launch on this machine with `Failed to find …
+> flutter_tester`. That is a stale Flutter artifact cache (darwin-x64 tools on
+> an arm64 host), not a code problem — `flutter precache --force --universal`
+> fixes it.
 
 ## What worked
 
@@ -100,35 +120,37 @@ widget test). **Nothing has been run on hardware or a simulator by the agent.**
 
 ## What didn't work — do not repeat
 
-Three debugging dead ends cost real time. All are now fixed, but the reasoning
-matters if similar symptoms return.
+Four debugging dead ends cost real time. All are now fixed, but the reasoning
+matters if similar symptoms return. A fifth — the CSV export failure — is
+written up under the `path_provider_foundation` pin below; its lesson was that
+the error surfaced as "check permissions" when the real cause was a native
+framework that was never embedded.
 
 - **"Device not found" was blamed on the app first.** It was not. The scan and connect path was never touched by this work — `git diff` on `ble_service.dart` was purely additive constants. Check the board before the app: pair with nRF Connect or LightBlue to see whether `BlockStartDevice` is advertising at all. That single check separates firmware problems from app problems in seconds.
 - **`FlutterBluePlus.connectedDevices` cannot find stale connections.** The old `_disconnectStaleConnections()` used it to clean up links surviving a hot restart — but it is a snapshot of an in-memory map built by *this* process, so after a restart it is empty, precisely in the case it was written for. A connected BLE peripheral stops advertising, so the still-live OS link made the board invisible to scanning. Replaced with `_findAlreadyConnectedDevice()`, which uses `FlutterBluePlus.systemDevices([serviceUuid])` (reports links held by any app) and **adopts** the device rather than disconnecting and rescanning. `connect()` is still required to attach it to our app but returns immediately. Note Android ignores the `withServices` argument to `systemDevices`, so there is a local-name fallback; `discoverServices()` is the real verification either way.
-- **`while (!Serial) delay(10);` bricks the sketch on a XIAO.** USB is native on the nRF52840: `Serial` only goes true when a host opens the CDC port. On battery, on a port with no Serial Monitor open, or on a charger, `setup()` blocks there forever and `BLE.advertise()` never runs. Reset makes it worse — it re-enters the block. Now a bounded 3-second wait. **The same pattern is still present in `Arduino/I2C_Scanner/I2C_Scanner.ino`** and in the vendored library examples.
+- **`while (!Serial) delay(10);` bricks the sketch on a XIAO.** USB is native on the nRF52840: `Serial` only goes true when a host opens the CDC port. On battery, on a port with no Serial Monitor open, or on a charger, `setup()` blocks there forever and `BLE.advertise()` never runs. Reset makes it worse — it re-enters the block. Now a bounded 3-second wait, in `BLEtest.ino` and in `I2C_Scanner.ino`. **The pattern is still present in the vendored library examples** — watch for it if you flash one.
 - **Flashing an IMU debug sketch silently removed BLE.** Commit `33e3cd5` edited `Arduino/libraries/.../HighLevelExample.ino`, which contains zero BLE code. With that on the board, no app can ever find it. Obvious in hindsight, invisible from the app side. Now moot, since BLE and IMU live in the same sketch.
 
 ## Next steps
 
-Nothing is blocked; everything below needs hardware.
+Steps 3–5 of the original list are now answered by a real capture (see the
+sensor evaluation below). What remains:
 
 1. **Flash `Arduino/BLEtest/BLEtest.ino`** and watch the Serial Monitor for `IMU OK`. If it prints `IMU error - live data disabled`, BLE still works and reaction time is unaffected — but the live view will be dead. The sketch sets `PIN_LSM6DS3TR_C_POWER` high inside an `#ifdef` (the XIAO Sense IMU has a dedicated power pin; if it stays low `begin()` fails even with I2C wired correctly). If the macro is missing from the installed core, that guard compiles it away and the pin is never driven — check the variant header.
-2. **The sketch has never been compiled.** No `arduino-cli` is installed on this machine. Verify at upload time.
-3. **Confirm the 50 Hz stream end to end.** `RecordingSession.sampleRateHz` on the summary card reports the achieved rate — if it lands well under 50, the connection interval is the first suspect. The sketch requests 15–30 ms via `BLE.setConnectionInterval(12, 24)`, but that is a request and the central decides; iOS in particular may not grant it.
-4. **Sanity-check the axis values.** At rest one axis should read ≈ 1.0 g and the others ≈ 0. If everything is ~4× too small or too large, `accelRange` and the library's `calcAccel` scaling have diverged.
-5. **Test the CSV export on a real device.** The export threw on iOS - see the
-   `path_provider_foundation` note below - and that is fixed, but the share
-   sheet itself is still unexercised. On iPad it is a popover needing an anchor
-   rect; `_export` in `live_data_screen.dart` derives one from the summary
-   card's `RenderBox`. "Save to Files" in the sheet is the save-to-device path.
-## Done since — no hardware needed
+2. **The sketch has never been compiled by an agent.** No `arduino-cli` on this machine. It has since been flashed successfully by hand, so this is largely moot — but no automated check exists.
+3. **Act on the firmware changes** the evaluation calls for (ODR, detector, audio-latency calibration) — listed under *What the evaluation implies for the firmware*.
+4. **Resolve the board question.** The system diagram shows an **ESP32-WROOM-32U with an external IMU**; the README's "Hardware direction under evaluation" note right below it argues for the **Arduino Nano 33 IoT** precisely because it avoids an external IMU. One of the two is stale. Nothing else can be finalised until this is settled.
+5. **Verify the CSV export on iPad.** It works on iPhone (the capture in `playground_IMU/` came out of it). On iPad the share sheet is a popover needing an anchor rect; `_export` in `live_data_screen.dart` derives one from the summary card's `RenderBox`, still unexercised. "Save to Files" is the save-to-device path.
+
+## Fixed since the first draft
 
 - `I2C_Scanner.ino` now uses the same bounded 3 s `Serial` wait as `BLEtest.ino`.
 - `prostartAccelerometerSampleRateHz` is wired into the recording summary line,
-  which now reads `48.7 Hz (nominal 50 Hz)` — giving next step 3 something to
-  compare against directly on screen.
+  which reads e.g. `48.8 Hz (nominal 50 Hz)`.
 - Root `README.md` repository structure and the `cd app` / `firmware/` paths in
-  Getting Started corrected to `Arduino/` and `prostart/`.
+  Getting Started corrected to `Arduino/` and `prostart/`. A system overview
+  diagram was added near the top, from `docs/`.
+- **CSV export on iOS was broken and is fixed** — see the pin below.
 
 ### `path_provider_foundation` is pinned - do not remove the override
 
@@ -136,24 +158,104 @@ Nothing is blocked; everything below needs hardware.
 `objective_c` FFI backend, 2.5.1 reverted it, and 2.6.0 went back to FFI. That
 backend ships as a Flutter *code asset*, only built and embedded into
 `Runner.app` when native assets are enabled (`flutter config` shows
-`enable-native-assets: (Not set)` on stable). Without it every call - including
-the `getTemporaryDirectory()` in `LiveDataController.exportLastSession` -
+`enable-native-assets: (Not set)` on stable). Without it every call — including
+the `getTemporaryDirectory()` in `LiveDataController.exportLastSession` —
 throws `Failed to load dynamic library 'objective_c.framework/objective_c'`.
 
 The tell is `ios/Podfile.lock`: the FFI version registers no pod at all, so
 `path_provider_foundation` was simply absent from it. `pubspec.yaml` now has a
 `dependency_overrides` pinning 2.5.1, the newest pigeon/CocoaPods release.
-`share_plus` was suspected first and is **not** implicated - it stays on 13.3.0.
+`share_plus` was suspected first and is **not** implicated — it stays on 13.3.0.
 
-Remove the override once native assets are on by default on stable, and
-rebuild from scratch (`flutter clean` + `pod install`) when you do.
+Remove the override once native assets are on by default on stable, and rebuild
+from scratch (`flutter clean` + `pod install`) when you do.
 
-Still wrong in the README: it links to `report/main.tex`, but no `report/`
-directory has ever been committed to this repo. Left alone deliberately — it
-may live elsewhere.
+---
+
+## Sensor evaluation — read this before touching the firmware
+
+A 14 s capture was taken from real hardware through the live view and exported
+via the CSV path. Full analysis in **`playground_IMU/`** (notebook with six
+figures, plus a README covering the architecture questions). The headlines:
+
+**The sensor is not the constraint.** Noise floor 0.65 mg (1σ). A light finger
+tap peaks at 196 mg — 300× the noise — and a real block push-off is 1–3 g. A
+20 mg threshold sits ~30σ clear of the noise. Resting magnitude 0.991 g, so
+`accelRange` and the library scaling agree (this closes the old sanity check).
+
+**The BLE stream's timestamps cannot be used for timing.** Arrival intervals are
+bimodal and the nominal 20 ms bin is *empty*: 30% of samples arrive with no
+measurable gap from the previous one, the rest cluster at 29.7 ms. This is
+connection-event batching, and the app timestamps on arrival — so the CSV
+records when a packet was received, not when the sensor was read. A systematic
+±30 ms distortion. Effective rate is 48.8 Hz, so the firmware is producing
+samples correctly; only the delivery is bursty.
+
+This confirms rather than threatens the design: the live stream was always
+meant to be visualization-only, and the single-shot `micros()` "go"
+characteristic exists precisely because of this.
+
+**Do not threshold on |a|.** The capture contains a near-purely lateral tap that
+the vector magnitude under-reports by 4.2× (46 mg vs 196 mg), because horizontal
+acceleration adds in quadrature with gravity on Z. The drive out of the blocks
+is predominantly horizontal, so this is the direction that matters most.
+
+### What the evaluation implies for the firmware
+
+1. **Raise `accelSampleRate` from 104 Hz to 416 or 833 Hz** for the detection
+   path. At 104 Hz quantization alone is σ = 2.8 ms; at 833 Hz it is 0.35 ms.
+   The gyro is already disabled, so the I2C budget is there. Note the current
+   104 Hz is correct *for the 50 Hz visualization stream* — this is about the
+   detection path, which does not exist yet.
+2. **Trigger on horizontal-plane magnitude** `sqrt(dx² + dy²)`, with Z vertical
+   and deltas against a resting baseline captured at "on your marks". Measured
+   on this capture it keeps full sensitivity to both lateral (196 mg) and
+   vertical (128–165 mg) events on a ~1 mg noise floor, and is orientation-
+   independent in the mounting plane.
+3. **Threshold ~20 mg.**
+4. **Calibrate the speaker's audio latency and subtract it.** The "go" timestamp
+   must mark when sound leaves the speaker, not when the code called `play()`.
+   The DAC, amplifier and membrane add 5–20 ms — systematic, always in the same
+   direction, and 5–20% of the false-start threshold if ignored. It is
+   deterministic on an MCU, so one calibration holds: record the GPIO marking
+   `play()` and a microphone next to the speaker on the same time base, measure
+   the delay to the first pressure wave. Re-check if the amp, speaker or sample
+   rate changes.
+
+With those, the reaction-time budget is **σ ≈ 1.2 ms** after calibration — the
+5–20 ms audio figure is systematic and calibratable, not a random error, which
+is why it does not dominate. Well inside a 100 ms rule.
+
+### Scope limit
+
+The events in the capture are **finger taps on a benchtop**, not an athlete
+driving out of blocks. They establish the noise floor, expose the timing
+problem and reveal the magnitude-detector trap — all properties of the hardware
+and data path, all of which transfer. They do **not** validate the threshold
+against real start dynamics, or show whether pre-start fidgeting false-triggers.
+The next capture worth taking is logged **on-device** at 416 Hz+, from a device
+mounted where it will actually live.
+
+The photo-finish clock-synchronization figures in `playground_IMU/README.md`
+are estimates from known BLE/WiFi behaviour, **not measured on this hardware**.
+
+## Conventions
+
+Commit messages in this repo carry **no Claude/Anthropic attribution trailers**
+— no `Co-Authored-By: Claude`, no `Claude-Session:`. The four commits that had
+them were rewritten on 2026-08-29 and force-pushed.
 
 ## State of the tree
 
-Everything described above is committed on `main` (`37060b5` for the live data
-view). Note `prostart/android/build/reports/...` is tracked and is a build
-artifact that probably should not be.
+Everything above is committed and pushed on `main`:
+
+| Commit | What |
+|---|---|
+| `de65ad6` | Live IMU data view, connection moved to Settings |
+| `51900e9` | I2C_Scanner Serial fix, README paths, nominal-rate label |
+| `56e90cb` | CSV export fix (`path_provider_foundation` pin) |
+| `4e8d220` | IMU evaluation (`playground_IMU/`) |
+| `0e701f8` | System overview diagram in the README |
+
+Hashes changed in the 2026-08-29 history rewrite; anything referencing the old
+`37060b5` means `de65ad6`.
