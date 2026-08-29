@@ -97,12 +97,12 @@ Bluetooth (BLE, including BLE 5 Long Range / Coded PHY) was also evaluated as a 
 
 ```
 Reaction-Time-System/
-├── firmware/              # Arduino sketches (.ino), one folder per sketch
-│   ├── I2C_Scanner/
-│   ├── IMU_Test/
-│   └── ReactionTimeBLE/
-├── app/                    # Flutter companion app
-├── report/                 # LaTeX project report (main.tex + figures)
+├── Arduino/               # Arduino sketches (.ino), one folder per sketch
+│   ├── BLEtest/           # firmware actually flashed to the board (BLE + IMU)
+│   ├── I2C_Scanner/       # I2C bus debug sketch
+│   └── libraries/         # vendored board libraries (Seeed LSM6DS3)
+├── prostart/              # Flutter companion app
+├── HANDOFF.md             # working notes for the live IMU data view
 └── README.md
 ```
 
@@ -114,11 +114,11 @@ Reaction-Time-System/
 1. Install [Arduino IDE](https://www.arduino.cc/en/software)
 2. Add your board's package URL under **Preferences → Additional Board Manager URLs**
 3. Install the board package via **Tools → Board → Boards Manager**
-4. Open a sketch from `firmware/`, select the correct board & port, and **Upload**
+4. Open a sketch from `Arduino/`, select the correct board & port, and **Upload**
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)
-2. `cd app && flutter pub get`
+2. `cd prostart && flutter pub get`
 3. `flutter run`
 
 ---

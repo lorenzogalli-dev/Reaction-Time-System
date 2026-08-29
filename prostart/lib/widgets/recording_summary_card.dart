@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/accel_sample.dart';
 import '../models/recording_session.dart';
+import '../services/ble_service.dart' show prostartAccelerometerSampleRateHz;
 import '../theme/app_theme.dart';
 import 'live_accel_chart.dart' show accelAxisColors;
 
@@ -54,7 +55,8 @@ class RecordingSummaryCard extends StatelessWidget {
             session.isEmpty
                 ? 'No samples were captured.'
                 : '${session.samples.length} samples · ${seconds.toStringAsFixed(1)} s · '
-                    '${session.sampleRateHz.toStringAsFixed(1)} Hz',
+                    '${session.sampleRateHz.toStringAsFixed(1)} Hz '
+                    '(nominal $prostartAccelerometerSampleRateHz Hz)',
             style: const TextStyle(fontSize: 13, color: AppColors.textSecondary),
           ),
           if (!session.isEmpty) ...[
