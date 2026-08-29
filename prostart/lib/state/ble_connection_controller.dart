@@ -41,6 +41,20 @@ class BleConnectionController extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
+  List<BluetoothService> _services = const [];
+
+  /// The live-accelerometer notification characteristic on the connected
+  /// device, or null when disconnected / not exposed by this firmware.
+  /// [LiveDataController] subscribes to it for the live data screen.
+  BluetoothCharacteristic? get accelerometerCharacteristic {
+    final service = _firstWhereOrNull(_services, (s) => s.uuid == prostartServiceUuid);
+    if (service == null) return null;
+    return _firstWhereOrNull(
+      service.characteristics,
+      (c) => c.uuid == prostartAccelerometerCharacteristicUuid,
+    );
+  }
+
   int? _lastGoTimestamp;
   int? get lastGoTimestamp => _lastGoTimestamp;
 
@@ -75,6 +89,7 @@ class BleConnectionController extends ChangeNotifier {
         _userInitiatedDisconnect = false;
         _device = device;
         _deviceName = deviceName;
+        _services = services;
         _status = BleAppStatus.connected;
         _errorMessage = null;
         _failureReason = null;
@@ -84,6 +99,7 @@ class BleConnectionController extends ChangeNotifier {
       case BleConnectFailure(:final reason, :final message):
         _device = null;
         _deviceName = null;
+        _services = const [];
         _status = BleAppStatus.error;
         _failureReason = reason;
         _errorMessage = message;
@@ -165,6 +181,7 @@ class BleConnectionController extends ChangeNotifier {
     _goCharacteristicSub = null;
     _device = null;
     _deviceName = null;
+    _services = const [];
     _stage = null;
     _lastGoTimestamp = null;
     if (unexpected) {

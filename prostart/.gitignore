@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Gradle build output (the /build/ rule above is anchored to the project root
+# and misses the per-platform ones)
+android/build/

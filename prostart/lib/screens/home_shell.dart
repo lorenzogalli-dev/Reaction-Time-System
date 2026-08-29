@@ -4,9 +4,10 @@ import '../theme/app_theme.dart';
 import '../widgets/floating_nav_bar.dart';
 import 'home_screen.dart';
 import 'placeholder_screen.dart';
+import 'settings_screen.dart';
 
 /// App shell: hosts the 4 top-level tabs behind a floating bottom nav bar.
-/// Only Home is functional in this MVP; the rest are placeholders.
+/// Home and Settings are functional; Stats and Profile are placeholders.
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -24,11 +25,13 @@ class _HomeShellState extends State<HomeShell> {
     NavItemData(icon: Icons.person_rounded, label: 'Profile'),
   ];
 
-  static const _screens = [
-    HomeScreen(),
-    PlaceholderScreen(title: 'Stats', icon: Icons.bar_chart_rounded),
-    PlaceholderScreen(title: 'Settings', icon: Icons.settings_rounded),
-    PlaceholderScreen(title: 'Profile', icon: Icons.person_rounded),
+  static const _settingsIndex = 2;
+
+  late final List<Widget> _screens = [
+    HomeScreen(onGoToSettings: () => setState(() => _index = _settingsIndex)),
+    const PlaceholderScreen(title: 'Stats', icon: Icons.bar_chart_rounded),
+    const SettingsScreen(),
+    const PlaceholderScreen(title: 'Profile', icon: Icons.person_rounded),
   ];
 
   @override

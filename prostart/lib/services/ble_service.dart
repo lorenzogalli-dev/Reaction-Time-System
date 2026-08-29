@@ -13,6 +13,21 @@ final Guid prostartServiceUuid = Guid('19b10000-e8f2-537e-4f6c-d104768a1214');
 /// unsigned integer timestamp (in microseconds) of the last "go" signal.
 final Guid prostartGoTimestampCharacteristicUuid = Guid('19b10001-e8f2-537e-4f6c-d104768a1214');
 
+/// Live accelerometer stream, notified continuously at ~50 Hz while a client
+/// is subscribed. Payload is 12 bytes: three little-endian float32 values
+/// (X, Y, Z) in g. This is a *visualization-only* feed - the reaction-time
+/// measurement still comes from the single-shot, high-precision
+/// [prostartGoTimestampCharacteristicUuid] above.
+///
+/// Implemented firmware side in Arduino/BLEtest/BLEtest.ino as `accelChar`,
+/// which only notifies while a client is subscribed - i.e. while the live
+/// data screen is open. Keep the UUID and the 12-byte layout in sync with
+/// that sketch.
+final Guid prostartAccelerometerCharacteristicUuid = Guid('19b10002-e8f2-537e-4f6c-d104768a1214');
+
+/// Nominal firmware notification rate for the accelerometer characteristic.
+const int prostartAccelerometerSampleRateHz = 50;
+
 /// Stages of the BLE connect flow, surfaced to the UI so it can show the
 /// right animation/copy at each step.
 enum BleConnectStage {
@@ -102,17 +117,18 @@ class BleService {
         }
       }
 
-      // A device from a previous session (hot restart, app relaunch after a
-      // crash, etc.) may still be alive at the OS level even though our
-      // in-memory state has no record of it. Clear those out first so a
-      // fresh scan/connect doesn't collide with a stale GATT connection.
-      await _disconnectStaleConnections();
+      // A BLE peripheral stops advertising while it is connected, so if the
+      // OS still holds a link to the device a scan can never see it. Adopt
+      // that link instead of scanning (see [_findAlreadyConnectedDevice]).
+      var device = await _findAlreadyConnectedDevice();
 
-      onStage(BleConnectStage.scanning);
-      final scanOutcome = await _scanForDevice(scanTimeout);
-      if (scanOutcome.failure != null) return scanOutcome.failure!;
-      final device = scanOutcome.device;
-      if (device == null) return _deviceNotFoundFailure;
+      if (device == null) {
+        onStage(BleConnectStage.scanning);
+        final scanOutcome = await _scanForDevice(scanTimeout);
+        if (scanOutcome.failure != null) return scanOutcome.failure!;
+        device = scanOutcome.device;
+        if (device == null) return _deviceNotFoundFailure;
+      }
 
       onStage(BleConnectStage.connecting);
       try {
@@ -142,24 +158,38 @@ class BleService {
     }
   }
 
-  /// Best-effort cleanup of any device our app already holds a live GATT
-  /// connection to (per `FlutterBluePlus.connectedDevices`) that matches the
-  /// Prostart service. Failures here are swallowed - a fresh scan/connect
-  /// attempt right after will surface any real problem.
-  Future<void> _disconnectStaleConnections() async {
-    if (kIsWeb) return;
-    for (final staleDevice in FlutterBluePlus.connectedDevices) {
-      try {
-        final looksLikeOurs = staleDevice.platformName == prostartDeviceLocalName;
-        if (!looksLikeOurs) {
-          final services = await staleDevice.discoverServices();
-          if (!services.any((s) => s.uuid == prostartServiceUuid)) continue;
-        }
-        await staleDevice.disconnect();
-      } catch (_) {
-        // not our device, or already gone - ignore.
+  /// Looks for a Prostart device the *operating system* is already connected
+  /// to, and hands it back so we can adopt it instead of scanning.
+  ///
+  /// This matters because a connected BLE peripheral stops advertising: once
+  /// the OS holds a link to the Arduino, no amount of scanning will ever find
+  /// it, and the connect flow times out as "device not found" even though the
+  /// board is powered on and healthy. That link routinely outlives the app -
+  /// a hot restart, a crash, or a reinstall drops our Dart state but not the
+  /// OS's GATT connection.
+  ///
+  /// `FlutterBluePlus.connectedDevices` cannot see those: it is a snapshot of
+  /// connections made by *this* process. `systemDevices()` reports links held
+  /// by any app, including our own from a previous run, which is what we need
+  /// here. Calling `connect()` on one of them is still required (it attaches
+  /// the device to our app) but returns immediately, since the radio link
+  /// already exists.
+  Future<BluetoothDevice?> _findAlreadyConnectedDevice() async {
+    if (kIsWeb) return null;
+    try {
+      final devices = await FlutterBluePlus.systemDevices([prostartServiceUuid]);
+      for (final candidate in devices) {
+        // iOS filters systemDevices() by the service UUID for us; Android
+        // ignores that argument, so fall back to matching the local name.
+        // Either way discoverServices() below is the real verification.
+        final looksLikeOurs = defaultTargetPlatform != TargetPlatform.android ||
+            candidate.platformName == prostartDeviceLocalName;
+        if (looksLikeOurs) return candidate;
       }
+    } catch (_) {
+      // Not fatal - fall through to a normal scan.
     }
+    return null;
   }
 
   Future<BleConnectFailure?> _ensureAndroidPermissions() async {

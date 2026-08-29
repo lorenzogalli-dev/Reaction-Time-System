@@ -3,13 +3,15 @@ import 'package:provider/provider.dart';
 
 import '../state/ble_connection_controller.dart';
 import '../theme/app_theme.dart';
-import '../widgets/connect_device_card.dart';
 import '../widgets/connection_badge.dart';
-import '../widgets/connection_sheet.dart';
-import '../widgets/device_status_card.dart';
+import '../widgets/home_connection_card.dart';
+import 'live_data_screen.dart';
 
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key});
+  /// Switches the shell to the Settings tab, where device pairing lives.
+  final VoidCallback onGoToSettings;
+
+  const HomeScreen({super.key, required this.onGoToSettings});
 
   @override
   Widget build(BuildContext context) {
@@ -39,12 +41,12 @@ class HomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: AppSpacing.xl),
             if (controller.status == BleAppStatus.connected)
-              DeviceStatusCard(
+              LiveDataCard(
                 deviceName: controller.deviceName ?? 'Prostart device',
-                lastGoTimestamp: controller.lastGoTimestamp,
+                onSeeLiveData: () => Navigator.of(context).push(LiveDataScreen.route()),
               )
             else
-              ConnectDeviceCard(onConnectPressed: () => ConnectionSheet.show(context)),
+              ConnectPromptCard(onGoToSettings: onGoToSettings),
           ],
         ),
       ),
