@@ -8,3 +8,4 @@ prostart/.flutter-plugins
 prostart/.flutter-plugins-dependencies
 prostart/ios/Pods/
 prostart/ios/.symlinks/
+**/.DS_Store
