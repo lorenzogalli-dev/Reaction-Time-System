@@ -40,6 +40,17 @@ dependencies:
   share_plus: ^13.3.0
   path_provider: ^2.1.6
 
+# path_provider_foundation 2.5.0 and 2.6.0 implement the iOS/macOS side with
+# an `objective_c` FFI backend instead of a normal plugin. That backend ships
+# as a Flutter "code asset", which is only built and embedded into Runner.app
+# when native assets are enabled - otherwise every call (getTemporaryDirectory
+# included) throws at runtime:
+#   Failed to load dynamic library 'objective_c.framework/objective_c'
+# 2.5.1 is the newest release that still uses the plain pigeon/CocoaPods
+# implementation. Pinned until native assets are on by default on stable.
+dependency_overrides:
+  path_provider_foundation: 2.5.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -116,14 +116,44 @@ Nothing is blocked; everything below needs hardware.
 2. **The sketch has never been compiled.** No `arduino-cli` is installed on this machine. Verify at upload time.
 3. **Confirm the 50 Hz stream end to end.** `RecordingSession.sampleRateHz` on the summary card reports the achieved rate — if it lands well under 50, the connection interval is the first suspect. The sketch requests 15–30 ms via `BLE.setConnectionInterval(12, 24)`, but that is a request and the central decides; iOS in particular may not grant it.
 4. **Sanity-check the axis values.** At rest one axis should read ≈ 1.0 g and the others ≈ 0. If everything is ~4× too small or too large, `accelRange` and the library's `calcAccel` scaling have diverged.
-5. **Test the CSV export on a real device.** Untested. On iPad the share sheet is a popover needing an anchor rect; `_export` in `live_data_screen.dart` derives one from the summary card's `RenderBox`, but this has not been exercised.
-6. **Consider fixing `while (!Serial)` in `I2C_Scanner.ino`** — same trap, still armed.
-7. **Optional:** `prostartAccelerometerSampleRateHz` in `ble_service.dart` is currently unused. Either wire it into the chart/stats as the expected rate or drop it.
-8. **The root `README.md` repo structure is wrong** (`firmware/`, `app/` vs. the real `Arduino/`, `prostart/`). Worth correcting.
+5. **Test the CSV export on a real device.** The export threw on iOS - see the
+   `path_provider_foundation` note below - and that is fixed, but the share
+   sheet itself is still unexercised. On iPad it is a popover needing an anchor
+   rect; `_export` in `live_data_screen.dart` derives one from the summary
+   card's `RenderBox`. "Save to Files" in the sheet is the save-to-device path.
+## Done since — no hardware needed
 
-## Uncommitted work
+- `I2C_Scanner.ino` now uses the same bounded 3 s `Serial` wait as `BLEtest.ino`.
+- `prostartAccelerometerSampleRateHz` is wired into the recording summary line,
+  which now reads `48.7 Hz (nominal 50 Hz)` — giving next step 3 something to
+  compare against directly on screen.
+- Root `README.md` repository structure and the `cd app` / `firmware/` paths in
+  Getting Started corrected to `Arduino/` and `prostart/`.
 
-All of the above is uncommitted on `main`. `git status` also shows incidental
-churn from adding two plugins: `Podfile.lock`, the generated plugin registrants
-for linux/macos/windows, and `prostart/android/build/reports/...` (a build
-artifact that probably should not be tracked at all).
+### `path_provider_foundation` is pinned - do not remove the override
+
+`path_provider_foundation` 2.5.0 replaced its iOS/macOS plugin with an
+`objective_c` FFI backend, 2.5.1 reverted it, and 2.6.0 went back to FFI. That
+backend ships as a Flutter *code asset*, only built and embedded into
+`Runner.app` when native assets are enabled (`flutter config` shows
+`enable-native-assets: (Not set)` on stable). Without it every call - including
+the `getTemporaryDirectory()` in `LiveDataController.exportLastSession` -
+throws `Failed to load dynamic library 'objective_c.framework/objective_c'`.
+
+The tell is `ios/Podfile.lock`: the FFI version registers no pod at all, so
+`path_provider_foundation` was simply absent from it. `pubspec.yaml` now has a
+`dependency_overrides` pinning 2.5.1, the newest pigeon/CocoaPods release.
+`share_plus` was suspected first and is **not** implicated - it stays on 13.3.0.
+
+Remove the override once native assets are on by default on stable, and
+rebuild from scratch (`flutter clean` + `pod install`) when you do.
+
+Still wrong in the README: it links to `report/main.tex`, but no `report/`
+directory has ever been committed to this repo. Left alone deliberately — it
+may live elsewhere.
+
+## State of the tree
+
+Everything described above is committed on `main` (`37060b5` for the live data
+view). Note `prostart/android/build/reports/...` is tracked and is a build
+artifact that probably should not be.
