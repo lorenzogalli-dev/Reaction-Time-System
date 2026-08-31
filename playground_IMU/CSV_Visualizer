@@ -1,0 +1,111 @@
+import os
+import tkinter as tk
+from tkinter import filedialog
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------
+# 1. File Selection Dialog
+# ----------------------------------------------------
+# Initialize and hide the main tkinter root window
+root = tk.Tk()
+root.withdraw()
+root.attributes("-topmost", True)  # Bring file dialog to the front
+
+# Open file picker window
+file_path = filedialog.askopenfilename(
+    title="Select Accelerometer CSV File",
+    filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+)
+
+# Terminate cleanly if the user cancelled
+if not file_path:
+    print("Operation cancelled: No file selected.")
+    exit(0)
+
+print(f"Loading file: {file_path}")
+
+# ----------------------------------------------------
+# 2. Data Loading & Processing
+# ----------------------------------------------------
+# Load CSV and parse timestamps
+df = pd.read_csv(file_path, parse_dates=["timestamp_iso"])
+
+# Calculate total magnitude: |a| = sqrt(x^2 + y^2 + z^2)
+df["mag_g"] = np.sqrt(df["x_g"] ** 2 + df["y_g"] ** 2 + df["z_g"] ** 2)
+
+print("\n--- First 5 Records ---")
+print(df.head())
+
+print("\n--- Summary Statistics ---")
+print(df[["x_g", "y_g", "z_g", "mag_g"]].describe())
+
+# ----------------------------------------------------
+# 3. Visualization with Matplotlib
+# ----------------------------------------------------
+file_name = os.path.basename(file_path)
+
+fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
+
+# X-Axis
+ax1.plot(
+    df["elapsed_s"],
+    df["x_g"],
+    color="#e74c3c",
+    linewidth=1.2,
+    marker="o",
+    markersize=2,
+    label="X-Axis",
+)
+ax1.set_ylabel("Accel X [g]")
+ax1.grid(True, linestyle="--", alpha=0.6)
+ax1.legend(loc="upper right")
+
+# Y-Axis
+ax2.plot(
+    df["elapsed_s"],
+    df["y_g"],
+    color="#2ecc71",
+    linewidth=1.2,
+    marker="o",
+    markersize=2,
+    label="Y-Axis",
+)
+ax2.set_ylabel("Accel Y [g]")
+ax2.grid(True, linestyle="--", alpha=0.6)
+ax2.legend(loc="upper right")
+
+# Z-Axis
+ax3.plot(
+    df["elapsed_s"],
+    df["z_g"],
+    color="#3498db",
+    linewidth=1.2,
+    marker="o",
+    markersize=2,
+    label="Z-Axis",
+)
+ax3.set_ylabel("Accel Z [g]")
+ax3.grid(True, linestyle="--", alpha=0.6)
+ax3.legend(loc="upper right")
+
+# Total Magnitude
+ax4.plot(
+    df["elapsed_s"],
+    df["mag_g"],
+    color="#8e44ad",
+    linewidth=1.2,
+    linestyle="-",
+    label="Magnitude |a|",
+)
+ax4.set_xlabel("Elapsed Time (seconds)")
+ax4.set_ylabel("Magnitude [g]")
+ax4.grid(True, linestyle="--", alpha=0.6)
+ax4.legend(loc="upper right")
+
+plt.suptitle(f"Triaxial Accelerometer Data: {file_name}", fontsize=13, fontweight="bold")
+plt.tight_layout()
+
+# Display interactive plot window
+plt.show()
