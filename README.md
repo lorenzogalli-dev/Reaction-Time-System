@@ -169,4 +169,3 @@ Flagged early as the main items to test experimentally before committing to the 
 
 ## 📄 License
 
-*(add your chosen license here — e.g. MIT)*
