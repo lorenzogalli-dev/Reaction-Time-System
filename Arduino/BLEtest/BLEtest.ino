@@ -40,6 +40,17 @@
 // blocchi: il campionamento e' scandito dal sensore, non dal loop, e il jitter
 // del software non entra piu' nei dati.
 //
+// CATTURA SERIALE
+// ---------------
+// Il BLE non puo' portare 833 Hz in continuo, ma il cavo USB si'. I comandi
+// 'r'/'s' aprono e chiudono uno stream CSV sulla seriale con *lo stesso* tempo
+// misurato che usa tutto il resto del firmware: ogni riga porta l'elapsed
+// ricavato da sampleTimeUs(), cioe' dal PLL agganciato alla FIFO, non da un
+// contatore moltiplicato per il periodo nominale. E' la differenza fra un file
+// che sembra campionato a 833 Hz e uno che lo e' davvero. Formato compatibile
+// con lo script Python in Arduino/HighFrequencySampleRate/Python_Serial:
+//   elapsed_s,x_g,y_g,z_g
+//
 // DUMP
 // ----
 // A 833 Hz servono ~5 kB/s solo per i raw: il link BLE (connection interval
@@ -169,6 +180,27 @@ static bool     goPending = false;
 static uint32_t goDueUs = 0;
 
 static bool imuReady = false;
+// BLE assente non e' un motivo per fermare la board: la cattura via cavo resta
+// utile (ed e' anzi il modo in cui si caratterizza il sensore). Vedi setup().
+static bool bleReady = false;
+
+// --- Cattura seriale ad alta frequenza -------------------------------------
+// Ogni campione che entra nel ring viene emesso come riga CSV finche' lo stream
+// e' attivo. A 833 Hz sono ~30 righe/ms * 32 byte = ~27 kB/s: sotto i 921600
+// baud nominali, e sulla USB nativa del nRF52840 il baud e' comunque solo
+// un'etichetta. Se il buffer di uscita si riempie non si blocca: si riprova al
+// giro dopo, perche' un Serial.write() bloccante fermerebbe drainFifo() e
+// manderebbe la FIFO in overrun - il rimedio peggiore del male.
+static bool     serialStreaming = false;
+static uint32_t nextSerialSample = 0;
+static uint64_t serialElapsedUs = 0;   // tempo dall'inizio dello stream
+static uint32_t serialLastUs = 0;      // sampleTimeUs() dell'ultima riga emessa
+static bool     serialFirstRow = true;
+// Campioni usciti dal ring prima di essere emessi: l'unico modo in cui la
+// cattura puo' perdere dati. Dichiararlo e' meglio che scoprirlo dal CSV.
+static uint32_t serialDropped = 0;
+// Riga piu' lunga possibile con largo margine (vedi formatSampleLine).
+static const uint8_t SERIAL_ROW_MAX = 64;
 
 // Prototipi espliciti: l'auto-prototyping dell'IDE Arduino non e' affidabile
 // con le funzioni `static` in un .ino.
@@ -177,6 +209,9 @@ static void drainFifo();
 static void updateTimebase(uint32_t tStatus, uint16_t n, uint16_t leftBehind);
 static uint32_t sampleTimeUs(uint32_t k);
 static void publishLiveSamples();
+static void publishSerialSamples();
+static uint8_t writeFixed(char* out, int64_t value, uint32_t scale, uint8_t decimals);
+static uint8_t formatSampleLine(uint32_t k, char* out);
 static void startDump(uint32_t count);
 static void serviceDump();
 static void serviceGo();
@@ -186,7 +221,7 @@ static void printTimebase();
 static void printLatest();
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(921600);
   // Sul XIAO nRF52840 la USB e' nativa: `Serial` diventa true solo quando un
   // host apre la porta CDC. Aspettare all'infinito blocca setup() per sempre
   // se la board e' alimentata da batteria, da una porta senza Serial Monitor
@@ -196,29 +231,40 @@ void setup() {
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) delay(10);
 
+  // Senza seed random() ripete la stessa sequenza a ogni accensione: su un
+  // sistema di tempo di reazione significa che l'atleta impara l'attesa e
+  // anticipa. Il valore e' preso da un ingresso analogico scollegato (rumore)
+  // mescolato al clock.
+  randomSeed(((uint32_t)analogRead(A0) << 16) ^ micros());
+
   setupImu();
 
-  if (!BLE.begin()) {
-    Serial.println("BLE init failed!");
-    while (1);
+  // BLE.begin() che fallisce non deve piantare la board. Il firmware precedente
+  // faceva while(1) qui: la board restava viva ma muta, senza seriale utile e
+  // senza radio, e serviva il doppio tap di reset per riprogrammarla. Ora si
+  // procede lo stesso: la cattura via cavo e la diagnostica continuano a
+  // funzionare, e il fallimento e' dichiarato invece che silenzioso.
+  bleReady = BLE.begin();
+  if (!bleReady) {
+    Serial.println("BLE init failed - continuo senza radio (cattura seriale attiva)");
+  } else {
+    BLE.setLocalName("BlockStartDevice");
+    BLE.setAdvertisedService(reactionService);
+    reactionService.addCharacteristic(goTimeChar);
+    reactionService.addCharacteristic(accelChar);
+    reactionService.addCharacteristic(burstChar);
+    reactionService.addCharacteristic(cmdChar);
+    BLE.addService(reactionService);
+
+    // Richiesta (non garanzia: decide il central) di un connection interval
+    // 15-30 ms. Unita' = 1.25 ms. Con l'intervallo di default piu' lungo il
+    // grafico a 50 Hz arriva a scatti e il dump ci mette un'eternita'.
+    BLE.setConnectionInterval(12, 24);
+
+    BLE.advertise();
   }
 
-  BLE.setLocalName("BlockStartDevice");
-  BLE.setAdvertisedService(reactionService);
-  reactionService.addCharacteristic(goTimeChar);
-  reactionService.addCharacteristic(accelChar);
-  reactionService.addCharacteristic(burstChar);
-  reactionService.addCharacteristic(cmdChar);
-  BLE.addService(reactionService);
-
-  // Richiesta (non garanzia: decide il central) di un connection interval
-  // 15-30 ms. Unita' = 1.25 ms. Con l'intervallo di default piu' lungo il
-  // grafico a 50 Hz arriva a scatti e il dump ci mette un'eternita'.
-  BLE.setConnectionInterval(12, 24);
-
-  BLE.advertise();
-
-  Serial.println("Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest sample.");
+  Serial.println("Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest, 'r'/'s' cattura CSV.");
 }
 
 void setupImu() {
@@ -286,7 +332,7 @@ void setupImu() {
 }
 
 void loop() {
-  BLE.poll();
+  if (bleReady) BLE.poll();
 
   drainFifo();
   serviceGo();
@@ -461,6 +507,9 @@ static void drainFifo() {
   totalSamples += nSamples;
 
   updateTimebase(tStatus, nSamples, leftBehind);
+  // Dopo updateTimebase(): sampleTimeUs() dipende da newestSampleUs, che e'
+  // appena stato aggiornato con questo blocco.
+  publishSerialSamples();
   publishLiveSamples();
 }
 
@@ -525,7 +574,7 @@ static void publishLiveSamples() {
   // subscribed() e' vero solo mentre l'app e' sulla schermata Live Data. La
   // FIFO pero' si svuota comunque: la detection on-device non deve dipendere
   // da chi sta guardando.
-  if (!BLE.connected() || !accelChar.subscribed()) {
+  if (!bleReady || !BLE.connected() || !accelChar.subscribed()) {
     nextLiveSample = totalSamples;
     return;
   }
@@ -555,6 +604,120 @@ static void publishLiveSamples() {
 }
 
 // ---------------------------------------------------------------------------
+// Cattura seriale ad alta frequenza
+// ---------------------------------------------------------------------------
+
+// Scrive `value / scale` con `decimals` cifre decimali, senza toccare printf sui
+// float: su questo core la printf con %f e' pesante (e in alcune configurazioni
+// di newlib nano non c'e' proprio), e a 833 Hz sarebbe comunque il pezzo piu'
+// costoso del giro. Tutto in aritmetica intera. Ritorna i caratteri scritti.
+static uint8_t writeFixed(char* out, int64_t value, uint32_t scale, uint8_t decimals) {
+  uint8_t n = 0;
+  if (value < 0) {
+    out[n++] = '-';
+    value = -value;
+  }
+  uint64_t whole = (uint64_t)value / scale;
+  uint32_t frac  = (uint32_t)((uint64_t)value % scale);
+
+  char tmp[20];
+  uint8_t t = 0;
+  do {
+    tmp[t++] = (char)('0' + (whole % 10));
+    whole /= 10;
+  } while (whole);
+  while (t) out[n++] = tmp[--t];
+
+  out[n++] = '.';
+  uint32_t p = scale;
+  for (uint8_t d = 0; d < decimals; d++) {
+    p /= 10;
+    out[n++] = (char)('0' + ((frac / p) % 10));
+  }
+  return n;
+}
+
+// Costruisce la riga CSV del campione con indice globale k:
+//   elapsed_s,x_g,y_g,z_g\n
+//
+// L'elapsed e' accumulato dai delta fra timestamp *misurati* (sampleTimeUs), non
+// contato in campioni: e' esattamente questa la differenza rispetto allo sketch
+// HighFreq, dove l'asse dei tempi e' un indice moltiplicato per il periodo
+// nominale e quindi ignora sia la deriva dell'oscillatore sia i buchi. Sommare
+// i delta invece di fare una sottrazione secca regge anche oltre il wrap di
+// micros() (~71 minuti), che una cattura lunga incontrerebbe.
+static uint8_t formatSampleLine(uint32_t k, char* out) {
+  uint32_t t = sampleTimeUs(k);
+  if (serialFirstRow) {
+    serialLastUs = t;
+    serialFirstRow = false;
+  }
+  // Il PLL puo' spostare i timestamp all'indietro di poco quando riaggancia:
+  // un delta negativo diventa 0, mai un salto di 4000 secondi.
+  int32_t d = (int32_t)(t - serialLastUs);
+  if (d < 0) d = 0;
+  serialElapsedUs += (uint32_t)d;
+  serialLastUs = t;
+
+  uint8_t n = writeFixed(out, (int64_t)serialElapsedUs, 1000000, 6);
+
+  uint32_t slot = (k % RING_SAMPLES) * 3;
+  for (uint8_t a = 0; a < 3; a++) {
+    out[n++] = ',';
+    // Stesso fattore di LSM6DS3::calcAccel - raw * 0.061 * (range>>1) / 1000 -
+    // ma espresso in decimillesimi di g e in interi:
+    //   g * 10000 = raw * 61 * (range>>1) / 100
+    int32_t num = (int32_t)ringBuf[slot + a] * 61L * (int32_t)(ACCEL_RANGE_G >> 1);
+    int32_t units = (num >= 0) ? (num + 50) / 100 : (num - 50) / 100;
+    n += writeFixed(out + n, units, 10000, 4);
+  }
+  out[n++] = '\n';
+  return n;
+}
+
+static void publishSerialSamples() {
+  if (!serialStreaming) return;
+
+  // Se lo stream e' rimasto indietro oltre il ring, quei campioni sono stati
+  // sovrascritti: si riparte dal piu' vecchio ancora valido e la perdita viene
+  // contata. Il CSV mostrera' comunque il buco, perche' l'elapsed salta.
+  uint32_t oldest = (totalSamples > RING_SAMPLES) ? (totalSamples - RING_SAMPLES) : 0;
+  if (nextSerialSample < oldest) {
+    serialDropped += oldest - nextSerialSample;
+    nextSerialSample = oldest;
+  }
+
+  char row[SERIAL_ROW_MAX];
+  while (nextSerialSample < totalSamples) {
+    // Il controllo va fatto *prima* di formattare, perche' formatSampleLine
+    // fa avanzare l'elapsed accumulato: formattare e poi rinunciare a scrivere
+    // lascerebbe un buco nell'asse dei tempi. Si chiede lo spazio per la riga
+    // piu' lunga possibile, cosi' basta un confronto solo.
+    if ((int)Serial.availableForWrite() < (int)SERIAL_ROW_MAX) return;
+    uint8_t len = formatSampleLine(nextSerialSample, row);
+    Serial.write((const uint8_t*)row, len);
+    nextSerialSample++;
+  }
+}
+
+static void startSerialStream() {
+  // Si parte dal presente: il contenuto del ring e' storia precedente al
+  // comando e non appartiene a questa cattura.
+  nextSerialSample = totalSamples;
+  serialElapsedUs = 0;
+  serialFirstRow = true;
+  serialDropped = 0;
+  serialStreaming = true;
+}
+
+static void stopSerialStream() {
+  serialStreaming = false;
+  Serial.print("Stream stopped: ");
+  Serial.print(serialDropped);
+  Serial.println(" dropped");
+}
+
+// ---------------------------------------------------------------------------
 // Dump del ring buffer
 // ---------------------------------------------------------------------------
 
@@ -575,7 +738,7 @@ static void startDump(uint32_t count) {
 
 static void serviceDump() {
   if (!dumpActive) return;
-  if (!BLE.connected() || !burstChar.subscribed()) {
+  if (!bleReady || !BLE.connected() || !burstChar.subscribed()) {
     dumpActive = false;
     return;
   }
@@ -627,7 +790,7 @@ static void serviceGo() {
   // e non quando la notifica parte. Quando al posto della seriale ci sara' il
   // buzzer, cambia solo chi arma goDueUs.
   uint32_t goTimestamp = micros();
-  goTimeChar.writeValue(goTimestamp);
+  if (bleReady) goTimeChar.writeValue(goTimestamp);
 
   Serial.print("GO! Timestamp: ");
   Serial.println(goTimestamp);
@@ -648,6 +811,12 @@ static void handleSerial() {
     printTimebase();
   } else if (c == 'p') {
     printLatest();
+  } else if (c == 'r') {
+    // 'r'/'s' sono le lettere che manda gia' lo script Python: cosi' la cattura
+    // funziona senza toccare il lato host.
+    startSerialStream();
+  } else if (c == 's') {
+    stopSerialStream();
   }
 }
 
@@ -680,6 +849,8 @@ static void printTimebase() {
   Serial.print("shortReads     "); Serial.println(errShortRead);
   Serial.print("addrNacks      "); Serial.println(errAddrNack);
   Serial.print("misaligned     "); Serial.println(errMisaligned);
+  Serial.print("serialStream   "); Serial.println(serialStreaming ? "on" : "off");
+  Serial.print("serialDropped  "); Serial.println(serialDropped);
 
   if (lastStatSamples != 0 && n > lastStatSamples) {
     uint32_t dn = n - lastStatSamples;
@@ -718,7 +889,7 @@ static void printLatest() {
 }
 
 static void handleCommand() {
-  if (!cmdChar.written()) return;
+  if (!bleReady || !cmdChar.written()) return;
   const uint8_t* v = cmdChar.value();
   if (cmdChar.valueLength() >= 1 && v[0] == 0x01) {
     startDump(RING_SAMPLES);
