@@ -9,3 +9,7 @@ prostart/.flutter-plugins-dependencies
 prostart/ios/Pods/
 prostart/ios/.symlinks/
 **/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
