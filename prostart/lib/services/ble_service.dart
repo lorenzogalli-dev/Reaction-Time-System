@@ -14,18 +14,35 @@ final Guid prostartServiceUuid = Guid('19b10000-e8f2-537e-4f6c-d104768a1214');
 final Guid prostartGoTimestampCharacteristicUuid = Guid('19b10001-e8f2-537e-4f6c-d104768a1214');
 
 /// Live accelerometer stream, notified continuously at ~50 Hz while a client
-/// is subscribed. Payload is 12 bytes: three little-endian float32 values
-/// (X, Y, Z) in g. This is a *visualization-only* feed - the reaction-time
+/// is subscribed. This is a *visualization-only* feed - the reaction-time
 /// measurement still comes from the single-shot, high-precision
 /// [prostartGoTimestampCharacteristicUuid] above.
 ///
+/// Payload is [prostartAccelerometerPayloadBytes] bytes, all little-endian:
+///
+///   offset 0   uint32   t_us - the device's own `micros()` at the moment the
+///                       sample was captured. Same clock as the "go" timestamp
+///                       characteristic, so the two are directly comparable.
+///   offset 4   float32  X in g
+///   offset 8   float32  Y in g
+///   offset 12  float32  Z in g
+///
+/// The device is the only clock in the system. The app must not timestamp
+/// samples on arrival: BLE delivers them in bursts, so arrival times carry
+/// +/-15-30 ms of error (see playground_IMU/README.md).
+///
 /// Implemented firmware side in Arduino/BLEtest/BLEtest.ino as `accelChar`,
 /// which only notifies while a client is subscribed - i.e. while the live
-/// data screen is open. Keep the UUID and the 12-byte layout in sync with
-/// that sketch.
+/// data screen is open. Keep the UUID and this layout in sync with that sketch.
 final Guid prostartAccelerometerCharacteristicUuid = Guid('19b10002-e8f2-537e-4f6c-d104768a1214');
 
+/// Size of one [prostartAccelerometerCharacteristicUuid] notification.
+/// Was 12 before the firmware started stamping samples with `micros()`.
+const int prostartAccelerometerPayloadBytes = 16;
+
 /// Nominal firmware notification rate for the accelerometer characteristic.
+/// The sensor itself now runs at 833 Hz; the firmware decimates 1:17 for this
+/// cosmetic feed and keeps the full-rate samples on-device.
 const int prostartAccelerometerSampleRateHz = 50;
 
 /// Stages of the BLE connect flow, surfaced to the UI so it can show the

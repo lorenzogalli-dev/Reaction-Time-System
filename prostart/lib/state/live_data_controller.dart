@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../models/accel_sample.dart';
 import '../models/recording_session.dart';
+import '../services/ble_service.dart';
 import 'ble_connection_controller.dart';
 
 enum LiveStreamStatus {
@@ -59,8 +60,25 @@ class LiveDataController extends ChangeNotifier {
 
   final Stopwatch _clock = Stopwatch();
 
-  /// Microseconds since the stream opened - the chart's "now" edge.
-  int get elapsedMicros => _clock.elapsedMicroseconds;
+  /// Device `micros()` of the first sample of this stream. Every sample's
+  /// [AccelSample.elapsedMicros] is re-based to this, so the chart still works
+  /// in "time since the stream opened" while the spacing between samples comes
+  /// from the device.
+  int? _deviceOriginMicros;
+
+  /// Device time minus phone time, smoothed. Only the chart's scrolling edge
+  /// uses it: samples land on the device timebase but arrive in bursts, so
+  /// driving the edge straight off the last sample would make it advance in
+  /// visible steps. The phone's Stopwatch gives a smooth 60 Hz tick and this
+  /// offset maps it onto the device timebase.
+  ///
+  /// Cosmetic only - nothing measured depends on it.
+  int _deviceClockOffset = 0;
+  static const double _offsetSmoothing = 0.05;
+
+  /// Microseconds since the stream opened, on the device's timebase - the
+  /// chart's "now" edge.
+  int get elapsedMicros => _clock.elapsedMicroseconds + _deviceClockOffset;
 
   bool _isRecording = false;
   bool get isRecording => _isRecording;
@@ -105,6 +123,10 @@ class LiveDataController extends ChangeNotifier {
       return;
     }
 
+    // A restart re-bases the device timebase on the first sample of the new
+    // stream, so the chart's x axis always starts at zero.
+    _deviceOriginMicros = null;
+    _deviceClockOffset = 0;
     _clock.start();
     _valueSub = characteristic.lastValueStream.listen(_onValue);
     _status = LiveStreamStatus.streaming;
@@ -125,8 +147,16 @@ class LiveDataController extends ChangeNotifier {
   }
 
   void _onValue(List<int> bytes) {
-    final sample = _parseSample(bytes, _clock.elapsedMicroseconds);
+    final sample = _parseSample(bytes);
     if (sample == null) return;
+
+    // Track how far the device timebase runs ahead of the phone's Stopwatch,
+    // for the chart's scrolling edge only. Smoothed, because arrival times are
+    // bursty and the raw difference jumps by tens of milliseconds.
+    final rawOffset = sample.elapsedMicros - _clock.elapsedMicroseconds;
+    _deviceClockOffset = _window.isEmpty
+        ? rawOffset
+        : (_deviceClockOffset + _offsetSmoothing * (rawOffset - _deviceClockOffset)).round();
 
     _window.add(sample);
     final cutoff = sample.elapsedMicros - chartWindow.inMicroseconds;
@@ -144,15 +174,25 @@ class LiveDataController extends ChangeNotifier {
     latest.value = sample;
   }
 
-  /// Firmware payload: three little-endian float32 values (X, Y, Z) in g.
-  AccelSample? _parseSample(List<int> bytes, int elapsedMicros) {
-    if (bytes.length < 12) return null;
+  /// Firmware payload: uint32 `micros()` capture time, then three float32
+  /// axis values in g, all little-endian. See
+  /// [prostartAccelerometerPayloadBytes] in ble_service.dart.
+  AccelSample? _parseSample(List<int> bytes) {
+    if (bytes.length < prostartAccelerometerPayloadBytes) return null;
     final data = ByteData.sublistView(Uint8List.fromList(bytes));
+    final deviceMicros = data.getUint32(0, Endian.little);
+    _deviceOriginMicros ??= deviceMicros;
+
+    // The device clock is a 32-bit microsecond counter, so it wraps roughly
+    // every 71.6 minutes. Doing the subtraction modulo 2^32 makes the wrap a
+    // non-event: elapsed time stays monotonic across it.
+    final elapsed = (deviceMicros - _deviceOriginMicros!) & 0xFFFFFFFF;
+
     return AccelSample(
-      elapsedMicros: elapsedMicros,
-      x: data.getFloat32(0, Endian.little),
-      y: data.getFloat32(4, Endian.little),
-      z: data.getFloat32(8, Endian.little),
+      elapsedMicros: elapsed,
+      x: data.getFloat32(4, Endian.little),
+      y: data.getFloat32(8, Endian.little),
+      z: data.getFloat32(12, Endian.little),
     );
   }
 

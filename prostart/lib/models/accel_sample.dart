@@ -1,9 +1,14 @@
 /// A single accelerometer reading from the live BLE stream.
 ///
-/// [elapsedMicros] is measured by the app from the moment the live stream was
-/// opened, not by the device - the firmware notification carries only the
-/// three axis values. That's accurate enough for visualization; the
-/// reaction-time path uses the device's own microsecond timestamp instead.
+/// [elapsedMicros] comes from the *device*: the firmware stamps every sample
+/// with its own `micros()` at capture time, and this is that value re-based to
+/// the first sample of the stream. It is not measured by the app, and BLE
+/// delivery latency does not enter it.
+///
+/// This matters because BLE hands samples over in bursts - the 2026-08-31
+/// capture showed groups of 1-4 arriving together with 29-31 ms gaps between
+/// groups - so an arrival-time stamp carries +/-15-30 ms of error. See
+/// playground_IMU/README.md.
 class AccelSample {
   final int elapsedMicros;
   final double x;
