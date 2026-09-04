@@ -8,22 +8,24 @@
 
 ## 🖼️ System at a glance
 
-![System overview: the starting-block box (button, OLED, speaker, IMU, ESP32 with external antenna, LiPo battery) and the eight-step end-to-end flow from connection and clock calibration, through the local start sequence and reaction-time measurement, to video analysis and results on the phone.](docs/reaction_time_diagram.png)
+![System overview: the starting-block box (button, OLED, speaker, IMU, MCU, LiPo battery) and the end-to-end flow from the local start sequence and reaction-time measurement, over a Zigbee radio link to the finish box, and on to a phone at the finish line.](docs/reaction_time_diagram.png)
 
-*The device runs the whole start sequence and computes reaction time locally in microseconds. The phone is used only for calibration, receiving the timestamp, recording video, and post-processing.*
+*The start box runs the whole start sequence and computes reaction time locally in microseconds, then sends the result over a Zigbee (XBee) link to the finish box. A phone at the finish line connects to the finish box over Bluetooth to display it. (The diagram predates the Zigbee/XBee revision and is being redrawn.)*
 
 ---
 
-> 🧭 **Hardware direction under evaluation:** the **Arduino Nano 33 IoT** looks like the best fit so far — it integrates Wi-Fi, Bluetooth/BLE, and a 6-axis IMU (LSM6DS3) on a single Arduino-compatible board, avoiding the need for external IMU wiring. Alternatives considered: the **ESP32-WROOM-32U** (Wi-Fi + BLE, no onboard IMU — would need an external MPU6050/ICM-42688 wired via I2C, as originally planned), and the **M5Stack Core2/StickC** (Wi-Fi + BLE + onboard IMU, plus a built-in display, speaker and mic — trading compactness and Arduino-IDE simplicity for a more all-in-one, if slightly bulkier, package).
+> 🧭 **Current hardware plan:** both boxes are built on a **Seeed XIAO nRF52840 Sense** (onboard 6-axis LSM6DS3 IMU, BLE) paired with a **Digi XBee** radio for the start ↔ finish link over **Zigbee**. A phone connects to the **finish** box over BLE to show the result. This replaces the earlier direct-Wi-Fi direction (**ESP32-WROOM-32U** / **Arduino Nano 33 IoT** / **M5Stack**), which assumed a single device talking straight to the phone.
 
 ---
 
 ## 📖 Overview
 
-This repository contains the design and implementation of a **two-part system**:
+This repository contains the design and implementation of a **two-box system**:
 
-1. 🔌 **Starting device** — a small, battery-powered, Wi-Fi-connected unit that plays a randomized "on your marks – set – go" sequence, detects the athlete's push-off from the blocks, and computes reaction time locally with microsecond-level precision.
-2. 📱 **Hardwareless AI photo-finish extension** — uses nothing more than a smartphone camera at the finish line, combined with computer-vision torso-crossing detection and sub-frame interpolation, to reconstruct finish order and total race time — no extra dedicated hardware required.
+1. 🔌 **Start box** — a small, battery-powered unit at the blocks that plays a randomized "on your marks – set – go" sequence, detects the athlete's push-off with an IMU, and computes reaction time locally with microsecond-level precision. It sends the result over a Zigbee (XBee) radio link to the finish box.
+2. 🏁 **Finish box** — a unit at the finish line that receives the reaction time over Zigbee and relays it to a phone over Bluetooth for display. How the finish box registers the finish itself is still to be decided.
+
+A later phase adds a **smartphone-camera photo-finish** layer — computer-vision torso-crossing detection with sub-frame interpolation — to reconstruct finish order and total race time for multi-lane races, with no extra dedicated hardware.
 
 The goal isn't to replace certified competition timing systems, but to bring a meaningful fraction of their precision — enough to be genuinely useful for training, testing, and local competitions — down to a price point and portability that a club or an individual athlete can actually afford. 💪
 
@@ -46,58 +48,65 @@ Full technical write-up, design-alternative comparisons, cost analysis and busin
 ## 🏗️ System Architecture
 
 ```
-┌─────────────────────┐         Wi-Fi (UDP, SoftAP)         ┌──────────────────────┐
-│   Starting Device    │ ───────────────────────────────────▶│   Athlete's Phone     │
-│   (ESP32 + IMU)       │◀─────────────────────────────────── │   (Flutter app)       │
-│                       │      clock calibration (RTT)         │                       │
-│  • Push-off detection │                                       │  • Displays reaction  │
-│  • "Go" signal (µs)   │                                       │    time               │
-│  • Onboard speaker    │                                       │  • Records finish-line│
-│  • OLED display       │                                       │    video (Phase 2)    │
-└─────────────────────┘                                       └──────────────────────┘
+┌────────────────────────┐                     ┌────────────────────────┐                   ┌─────────────────────┐
+│        Start box        │   Zigbee (XBee)    │        Finish box        │       BLE        │   Phone (Flutter)    │
+│   XIAO nRF52840 Sense   │ ─────────────────▶ │   XIAO nRF52840 Sense   │ ──────────────▶ │                      │
+│   + XBee radio          │   reaction-time     │   + XBee radio          │  reaction time  │  • Shows reaction    │
+│                         │   payload           │                         │                 │    time              │
+│  • IMU push-off detect  │                     │  • Receives result      │                 │  • Photo-finish      │
+│  • "Go" cue (µs clock)  │                     │  • Finish trigger: TBD  │                 │    video (later)     │
+│  • Onboard speaker      │                     │  • Relays to phone      │                 │                      │
+└────────────────────────┘                     └────────────────────────┘                   └─────────────────────┘
 ```
+
+Reaction time (the interval from the "go" cue to the detected push-off) is measured and computed entirely on the start box, on one MCU clock. The Zigbee link only carries the finished number; the finish box adds the finish event and forwards both to the phone.
 
 ### Key design decisions ⚖️
 
 | Component | Chosen approach | Why |
 |---|---|---|
-| Push-off detection | **IMU** (accelerometer) on device body | Cheap, no block modification needed, easy retrofit — vs. a force/pressure sensor behind the pedal (more accurate, but invasive) |
+| Push-off detection | **IMU** (accelerometer) on the start-box body | Cheap, no block modification needed, easy retrofit — vs. a force/pressure sensor behind the pedal (more accurate, but invasive) |
 | Start sequence | **Onboard speaker**, locally generated | Zero sync uncertainty between "go" cue and measurement clock, works without a human starter — vs. microphone listening to an external starter |
-| Device ↔ phone link | **Direct Wi-Fi (SoftAP + UDP)** | Simpler BOM and setup than a two-node relay — at the cost of needing ~200 m of reliable direct range, our single largest technical risk |
+| Reaction-time clock | **Computed on the start box** in `micros()` | "Go" cue and push-off are timed on one MCU, so there is no cross-device clock sync in the measurement path |
+| Start ↔ finish link | **Zigbee via XBee modules** | Purpose-built for long-range, low-power point-to-point telemetry; the link only ferries a small result payload, not a stream |
+| Finish ↔ phone link | **Bluetooth LE** | Phone sits at the finish line next to the finish box; BLE covers that short hop and the Flutter app already speaks it (`flutter_blue_plus`) |
 
-Bluetooth (BLE, including BLE 5 Long Range / Coded PHY) was also evaluated as a link alternative and remains a candidate for a future, lower-power revision — see [Open Risks](#-open-risks--things-to-validate) below.
+The earlier direct-Wi-Fi (SoftAP + UDP) start-device-to-phone link is dropped: it needed ~200 m of reliable Wi-Fi range, previously the single largest technical risk. XBee/Zigbee range over the track is the replacement risk to validate — see [Open Risks](#-open-risks--things-to-validate) below.
 
 ---
 
 ## 📊 Key Performance Indicators
 
-- **Reaction time** — µs-precision, from "go" cue to detected push-off
+- **Reaction time** — µs-precision, from "go" cue to detected push-off, computed on the start box
 - **Ground contact / flight time** *(future extension)*
 - **Finish-line crossing order & total race time** — via the photo-finish extension
-- **Clock-offset stability** across trials (device ↔ phone synchronization)
+- **Zigbee link reliability** — delivery rate and latency of the start → finish result payload across the track
 
 ---
 
 ## 🧰 Hardware
 
-| Component | Purpose |
-|---|---|
-| ESP32-WROOM-32U (external antenna) | Main MCU — Wi-Fi range is the priority |
-| 6-axis IMU (MPU6050 / ICM-42688, 500 Hz–1 kHz ODR) | Push-off detection |
-| 0.96" OLED display | Local reaction-time / status readout |
-| Class-D amplifier + speaker | Start-sequence playback |
-| LiPo battery + charge circuit | ~6–10 h continuous use |
-| Push button | Manual trigger |
+| Component | Box | Purpose |
+|---|---|---|
+| Seeed XIAO nRF52840 Sense | both | Main MCU — onboard LSM6DS3 IMU + BLE, small and Arduino-friendly |
+| Digi XBee module (+ carrier / adapter) | both | Zigbee radio for the start ↔ finish link |
+| Class-D amplifier + speaker | start | Start-sequence playback |
+| Push button | start | Manual trigger / arm |
+| 0.96" OLED display | both | Local status / reaction-time readout |
+| LiPo battery + charge circuit | both | ~6–10 h continuous use |
+| Finish-detection sensor | finish | **TBD** — the finish-trigger mechanism is not yet decided |
 
-> 🧪 **Currently prototyping on a Seeed XIAO nRF52840** (BLE-only, no Wi-Fi) while validating IMU wiring, BLE range, and firmware basics — the final hardware target for the Wi-Fi-based architecture above is the ESP32-WROOM-32U.
+The onboard **LSM6DS3** IMU covers push-off detection, so no external IMU is wired.
+
+> 🧪 **Prototyping** is on the Seeed XIAO nRF52840 Sense + XBee for both boxes, validating the Zigbee link, IMU push-off detection, and firmware basics before committing the enclosure and final BOM.
 
 ---
 
 ## 💻 Software Stack
 
-- **Firmware:** Arduino IDE (C/C++), `ArduinoBLE`, `Wire.h` (I2C), board-specific IMU libraries
-- **Companion app:** Flutter (Dart) — `flutter_blue_plus` (BLE) / `dart:io RawDatagramSocket` (Wi-Fi/UDP)
-- **Photo-finish AI pipeline:** computer-vision torso-crossing detection + sub-frame interpolation *(planned, Phase 2)*
+- **Firmware:** Arduino (C/C++), `ArduinoBLE`, `Wire.h` (I2C), the vendored Seeed LSM6DS3 library, and the XBee over a hardware UART (transparent or API mode)
+- **Companion app:** Flutter (Dart) — `flutter_blue_plus` (BLE)
+- **Photo-finish AI pipeline:** computer-vision torso-crossing detection + sub-frame interpolation *(planned, later phase)*
 
 ---
 
@@ -106,13 +115,17 @@ Bluetooth (BLE, including BLE 5 Long Range / Coded PHY) was also evaluated as a 
 ```
 Reaction-Time-System/
 ├── Arduino/               # Arduino sketches (.ino), one folder per sketch
-│   ├── BLEtest/           # firmware actually flashed to the board (BLE + IMU)
+│   ├── BLEtest/           # current BLE + IMU streaming sketch
+│   ├── HighFrequencySampleRate/  # high-rate serial capture sketch
 │   ├── I2C_Scanner/       # I2C bus debug sketch
+│   ├── Reaction_HardwareTest/    # display / wiring bring-up sketch
 │   └── libraries/         # vendored board libraries (Seeed LSM6DS3)
 ├── prostart/              # Flutter companion app
-├── playground_IMU/        # IMU evaluation: notebook, capture, findings
+├── playground_IMU/        # IMU evaluation notebook + findings
+├── data/                  # IMU capture CSVs
+├── tools/                 # host-side live capture / export tools
 ├── docs/                  # diagrams and figures
-├── HANDOFF.md             # working notes for the live IMU data view
+├── HANDOFF.md             # working notes
 └── README.md
 ```
 
@@ -121,10 +134,12 @@ Reaction-Time-System/
 ## 🚀 Getting Started
 
 ### Firmware
-1. Install [Arduino IDE](https://www.arduino.cc/en/software)
-2. Add your board's package URL under **Preferences → Additional Board Manager URLs**
-3. Install the board package via **Tools → Board → Boards Manager**
-4. Open a sketch from `Arduino/`, select the correct board & port, and **Upload**
+1. Install the [Arduino IDE](https://www.arduino.cc/en/software) (or `arduino-cli`)
+2. Add the Seeed nRF52 board-package URL under **Preferences → Additional Board Manager URLs** and install it via **Boards Manager** — board: *Seeed XIAO nRF52840 Sense* (mbed core; `ArduinoBLE` does not link on the non-mbed core)
+3. Open a sketch from `Arduino/`, select the board & port, and **Upload**
+
+### Radios
+Both XBee modules must share a **PAN ID** and channel and run the same mode (transparent or API). Configure them once with Digi **XCTU** before pairing the boxes.
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)
@@ -137,24 +152,26 @@ Reaction-Time-System/
 
 Flagged early as the main items to test experimentally before committing to the final design:
 
-- 📶 **Wi-Fi range** of the direct SoftAP link at up to 200 m in open field — the single largest architectural risk
+- 📡 **Zigbee/XBee range** at up to ~200 m along a track, plus delivery reliability of the start → finish payload — the single largest architectural risk
+- 🏁 **Finish-detection mechanism** — not yet chosen; it drives the finish-box BOM and firmware
 - 🔊 **Speaker audibility** on an active, noisy track, at range
-- ⏱️ **Clock-offset stability** across trials and over a full training session
-- 🔋 **Battery life** under real, extended use
-- 📡 **BLE Long Range (Coded PHY) feasibility** on our current dev board/library combo — early testing suggests this may need extra work beyond the standard `ArduinoBLE` library
+- 🔋 **Battery life** under real, extended use, per box
+- 📶 **BLE range finish-box ↔ phone**, and 2.4 GHz coexistence with the XBee sharing the enclosure
 
 ---
 
 ## 🗺️ Roadmap
 
-- [x] Validate dev board toolchain (Arduino IDE + board support)
-- [ ] Confirm IMU presence/wiring on current dev board
-- [ ] Test standard BLE range (baseline)
-- [ ] Finalize component list & assemble breadboard prototype
-- [ ] Reaction-time firmware: push-off detection, "go" signal, on-device display
-- [ ] Flutter app: BLE/Wi-Fi connection, reaction-time display
-- [ ] **Phase 2:** photo-finish video capture, torso-crossing detection, sub-frame interpolation, time alignment
+- [x] Validate dev board toolchain (Arduino + board support)
+- [x] Confirm onboard IMU; characterise push-off signal vs. noise floor
+- [ ] Bring up the XBee/Zigbee link between two XIAO boards; measure range and delivery rate on a track
+- [ ] Decide how the finish box registers a finish
+- [ ] Start-box firmware: push-off detection, "go" signal, on-device display
+- [ ] Finish-box firmware: receive result over Zigbee, relay to phone over BLE
+- [ ] Flutter app: BLE connection to the finish box, reaction-time display
+- [ ] Finalize component list & assemble breadboard prototype of both boxes
 - [ ] End-to-end validation against photocell timing gates (Bosön)
+- [ ] **Later phase:** photo-finish video capture, torso-crossing detection, sub-frame interpolation, time alignment
 
 ---
 
