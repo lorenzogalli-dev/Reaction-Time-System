@@ -1,2 +1,20 @@
 default_fqbn: Seeeduino:mbed:xiaonRF52840Sense
-default_port: /dev/cu.usbmodem101
+# No default_port on purpose: it differs per machine, and the range test uses
+# two identical boards, so a hardcoded port would be wrong for at least one of
+# them. Pass it explicitly and check `arduino-cli board list` first.
+#
+# ROLE SELECTION - the sketch defaults to SENDER via `#ifndef RANGE_TEST_ROLE`.
+# Override it on the command line instead of hand-editing the .ino between the
+# two boards (editing it is how you end up with two SENDERs and no echoes):
+#
+#   arduino-cli compile -u -p <sender-port> Arduino/Xbee_RangeTest
+#   arduino-cli compile -u -p <receiver-port> \
+#     --build-property "compiler.cpp.extra_flags=-DRANGE_TEST_ROLE=1" \
+#     Arduino/Xbee_RangeTest
+#
+# Either way, confirm the role in the board's boot banner ("# role: ...")
+# before walking away from the start line.
+#
+# (arduino-cli profiles were tried for this. As of arduino-cli 1.5.1 a
+# profile's `build_properties:` is accepted but never reaches the compiler, so
+# both profiles built as SENDER - hence the explicit flag above.)

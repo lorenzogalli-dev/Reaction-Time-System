@@ -42,6 +42,7 @@ def load(paths):
     role = None
     header = None
     rows = []
+    skipped = 0
     for path in paths:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -53,23 +54,43 @@ def load(paths):
                     role = r
                 elif line.startswith("#") or not line:
                     continue
-                elif header is None and line.startswith("host_iso"):
-                    header = line.split(",")
+                elif line.startswith("host_iso"):
+                    # Every file carries its own header. Only the first one
+                    # defines the columns; the rest have to be skipped, not
+                    # appended as data - they have the right field count, so
+                    # the length check below lets them through and the float()
+                    # conversion then dies on "distance_m".
+                    if header is None:
+                        header = line.split(",")
+                    continue
                 elif header is not None:
                     parts = line.split(",")
                     if len(parts) == len(header):
                         rows.append(parts)
+                    else:
+                        skipped += 1
     if not role or not rows:
         sys.exit("no usable rows found")
     cols = {name: [] for name in header}
     for parts in rows:
-        for name, val in zip(header, parts):
-            cols[name].append(val)
-    out = {"host_iso": np.array(cols["host_iso"])}
-    for name, vals in cols.items():
-        if name == "host_iso":
+        # Guard against any other stray non-numeric line surviving the checks
+        # above (a truncated row from an interrupted logger, a merged file with
+        # a different column set). Drop it rather than crash the whole run.
+        try:
+            vals = [float(v) for v in parts[1:]]
+        except ValueError:
+            skipped += 1
             continue
-        out[name] = np.array([float(v) for v in vals])
+        cols["host_iso"].append(parts[0])
+        for name, val in zip(header[1:], vals):
+            cols[name].append(val)
+    if skipped:
+        print("# skipped %d unparseable row(s)" % skipped)
+    if not cols["host_iso"]:
+        sys.exit("no usable rows found")
+    out = {"host_iso": np.array(cols["host_iso"])}
+    for name in header[1:]:
+        out[name] = np.array(cols[name], dtype=float)
     return role, out
 
 
@@ -94,7 +115,13 @@ def summarise(role, d):
         if role == "sender":
             uni = m & (d["unicast"] == 1)
             exp = (seq.max() - seq.min() + 1) if seq.size else 0
-            row["uplink_pdr"] = (np.sum((d["tx_delivery"][uni] == 0)) / exp) if exp else float("nan")
+            # uplink_pdr is a unicast-only figure: only unicast transmits get a
+            # 0x8B delivery status, so the denominator has to be the unicast
+            # sequence span too. Using the full span would count the handful of
+            # pre-discovery broadcast pings as uplink losses.
+            useq = d["seq"][uni]
+            uexp = (useq.max() - useq.min() + 1) if useq.size else 0
+            row["uplink_pdr"] = (np.sum(d["tx_delivery"][uni] == 0) / uexp) if uexp else float("nan")
             row["rt_pdr"] = (np.sum(d["echo_ok"][m] == 1) / exp) if exp else float("nan")
             ret = d["tx_retries"][uni & (d["tx_retries"] >= 0)]
             row["retries_mean"] = float(ret.mean()) if ret.size else float("nan")
@@ -106,11 +133,12 @@ def summarise(role, d):
             row["rtt_jitter"] = row["rtt_p95"] - row["rtt_p50"]
             rr = d["rssi_remote_dbm"][m & (d["rssi_remote_dbm"] != 0)]
             row["rssi_mean"] = float(rr.mean()) if rr.size else float("nan")
-            row["rssi_worst"] = float(rr.max()) if rr.size else float("nan")
+            # negative dBm: the weakest signal is the most negative -> min()
+            row["rssi_worst"] = float(rr.min()) if rr.size else float("nan")
         else:
             rssi = d["rssi_dbm"][m & (d["rssi_dbm"] != 0)]
             row["rssi_mean"] = float(rssi.mean()) if rssi.size else float("nan")
-            row["rssi_worst"] = float(rssi.max()) if rssi.size else float("nan")
+            row["rssi_worst"] = float(rssi.min()) if rssi.size else float("nan")
             dt = d["dt_us"][m & (d["dt_us"] > 0)]
             row["dt_p50"] = float(np.percentile(dt, 50)) if dt.size else float("nan")
             row["dt_jitter"] = (float(np.percentile(dt, 95) - np.percentile(dt, 50))

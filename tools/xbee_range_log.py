@@ -16,12 +16,16 @@ from host_iso.
 
 WHICH BOARD TO TETHER
 --------------------
-- Tether the SENDER (fixed at the start line, or on battery): you get uplink
-  delivery ratio + MAC retry count + full round-trip RTT. Round-trip PDR is a
-  conservative proxy for one-way.
-- Tether the RECEIVER (the one you carry): you get one-way downlink PDR and
-  clean one-way inter-arrival jitter (dt_us).
-- Tether both (two USB ports / a hub, two copies of this script): all of it.
+Default: tether the SENDER only. The laptop stays at the start line with it and
+the RECEIVER walks away on a power bank - the two boards end up hundreds of
+metres apart, so one host cannot reach both (a USB hub does not span 200 m).
+That gives uplink PDR, MAC retry count, RTT, and the receiver's RSSI, which the
+receiver carries back inside the echo.
+Tethering the RECEIVER instead needs a second laptop and a second copy of this
+script. It adds the two things the sender log cannot show: one-way downlink PDR
+measured at the far end, and clean one-way inter-arrival jitter (dt_us). Without
+it, RTT jitter is the only jitter figure available, and it folds both hops plus
+the receiver's ATDB turnaround into one number.
 
 USAGE
     python3 tools/xbee_range_log.py --distance 0
@@ -151,7 +155,9 @@ class Segment:
         else:
             pdr = 100.0 * self.rows / exp
             rssi_mean = (sum(self.rssi) / len(self.rssi)) if self.rssi else float("nan")
-            rssi_worst = max(self.rssi) if self.rssi else float("nan")  # closest to 0 = weakest
+            # RSSI is negative dBm, so the weakest signal is the most negative:
+            # min(), not max(). Matches the firmware's rssiMin.
+            rssi_worst = min(self.rssi) if self.rssi else float("nan")
             dt = sorted(self.dt_us)
             jit = percentile(dt, 0.95) - percentile(dt, 0.5) if dt else float("nan")
             return ("distance %-4s m  rows %-5d  PDR %5.1f%%  rssi_dbm mean %.1f worst %.0f  "

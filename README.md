@@ -119,6 +119,7 @@ Reaction-Time-System/
 │   ├── HighFrequencySampleRate/  # high-rate serial capture sketch
 │   ├── I2C_Scanner/       # I2C bus debug sketch
 │   ├── Reaction_HardwareTest/    # display / wiring bring-up sketch
+│   ├── Xbee_Passthrough/  # USB<->Serial1 bridge: makes the XIAO XCTU's serial adapter
 │   ├── Xbee_RangeTest/    # start<->finish link range & reliability test (API mode)
 │   └── libraries/         # vendored board libraries (Seeed LSM6DS3)
 ├── prostart/              # Flutter companion app
@@ -141,7 +142,9 @@ Reaction-Time-System/
 3. Open a sketch from `Arduino/`, select the board & port, and **Upload**
 
 ### Radios
-2 × XBee / XBee-PRO **S2C** (`XB24CZ7PIT-004`, 2.4 GHz Zigbee, PCB antenna). In Digi **XCTU**, flash the **XB24C (Z7) — Zigbee** firmware (*not* XBee3): one module as *Coordinator API*, the other as *Router API*. Both need the same `ID` (PAN ID) and `AP=1`; `BD` must match the firmware's `XBEE_BAUD`. XBee is 3.3 V — wired straight to the XIAO (`DOUT→D7`, `DIN→D6`), no level shifter. Production firmware uses the XBee in transparent mode; `Arduino/Xbee_RangeTest/` uses API mode to collect delivery-status and RSSI for the range test — see [`playground_xbee/`](./playground_xbee/).
+2 × XBee / XBee-PRO **S2C** (`XB24CZ7PIT-004`, 2.4 GHz Zigbee, PCB antenna). In Digi **XCTU**, flash the **XB24C (Z7) — Zigbee** firmware (*not* XBee3): one module as *Coordinator API*, the other as *Router API*. Both need the same `ID` (PAN ID) and `AP=1`, and `BD=7` (115200) to match the firmware's `XBEE_BAUD` — the 9600 default is too slow for the range test, where one ping costs four UART transactions. Set `BD=7` on **both** modules first, *then* change `XBEE_BAUD` and reflash; the other order leaves a 115200 board talking to a 9600 module. XBee is 3.3 V — wired straight to the XIAO (`DOUT→D7`, `DIN→D6`), no level shifter.
+
+Our XBee adapter (Parallax 32403) is a passive breakout with no USB chip, so XCTU cannot see the module directly: flash `Arduino/Xbee_Passthrough/` to a XIAO to use it as the USB-to-serial adapter, configure one module at a time, then reflash. Production firmware uses the XBee in transparent mode; `Arduino/Xbee_RangeTest/` uses API mode to collect delivery-status and RSSI for the range test — see [`playground_xbee/`](./playground_xbee/).
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)

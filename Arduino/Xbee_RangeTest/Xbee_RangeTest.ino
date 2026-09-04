@@ -37,7 +37,9 @@
 //   SC (scan channels) left at default is fine; note the joined CH in the log
 //   AP = 1  (API enabled, NOT escaped - this parser does not unescape)
 //   AO = 0  (plain 0x90 receive frames, not explicit 0x91)
-//   BD = 3  (9600, the factory default this sketch assumes) - see XBEE_BAUD
+//   BD = 7  (115200) - NOT the 9600 factory default. Set BD on both modules
+//               before changing XBEE_BAUD below; see the note there for the
+//               ordering and for why 9600 is too slow to measure the radio.
 //   Both modules MUST be the same S2C family/firmware stack, or they will not
 //   pair.
 //
@@ -71,10 +73,31 @@
 #endif
 // ========================================================================
 
-// Must match XCTU's BD parameter on both modules. 9600 (BD=3) is the factory
-// default and is plenty for ~10 Hz of 30-byte frames; raise both to 115200
-// (BD=7) if you extend the payload or the rate.
-static const uint32_t XBEE_BAUD = 9600;
+// Must match XCTU's BD parameter on both modules. This is BD=7, NOT the 9600
+// (BD=3) factory default - see the ordering warning below before flashing.
+//
+// Why not 9600: one ping is four UART transactions, not one, and at 9600
+// (~1.04 ms/byte) the wire dominates the measurement:
+//   sender TX ping        29 B    ~30 ms
+//   receiver RX ping      27 B    ~28 ms
+//   receiver ATDB query    8 B    ~ 8 ms   } the RSSI read, per packet
+//   receiver ATDB reply   10 B    ~10 ms   }
+//   receiver TX echo      29 B    ~30 ms
+//   sender RX echo        27 B    ~28 ms
+//                               ~135 ms of pure serial per round trip, against
+// a radio contribution of only a few ms. Three consequences, all of which turn
+// this into a test of the UART rather than of the radio:
+//   - RTT lands at ~140 ms, longer than PING_PERIOD_MS (100 ms), so pings
+//     queue up behind each other and the RTT curve measures the backlog.
+//   - the receiver spends ~77 ms of every 100 ms window shifting bytes.
+//   - the ATDB round trip alone is ~19 ms against DB_TIMEOUT_MS of 40 ms, so
+//     any hiccup starts dropping RSSI readings.
+// At 115200 the same 135 ms becomes ~11 ms and the radio is what is measured.
+//
+// *** ORDERING: set BD=7 in XCTU on BOTH modules first (over the still-9600
+// *** link), and only then change this constant and reflash. Changing this
+// *** first leaves the XIAO at 115200 talking to a 9600 module - a dead link.
+static const uint32_t XBEE_BAUD = 115200;
 
 // Ping cadence and the window the SENDER waits for an echo before it logs the
 // packet as a round-trip loss.
@@ -240,13 +263,18 @@ static void  printSummary();
 static uint32_t stSent = 0, stStatusOk = 0, stEchoOk = 0, stRetriesSum = 0;
 static uint32_t stRttMin = 0xFFFFFFFF, stRttMax = 0, stRttCount = 0;
 static uint64_t stRttSum = 0;
+static uint32_t stForced = 0;   // rows emitted early because the ring filled
 
 static Sent* ringAlloc() {
   for (auto& e : ring) if (!e.used) return &e;
-  // No free slot: force-emit the oldest so logging never silently drops a row.
+  // No free slot: emit the oldest before reusing it, so logging never silently
+  // drops a row. The row goes out incomplete (a status or echo still in flight
+  // is now unmatchable and reads as a loss), so count these - a nonzero count
+  // means the ring is too small for the ping rate and inflates the loss rate.
   Sent* oldest = &ring[0];
   for (auto& e : ring) if (e.used && e.txMs < oldest->txMs) oldest = &e;
-  oldest->used = false;
+  emit(*oldest);          // clears used
+  stForced++;
   return oldest;
 }
 
@@ -277,6 +305,7 @@ static void emit(Sent& e) {
 static void resetStats() {
   stSent = stStatusOk = stEchoOk = stRetriesSum = 0;
   stRttMin = 0xFFFFFFFF; stRttMax = 0; stRttCount = 0; stRttSum = 0;
+  stForced = 0;
   Serial.println("# stats reset");
 }
 
@@ -295,6 +324,10 @@ static void printSummary() {
     Serial.print("  mean ");        Serial.print((double)(stRttSum / stRttCount));
     Serial.print("  max ");         Serial.println(stRttMax);
     Serial.println("# (host log has the full RTT distribution / percentiles)");
+  }
+  if (stForced) {
+    Serial.print("# ring full, rows emitted early: "); Serial.println(stForced);
+    Serial.println("# (these read as losses - grow ring[] if this is not 0)");
   }
 }
 
