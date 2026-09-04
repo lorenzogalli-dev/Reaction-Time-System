@@ -14,10 +14,6 @@
 
 ---
 
-> 🧭 **Hardware direction under evaluation:** the **Arduino Nano 33 IoT** looks like the best fit so far — it integrates Wi-Fi, Bluetooth/BLE, and a 6-axis IMU (LSM6DS3) on a single Arduino-compatible board, avoiding the need for external IMU wiring. Alternatives considered: the **ESP32-WROOM-32U** (Wi-Fi + BLE, no onboard IMU — would need an external MPU6050/ICM-42688 wired via I2C, as originally planned), and the **M5Stack Core2/StickC** (Wi-Fi + BLE + onboard IMU, plus a built-in display, speaker and mic — trading compactness and Arduino-IDE simplicity for a more all-in-one, if slightly bulkier, package).
-
----
-
 ## 📖 Overview
 
 This repository contains the design and implementation of a **two-part system**:
