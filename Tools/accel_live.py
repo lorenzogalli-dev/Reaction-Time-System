@@ -8,9 +8,9 @@ CSV + a PNG overview on request. t_us is a real per-sample micros() reading
 taken on the board, not a nominal index * period.
 
 Usage:
-    python3 tools/accel_live.py                    # autodetect the port
-    python3 tools/accel_live.py --port /dev/cu.usbmodem1101
-    python3 tools/accel_live.py --simulate          # no hardware, UI only
+    python3 Tools/accel_live.py                    # autodetect the port
+    python3 Tools/accel_live.py --port /dev/cu.usbmodem1101
+    python3 Tools/accel_live.py --simulate          # no hardware, UI only
 
 Controls: on-screen buttons, or keys r (record), s (stop), p (snapshot PNG).
 
@@ -35,7 +35,7 @@ CMD_START = b"r"
 CMD_STOP = b"s"
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "data")
+DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "Data")
 
 
 # ---------------------------------------------------------------------------

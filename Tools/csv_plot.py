@@ -5,16 +5,16 @@ Arduino/HighFrequencySampleRate/CSV_Visualizer, which crashed outright on
 anything but its own original column layout.
 
 Handles both formats seen in this repo:
-  - current (tools/accel_live.py): commented metadata header, then
+  - current (Tools/accel_live.py): commented metadata header, then
     t_s,t_us,x_g,y_g,z_g,host_iso
-  - older (e.g. data/Block_Start_Data.csv): no comment header,
+  - older (e.g. Data/blockstart_20260831_test0.csv): no comment header,
     timestamp_iso,elapsed_s,x_g,y_g,z_g
 
 The time column is auto-detected (t_s if present, else elapsed_s), so both
 plot correctly without needing to know which pipeline produced the file.
 
 Usage:
-    python3 tools/csv_plot.py
+    python3 Tools/csv_plot.py
 
 Always opens a file-browser dialog to pick the CSV - no path to type or
 remember on the command line.
@@ -38,7 +38,7 @@ def pick_file():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return filedialog.askopenfilename(
         title="Select an accel_live CSV file",
-        initialdir=os.path.join(repo_root, "data"),
+        initialdir=os.path.join(repo_root, "Data"),
         filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
     )
 
@@ -56,7 +56,7 @@ def main(argv=None):
     df["mag_g"] = np.sqrt(df["x_g"] ** 2 + df["y_g"] ** 2 + df["z_g"] ** 2)
 
     if "t_s" in df.columns:
-        time_col = "t_s"          # tools/accel_live.py
+        time_col = "t_s"          # Tools/accel_live.py
     elif "elapsed_s" in df.columns:
         time_col = "elapsed_s"    # older kinestart/BLEtest.ino format
     else:

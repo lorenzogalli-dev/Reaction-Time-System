@@ -8,7 +8,7 @@
 
 ## 🖼️ System at a glance
 
-![System overview v2: the start block and finish block (each a XIAO nRF52840 Sense with button, OLED, speaker, IMU, battery, in a compact enclosure) linked by Zigbee, the finish block relaying to the phone app, and the eight-step end-to-end flow from connection and clock calibration, through the local start sequence and reaction-time measurement, to AI torso-crossing analysis and results on the phone.](Docs/reaction_time_diagram_v2.png)
+![System overview v2: the start block and finish block (each a XIAO nRF52840 Sense with button, OLED, speaker, IMU, battery, in a compact enclosure) linked by Zigbee, the finish block relaying to the phone app over BLE (with WiFi Direct as a fallback if Zigbee is unreliable), and the eight-step end-to-end flow from connection and clock calibration, through the local start sequence and reaction-time measurement, to AI torso-crossing analysis and results on the phone.](Docs/reaction_time_diagram_v2.png)
 
 *Both blocks compute and timestamp locally in microseconds on their own clock. The phone is used only for calibration, receiving results, recording video, and AI post-processing.*
 
@@ -53,7 +53,7 @@ Start unit (XIAO #1)  --Zigbee-->  Finish unit (XIAO #2)  --BLE-->  Phone (Flutt
 ```
 
 - **Start unit** — sits at the blocks. Button trigger, onboard speaker for the "on your marks – set – go" sequence, and an IMU (accelerometer) that detects the push-off. Reaction time is computed **locally**, on the same clock that generated the "go" cue, so BLE/Zigbee latency downstream never touches the measurement itself.
-- **Finish unit** — sits at (or near) the finish line, within BLE range of the phone. Receives the start unit's timestamp over **Zigbee** (longer range and low power, well suited to a fixed point-to-point link) and relays it to the phone over **BLE** — so the phone only ever needs to be near the finish line, never the start.
+- **Finish unit** — sits at (or near) the finish line, within BLE range of the phone. Receives the start unit's timestamp over **Zigbee** (longer range and low power, well suited to a fixed point-to-point link) and relays it to the phone over **BLE** — so the phone only ever needs to be near the finish line, never the start. If Zigbee proves unreliable in the field, **WiFi Direct (SoftAP)** is the documented fallback for the same start↔finish hop.
 - **Phone (Flutter app)** — displays the reaction time, logs it, and runs the photo-finish pipeline against its own camera feed.
 
 This split is under active validation right now — the open question is whether the two independent microcontrollers' clocks can be synchronized precisely enough across the Zigbee hop for reaction-time-grade timing. See [Open Risks](#-open-risks--things-to-validate).
@@ -64,7 +64,7 @@ This split is under active validation right now — the open question is whether
 |---|---|---|
 | Push-off detection | **IMU** (accelerometer) on device body | Cheap, no block modification needed, easy retrofit — vs. a force/pressure sensor behind the pedal (more accurate, but invasive) |
 | Start sequence | **Onboard speaker**, locally generated | Zero sync uncertainty between "go" cue and measurement clock, works without a human starter |
-| Start ↔ Finish link | **Zigbee** | Longer reliable range than BLE at low power, for a fixed point-to-point link that doesn't need a phone in the middle |
+| Start ↔ Finish link | **Zigbee**, WiFi Direct (SoftAP) as fallback | Longer reliable range than BLE at low power, for a fixed point-to-point link that doesn't need a phone in the middle |
 | Finish ↔ Phone link | **BLE** | Short-range but simple and universal; the phone only needs to be near the finish line, not the start |
 
 ---
@@ -210,8 +210,8 @@ For exact tool/library versions and the full step-by-step for both firmware and 
 
 What we're actually seeing right now, not a wishlist:
 
-- ❌ **Wi-Fi is out.** Ruled out on UX grounds (see [How the System Works](#️-how-the-system-works)) — not being pursued further.
-- 📏 **BLE range measured at ~25 m max**, confirmed in real testing — this is what forced the two-hop Zigbee + BLE design.
+- ❌ **Wi-Fi as the primary phone link is out.** Ruled out on UX grounds (see [How the System Works](#️-how-the-system-works)) — a direct SoftAP link to the phone is not being pursued. WiFi Direct (SoftAP) still exists as a narrower fallback purely for the start↔finish hop, only if Zigbee proves unreliable there.
+- 📏 **BLE range measured at ~25 m max**, confirmed in real testing — this is what forced the two-hop Zigbee + BLE design instead of a single BLE link end-to-end.
 - 🔄 **Zigbee start↔finish link — in progress.** We're now building and testing the two-XIAO link; the open question is whether the two boards' independent clocks can be synchronized tightly enough over Zigbee for reaction-time-grade precision. Not yet validated.
 - 🔊 **Speaker audibility** on an active, noisy track, at range.
 - 🔋 **Battery life** under real, extended use, for both units.

@@ -29,19 +29,18 @@ it's documentation and product/business content only. What changed:
   `README.md` (redundant with the image), replaced by a prose "How the
   System Works" section.
 
-**Unresolved discrepancy, flagged but not resolved — needs a human decision:**
-the user described the finish unit as talking **BLE** to the phone, and
-`README.md`'s prose says exactly that. But the new `reaction_time_diagram_v2.png`
-the user supplied shows the finish block talking **Zigbee** to the phone too
-(end-to-end Zigbee: start↔finish↔phone), with **Wi-Fi Direct/SoftAP as a
-documented fallback** if Zigbee proves unreliable — no BLE anywhere in that
-diagram. These two sources of truth disagree. `README.md`'s prose currently
-still says BLE for the finish↔phone hop; it was **not** rewritten to match
-the diagram, since which one is actually correct is a product decision, not
-something to infer. Whoever picks this up next should get a straight answer
-from the user on which link the finish unit actually uses to the phone, then
-make `README.md`'s prose, the Hardware/Software Stack tables, and the Open
-Risks section consistent with the diagram (or vice versa).
+**Discrepancy above: resolved 2026-09-04, same day.** The first
+`reaction_time_diagram_v2.png` the user supplied showed the finish block
+talking Zigbee to the phone (no BLE anywhere in it), contradicting the
+user's own verbal description and `README.md`'s prose (both said BLE). The
+user then supplied a corrected diagram (same filename, overwritten) that
+matches the verbal description: **Zigbee for start↔finish, BLE for
+finish↔phone**, with **WiFi Direct (SoftAP) as a fallback specifically for
+the start↔finish hop** if Zigbee proves unreliable — not a phone-facing
+fallback. `README.md`'s "How the System Works", "Key design decisions"
+table, and "Open Risks" section were updated to state the WiFi-fallback
+nuance explicitly, so the image and the prose now agree. Nothing further to
+reconcile here.
 
 ## READ THIS FIRST — repo reorganized 2026-09-04, BLEtest.ino removed
 
