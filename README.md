@@ -119,11 +119,13 @@ Reaction-Time-System/
 │   ├── HighFrequencySampleRate/  # high-rate serial capture sketch
 │   ├── I2C_Scanner/       # I2C bus debug sketch
 │   ├── Reaction_HardwareTest/    # display / wiring bring-up sketch
+│   ├── Xbee_RangeTest/    # start<->finish link range & reliability test (API mode)
 │   └── libraries/         # vendored board libraries (Seeed LSM6DS3)
 ├── prostart/              # Flutter companion app
 ├── playground_IMU/        # IMU evaluation notebook + findings
-├── data/                  # IMU capture CSVs
-├── tools/                 # host-side live capture / export tools
+├── playground_xbee/       # XBee range-test method + findings
+├── data/                  # IMU + XBee capture CSVs
+├── tools/                 # host-side capture / export / analysis tools
 ├── docs/                  # diagrams and figures
 ├── HANDOFF.md             # working notes
 └── README.md
@@ -139,7 +141,7 @@ Reaction-Time-System/
 3. Open a sketch from `Arduino/`, select the board & port, and **Upload**
 
 ### Radios
-Both XBee modules must share a **PAN ID** and channel and run the same mode (transparent or API). Configure them once with Digi **XCTU** before pairing the boxes.
+2 × XBee / XBee-PRO **S2C** (`XB24CZ7PIT-004`, 2.4 GHz Zigbee, PCB antenna). In Digi **XCTU**, flash the **XB24C (Z7) — Zigbee** firmware (*not* XBee3): one module as *Coordinator API*, the other as *Router API*. Both need the same `ID` (PAN ID) and `AP=1`; `BD` must match the firmware's `XBEE_BAUD`. XBee is 3.3 V — wired straight to the XIAO (`DOUT→D7`, `DIN→D6`), no level shifter. Production firmware uses the XBee in transparent mode; `Arduino/Xbee_RangeTest/` uses API mode to collect delivery-status and RSSI for the range test — see [`playground_xbee/`](./playground_xbee/).
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)
@@ -164,7 +166,7 @@ Flagged early as the main items to test experimentally before committing to the 
 
 - [x] Validate dev board toolchain (Arduino + board support)
 - [x] Confirm onboard IMU; characterise push-off signal vs. noise floor
-- [ ] Bring up the XBee/Zigbee link between two XIAO boards; measure range and delivery rate on a track
+- [ ] Bring up the XBee/Zigbee link between two XIAO boards; measure range and delivery rate on a track — test tooling in `Arduino/Xbee_RangeTest/` + `tools/xbee_range_*.py`, method in `playground_xbee/`
 - [ ] Decide how the finish box registers a finish
 - [ ] Start-box firmware: push-off detection, "go" signal, on-device display
 - [ ] Finish-box firmware: receive result over Zigbee, relay to phone over BLE

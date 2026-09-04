@@ -249,6 +249,40 @@ mounted where it will actually live.
 The photo-finish clock-synchronization figures in `playground_IMU/README.md`
 are estimates from known BLE/WiFi behaviour, **not measured on this hardware**.
 
+## XBee link range test
+
+The start box <-> finish box link is **XBee / XBee-PRO S2C** (`XB24CZ7PIT-004`,
+2.4 GHz Zigbee, PCB antenna). Tooling to validate its range is in place; the
+walk test itself has **not been run** (no XBee hardware attached when this was
+written, and the sketch has been compile-checked only, per convention 2).
+
+- `Arduino/Xbee_RangeTest/Xbee_RangeTest.ino` — one sketch, two roles chosen by
+  the `RANGE_TEST_ROLE` `#define` at the top. SENDER pings at 10 Hz; RECEIVER
+  echoes each ping and queries `ATDB` for RSSI. **API mode** (`AP=1`,
+  unescaped), because that is the only way to get the `0x8B` transmit-status
+  frame (delivery result + MAC retry count) and per-node RSSI. Production
+  `Prostart_*` firmware still uses transparent mode — this does not change that.
+  Peer discovery is automatic: the first pings go out broadcast, the SENDER
+  latches the RECEIVER's 64-bit address from the first echo, then unicasts.
+- USB-serial output is one CSV row per packet (`S,...` / `R,...`); `#` lines
+  are diagnostics. `'r'` resets the on-board counters at each new distance,
+  `'t'` prints a summary.
+- `tools/xbee_range_log.py` — tether either board, transcribes rows to
+  `data/xbee_range_*.csv` with a host timestamp and a distance tag you set with
+  `d <metres>` (which also resets the board). Live PDR/RSSI/RTT readout.
+- `tools/xbee_range_plot.py` — PDR / RSSI / RTT vs distance, plus the max
+  distance meeting the criterion and, if short of 200 m, which upgrade that
+  implies.
+- Full method, XCTU parameters, wiring and the results table:
+  `playground_xbee/README.md`.
+
+Pass criterion: PDR >= 95% at the target distance (retries/ACK allowed). Log
+the full RTT distribution and retry count per point, not just PDR — rising
+min-RTT / jitter is the leading indicator for clock-sync degradation, which
+matters more than raw PDR here since reaction time comes from synced on-device
+clocks, not radio latency. "Doesn't clear 200 m" is a valid result that names
+the needed upgrade (wire-whip antenna, then XBee-PRO), not a blocked task.
+
 ## Conventions
 
 Commit messages in this repo carry **no Claude/Anthropic attribution trailers**
