@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-Interfaccia live per il firmware Prostart/BlockStart su XIAO nRF52840 Sense.
+Live interface for the Prostart/BlockStart firmware on the XIAO nRF52840 Sense.
 
-Mostra l'accelerometro in tempo reale, registra su CSV ed esporta i grafici.
+Shows the accelerometer in real time, records to CSV and exports the plots.
 
-IL TEMPO
---------
-L'unico orologio della misura e' micros() del nRF52840. Il firmware emette
-righe "elapsed_s,x_g,y_g,z_g" dove elapsed_s viene dai timestamp della FIFO
-hardware agganciati dal PLL di bordo: e' il tempo di *cattura* del campione,
-non di arrivo. Questo script non timestampa nulla ai fini della misura - si
-limita a trascrivere il tempo del dispositivo.
+TIME
+----
+The only clock for the measurement is the nRF52840's micros(). The firmware
+emits "elapsed_s,x_g,y_g,z_g" rows where elapsed_s comes from the hardware FIFO
+timestamps locked by the on-board PLL: it is the sample's *capture* time, not
+its arrival time. This script does not timestamp anything for the purposes of
+the measurement - it merely transcribes the device's time.
 
-La colonna host_iso nel CSV e' l'ora di arrivo sul computer ed e' li' solo per
-incrociare una cattura con altri log. Non va usata per misurare: il buffering
-di USB e sistema operativo la sposta di decine di ms in modo variabile.
+The host_iso column in the CSV is the arrival time on the computer and is there
+only to cross-reference a capture with other logs. It must not be used to
+measure: USB and OS buffering shift it by tens of ms in a variable way.
 
-USO
----
-    python3 tools/kinestart_live.py                 # trova la porta da solo
+USAGE
+-----
+    python3 tools/kinestart_live.py                 # finds the port by itself
     python3 tools/kinestart_live.py --port /dev/cu.usbmodem1101
-    python3 tools/kinestart_live.py --simulate      # senza hardware, per provare la UI
+    python3 tools/kinestart_live.py --simulate      # no hardware, to try the UI
 
-Comandi: pulsanti in basso, oppure i tasti r (registra), s (stop), p (snapshot).
+Commands: buttons at the bottom, or the keys r (record), s (stop), p (snapshot).
 
-Richiede: pyserial, matplotlib, numpy.
+Requires: pyserial, matplotlib, numpy.
 """
 
 import argparse
@@ -41,7 +41,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
-# Il firmware apre lo stream su 'r' e lo chiude su 's'.
+# The firmware opens the stream on 'r' and closes it on 's'.
 CMD_START = b"r"
 CMD_STOP = b"s"
 
@@ -50,20 +50,20 @@ DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "data")
 
 
 # ---------------------------------------------------------------------------
-# Sorgenti dati
+# Data sources
 # ---------------------------------------------------------------------------
 
 class SerialSource:
-    """Legge la seriale a blocchi e restituisce righe di testo complete.
+    """Reads the serial port in blocks and returns complete lines of text.
 
-    A blocchi e non con readline(): a 833 Hz arrivano ~833 righe al secondo, e
-    una readline() per riga mentre il thread grafico tiene il GIL lascia
-    riempire il buffer del sistema operativo. Leggere tutto quello che c'e' e
-    spezzarlo in memoria toglie il problema alla radice.
+    In blocks, not with readline(): at 833 Hz ~833 rows per second arrive, and
+    one readline() per row while the plotting thread holds the GIL lets the OS
+    buffer fill up. Reading everything that is there and splitting it in memory
+    removes the problem at the root.
     """
 
     def __init__(self, port, baud):
-        import serial  # importato qui: con --simulate pyserial non serve
+        import serial  # imported here: with --simulate pyserial is not needed
         self.port = port
         self._ser = serial.Serial(port, baud, timeout=0.05)
         self._tail = ""
@@ -77,7 +77,7 @@ class SerialSource:
             return []
         text = self._tail + chunk.decode("utf-8", errors="ignore")
         parts = text.split("\n")
-        self._tail = parts.pop()  # ultima riga: probabilmente incompleta
+        self._tail = parts.pop()  # last line: probably incomplete
         return parts
 
     def close(self):
@@ -93,14 +93,14 @@ class SerialSource:
 
 
 class SimulatedSource:
-    """Genera lo stesso testo del firmware, per provare la UI senza board.
+    """Generates the same text as the firmware, to try the UI without a board.
 
-    Serve a verificare la catena completa - parsing, grafico, CSV, export -
-    quando la board non e' collegata. I dati sono finti; il formato no.
+    It is there to verify the full chain - parsing, plotting, CSV, export -
+    when the board is not connected. The data is fake; the format is not.
     """
 
     def __init__(self, odr_hz, accel_range_g):
-        self.port = "simulato"
+        self.port = "simulated"
         self._odr = odr_hz
         self._range = accel_range_g
         self._n = 0
@@ -108,7 +108,7 @@ class SimulatedSource:
         self._emitted = 0
         self._banner = [
             "IMU OK - accel %d Hz, +/-%d g, FIFO continuous" % (odr_hz, accel_range_g),
-            "Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest, 'r'/'s' cattura CSV.",
+            "Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest, 'r'/'s' CSV capture.",
         ]
 
     def read_lines(self):
@@ -120,8 +120,8 @@ class SimulatedSource:
         while self._emitted < due:
             k = self._emitted
             t = k / self._odr
-            # Fondo: gravita' su Z piu' rumore. Ogni 5 s un transitorio che
-            # somiglia a una partenza, cosi' il picco e il grafico si vedono.
+            # Baseline: gravity on Z plus noise. Every 5 s a transient that
+            # resembles a start, so the peak and the chart are visible.
             phase = t % 5.0
             burst = math.exp(-((phase - 2.0) ** 2) / 0.002) * 3.0 if phase < 3 else 0.0
             ax = 0.01 * math.sin(2 * math.pi * 3 * t) + np.random.normal(0, 0.004)
@@ -138,7 +138,7 @@ class SimulatedSource:
 
 
 # ---------------------------------------------------------------------------
-# Applicazione
+# Application
 # ---------------------------------------------------------------------------
 
 class LiveApp:
@@ -158,21 +158,21 @@ class LiveApp:
         self.lock = threading.Lock()
         self.running = True
         self.source = None
-        self.status = "avvio..."
+        self.status = "starting..."
         self.last_message = ""
 
-        # --- stato registrazione ---
+        # --- recording state ---
         self.recording = False
         self.csv_file = None
         self.csv_path = None
-        self.rec_t0 = None            # elapsed del dispositivo all'inizio della registrazione
+        self.rec_t0 = None            # device elapsed at the start of the recording
         self.rec_rows = 0
         self.rec_peak = 0.0
         self.rec_clipped = 0
         self.rec_gaps = 0
-        self.rec_data = []            # per il PNG di fine registrazione
+        self.rec_data = []            # for the end-of-recording PNG
 
-        # --- statistiche live ---
+        # --- live statistics ---
         self.total_samples = 0
         self.host_t0 = time.monotonic()
         self.last_elapsed = None
@@ -181,7 +181,7 @@ class LiveApp:
 
         self._build_ui()
 
-    # -- sorgente -----------------------------------------------------------
+    # -- source -----------------------------------------------------------
 
     def connect(self):
         try:
@@ -190,12 +190,12 @@ class LiveApp:
             else:
                 port = self.args.port or autodetect_port()
                 if port is None:
-                    self.status = "nessuna porta trovata - collega la board e riavvia"
+                    self.status = "no port found - connect the board and restart"
                     return
                 self.source = SerialSource(port, self.args.baud)
-            self.status = "connesso a %s" % self.source.port
+            self.status = "connected to %s" % self.source.port
         except Exception as exc:
-            self.status = "connessione fallita: %s" % exc
+            self.status = "connection failed: %s" % exc
             self.source = None
             return
         threading.Thread(target=self._reader, daemon=True).start()
@@ -205,7 +205,7 @@ class LiveApp:
             try:
                 lines = self.source.read_lines()
             except Exception as exc:
-                self.status = "errore di lettura: %s" % exc
+                self.status = "read error: %s" % exc
                 return
             for line in lines:
                 self._handle_line(line.strip())
@@ -227,8 +227,8 @@ class LiveApp:
         mag = math.sqrt(ax * ax + ay * ay + az * az)
         host_iso = datetime.now(timezone.utc).isoformat()
 
-        # Un salto molto piu' largo del periodo nominale significa campioni
-        # persi: il firmware li dichiara, ma cosi' si vedono anche qui.
+        # A jump much wider than the nominal period means lost samples: the
+        # firmware declares them, but this way they are visible here too.
         if self.last_elapsed is not None:
             if elapsed - self.last_elapsed > 3.0 / self.odr:
                 self.gap_count += 1
@@ -254,13 +254,13 @@ class LiveApp:
                 self.rec_data.append((t_rel, ax, ay, az, mag))
                 if mag > self.rec_peak:
                     self.rec_peak = mag
-                # Clipping: il fronte di salita e' proprio dove si legge
-                # l'onset, saturare li' rovina la misura senza farsi notare.
+                # Clipping: the rising edge is exactly where the onset is read,
+                # saturating there ruins the measurement without being noticed.
                 if max(abs(ax), abs(ay), abs(az)) >= 0.95 * self.accel_range:
                     self.rec_clipped += 1
 
     def _handle_message(self, line):
-        """Righe di testo del firmware: banner, esiti, diagnostica."""
+        """Text lines from the firmware: banner, outcomes, diagnostics."""
         self.last_message = line
         if "+/-" in line and " g," in line:
             # "IMU OK - accel 833 Hz, +/-4 g, FIFO continuous"
@@ -275,7 +275,7 @@ class LiveApp:
             except (IndexError, ValueError):
                 pass
 
-    # -- registrazione ------------------------------------------------------
+    # -- recording ------------------------------------------------------
 
     def start_recording(self, _event=None):
         if self.recording:
@@ -289,9 +289,9 @@ class LiveApp:
         f.write("# source: %s\n" % (self.source.port if self.source else "?"))
         f.write("# odr_hz_nominal: %d\n" % self.odr)
         f.write("# accel_range_g: %d\n" % self.accel_range)
-        f.write("# t_s e device_elapsed_s vengono dal clock micros() della board\n")
-        f.write("# (FIFO hardware + PLL di bordo). host_iso e' l'ora di arrivo\n")
-        f.write("# sul computer: solo per riferimento incrociato, non per misurare.\n")
+        f.write("# t_s and device_elapsed_s come from the board's micros() clock\n")
+        f.write("# (hardware FIFO + on-board PLL). host_iso is the arrival time\n")
+        f.write("# on the computer: for cross-reference only, not for measuring.\n")
         f.write("t_s,device_elapsed_s,x_g,y_g,z_g,host_iso\n")
 
         with self.lock:
@@ -303,7 +303,7 @@ class LiveApp:
             self.rec_gaps = 0
             self.rec_data = []
             self.recording = True
-        self.status = "registrazione -> %s" % os.path.basename(self.csv_path)
+        self.status = "recording -> %s" % os.path.basename(self.csv_path)
 
     def stop_recording(self, _event=None):
         if not self.recording:
@@ -321,17 +321,17 @@ class LiveApp:
             png = os.path.splitext(path)[0] + ".png"
             self._save_overview(data, png)
 
-        self.status = "salvate %d righe in %s%s" % (
+        self.status = "saved %d rows to %s%s" % (
             rows, os.path.basename(path),
             " (+ %s)" % os.path.basename(png) if png else "")
 
     def _save_overview(self, data, png_path):
-        """PNG dell'intera registrazione, non solo della finestra a schermo."""
+        """PNG of the whole recording, not just the on-screen window."""
         arr = np.asarray(data, dtype=float)
         t, ax_, ay_, az_, mag = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
 
         fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-        fig.suptitle("kinestart - %s (%d campioni, %.2f s)"
+        fig.suptitle("kinestart - %s (%d samples, %.2f s)"
                      % (os.path.basename(png_path), len(t), t[-1] - t[0]))
         a1.plot(t, ax_, "r-", lw=0.7, label="X")
         a1.plot(t, ay_, "g-", lw=0.7, label="Y")
@@ -344,9 +344,9 @@ class LiveApp:
 
         a2.plot(t, mag, "m-", lw=0.9, label="|a|")
         a2.axhline(mag.max(), color="0.5", ls="--", lw=0.8,
-                   label="picco %.3f g" % mag.max())
-        a2.set_xlabel("Tempo dall'inizio registrazione [s]  (clock della board)")
-        a2.set_ylabel("Magnitudine [g]")
+                   label="peak %.3f g" % mag.max())
+        a2.set_xlabel("Time since recording start [s]  (board clock)")
+        a2.set_ylabel("Magnitude [g]")
         a2.grid(True, ls="--", alpha=0.5)
         a2.legend(loc="upper right", fontsize=8)
 
@@ -359,9 +359,9 @@ class LiveApp:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.args.outdir, "kinestart_snapshot_%s.png" % stamp)
         self.fig.savefig(path, dpi=140)
-        self.status = "snapshot salvato in %s" % os.path.basename(path)
+        self.status = "snapshot saved to %s" % os.path.basename(path)
 
-    # -- interfaccia --------------------------------------------------------
+    # -- interface --------------------------------------------------------
 
     def _build_ui(self):
         self.fig, (self.ax_accel, self.ax_mag) = plt.subplots(
@@ -377,22 +377,22 @@ class LiveApp:
         self.ax_accel.legend(loc="upper left", fontsize=8, ncol=3)
 
         (self.l_m,) = self.ax_mag.plot([], [], "m-", lw=1.0, label="|a|")
-        self.ax_mag.set_xlabel("Tempo dal clock della board [s]")
-        self.ax_mag.set_ylabel("Magnitudine [g]")
+        self.ax_mag.set_xlabel("Time from the board clock [s]")
+        self.ax_mag.set_ylabel("Magnitude [g]")
         self.ax_mag.grid(True, ls="--", alpha=0.5)
 
-        # Due blocchi separati: lo stato cambia di rado, le statistiche a ogni
-        # ridisegno. Il secondo puo' occupare due righe, da cui la distanza.
+        # Two separate blocks: the status changes rarely, the statistics on
+        # every redraw. The second can span two lines, hence the spacing.
         self.txt_status = self.fig.text(0.012, 0.965, "", fontsize=9.5,
                                         family="monospace", weight="bold")
         self.txt_stats = self.fig.text(0.012, 0.925, "", fontsize=9,
                                        family="monospace", va="top")
 
-        # I riferimenti ai Button vanno tenuti vivi, altrimenti il garbage
-        # collector li porta via e i pulsanti smettono di rispondere.
+        # The references to the Buttons must be kept alive, otherwise the
+        # garbage collector takes them away and the buttons stop responding.
         self.buttons = []
         specs = [
-            ("Registra (r)", self.start_recording),
+            ("Record (r)", self.start_recording),
             ("Stop (s)", self.stop_recording),
             ("Snapshot PNG (p)", self.snapshot),
         ]
@@ -443,24 +443,24 @@ class LiveApp:
             self.ax_accel.set_ylim(lo - pad, hi + pad)
             self.ax_mag.set_ylim(min(m) - 0.1, max(m) + 0.2)
 
-        # Frequenza *misurata* sul clock della board contro quella osservata
-        # dall'host: se la seconda e' piu' bassa il collo di bottiglia e' qui,
-        # non sulla board.
+        # Rate *measured* on the board clock against the one observed by the
+        # host: if the second is lower the bottleneck is here, not on the
+        # board.
         span = t_all[1] - t_all[0]
         dev_rate = (n_win - 1) / span if span > 0 else 0.0
         host_rate = self.total_samples / max(1e-6, time.monotonic() - self.host_t0)
 
         state = "REC" if recording else "---"
         self.txt_status.set_text("[%s] %s" % (state, self.status))
-        stats = ("campioni %-9d  rate board %7.1f Hz  rate host %7.1f Hz  "
-                 "gap %-4d  fondo scala +/-%d g"
+        stats = ("samples %-9d  rate board %7.1f Hz  rate host %7.1f Hz  "
+                 "gap %-4d  full scale +/-%d g"
                  % (self.total_samples, dev_rate, host_rate, self.gap_count,
                     self.accel_range))
         if recording:
-            stats += "\n              righe %-9d  picco %6.3f g  clip %-5d  gap %d" % (
+            stats += "\n              rows %-9d  peak %6.3f g  clip %-5d  gap %d" % (
                 rec_rows, rec_peak, rec_clipped, rec_gaps)
         if rec_clipped:
-            stats += "   <<< SATURAZIONE: alza il fondo scala"
+            stats += "   <<< CLIPPING: raise the full-scale range"
         self.txt_stats.set_text(stats)
 
     def run(self):
@@ -480,7 +480,7 @@ class LiveApp:
 
 
 def autodetect_port():
-    """Prima la porta segnalata da pyserial, poi i nomi tipici di macOS."""
+    """First the port reported by pyserial, then the typical macOS names."""
     try:
         from serial.tools import list_ports
         for p in list_ports.comports():
@@ -499,18 +499,18 @@ def autodetect_port():
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", help="porta seriale (default: rilevata da sola)")
-    ap.add_argument("--baud", type=int, default=921600, help="deve combaciare col firmware")
-    ap.add_argument("--odr", type=int, default=833, help="ODR nominale dell'accelerometro")
+    ap.add_argument("--port", help="serial port (default: auto-detected)")
+    ap.add_argument("--baud", type=int, default=921600, help="must match the firmware")
+    ap.add_argument("--odr", type=int, default=833, help="nominal accelerometer ODR")
     ap.add_argument("--range", type=int, default=4,
-                    help="fondo scala in g; aggiornato da solo se la board lo annuncia")
-    ap.add_argument("--window", type=float, default=3.0, help="secondi visibili a schermo")
-    ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="dove finiscono CSV e PNG")
-    ap.add_argument("--refresh-ms", type=int, default=200, help="periodo di ridisegno")
+                    help="full scale in g; updated by itself if the board announces it")
+    ap.add_argument("--window", type=float, default=3.0, help="seconds visible on screen")
+    ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="where CSV and PNG files go")
+    ap.add_argument("--refresh-ms", type=int, default=200, help="redraw period")
     ap.add_argument("--plot-decimation", type=int, default=4,
-                    help="1 punto ogni N nel grafico; il CSV resta a piena frequenza")
+                    help="1 point every N in the plot; the CSV stays at full rate")
     ap.add_argument("--simulate", action="store_true",
-                    help="dati finti, per provare l'interfaccia senza board")
+                    help="fake data, to try the interface without a board")
     args = ap.parse_args(argv)
 
     app = LiveApp(args)
