@@ -1,11 +1,88 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-08-29. Written for an agent starting with no prior context.
+Last updated: 2026-09-03. Written for an agent starting with no prior context.
 
-Two pieces of work, in order: the live accelerometer view in the Flutter app,
-and then an evaluation of what the captured data says about the sensor's
-suitability for false-start detection. The second is the one with consequences
-for the firmware — see **Sensor evaluation** below.
+## READ THIS FIRST — 2026-09-03: BLEtest.ino abandoned, new AccelStream.ino pipeline
+
+Everything below this section (up to **State of the tree**) describes work from
+2026-08-29 and earlier, centered on `Arduino/BLEtest/BLEtest.ino` — a firmware
+that combined a hardware-FIFO accelerometer capture at 833 Hz, a software PLL
+to derive real timestamps from the FIFO's sample count, and a full BLE stack
+(live view + "go" trigger + raw dump characteristics). That firmware is now
+**known broken** and should not be built on without first fixing it:
+
+- On 2026-09-03 it reproducibly hung or crash-looped (`setup()` re-running on
+  its own, "IMU OK"/"Ready" reprinting with no user input) on **two separate
+  physical XIAO nRF52840 Sense boards**, ruling out a single bad board.
+- A bare-bones sanity sketch with no IMU/BLE/FIFO
+  (`Arduino/SerialEchoTest/SerialEchoTest.ino` — heartbeat print + serial
+  echo, nothing else) worked correctly on both boards, ruling out the cable,
+  USB port, and Mac-side toolchain. The fault is specifically in
+  `BLEtest.ino`'s code.
+- One concrete symptom captured along the way: `BLE.begin()` was observed
+  taking **~2 minutes** to return instead of milliseconds. Disabling BLE
+  entirely (`bleReady = false`, skipping `BLE.begin()`) did not fix
+  responsiveness by itself; with BLE *and* the FIFO drain (`drainFifo()`)
+  both disabled, the board was still unresponsive to serial commands. The
+  root cause was never isolated — debugging was abandoned in favor of a
+  clean rewrite rather than continuing to guess blindly.
+- `BLEtest.ino` itself was reverted to its exact pre-session behavior (a
+  `git diff` before rewriting its comments to English showed zero functional
+  change) and is left in the repo as-is, bug and all. If BLE (phone live
+  view, wireless "go" trigger, raw dump) is wanted again, it needs to be
+  rebuilt cleanly on top of the now-proven-working firmware below, not by
+  resuming debugging of this file.
+
+**Current, working pipeline** (verified end-to-end on real hardware, real
+push-off-scale data already captured — see `data/accel_2026*.png`):
+
+- **Firmware:** `Arduino/AccelStream/AccelStream.ino` — deliberately minimal.
+  No BLE, no hardware FIFO, no hand-rolled I2C register/FIFO code - just the
+  vendored LSM6DS3 library's plain polling reads (`readFloatAccelX/Y/Z`) on a
+  `micros()`-scheduled loop at **416 Hz**, **±8 g** (raised from the old
+  ±4 g: a real push-off rigidly mounted on the block can hit 2-5 g and would
+  clip at ±4 g). Each sample's timestamp is a direct `micros()` read taken
+  immediately after that sample's I2C transaction - a real measurement, not
+  a count-times-nominal-period model like the old `Reaction_Time_HighFreq.ino`
+  or a PLL-inferred one like `BLEtest.ino`. Serial protocol: `'r'` start
+  CSV stream, `'s'` stop, `'p'` one immediate reading; streaming rows are
+  `t_us,x_g,y_g,z_g`.
+- **Live capture:** `tools/accel_live.py` — live X/Y/Z + magnitude plot,
+  autodetects the port, Record/Stop/Snapshot buttons with an actually-visible
+  state change (button turns solid red with "● Recording..." while
+  recording, flashes green "✓ Saved" on stop), gap/clipping detection, CSV +
+  a 4-panel PNG (X, Y, Z separately, then magnitude) saved on stop.
+- **Offline review:** `tools/csv_plot.py` — always opens a native file-picker
+  dialog (no CLI path to type), auto-detects the CSV's time column (`t_s`
+  from `accel_live.py`, or `elapsed_s` from older captures like
+  `data/Block_Start_Data.csv`), same 4-panel layout, standard matplotlib
+  zoom/pan toolbar for inspecting sub-second detail.
+- **Diagnostic sketch:** `Arduino/SerialEchoTest/SerialEchoTest.ino` - keep
+  this around. Flash it first on any new or suspect board before trusting
+  more complex firmware; it isolates hardware/cable/port problems from
+  firmware bugs in about a minute.
+
+**Now deprecated - do not use for new work, left in the repo only because
+they weren't asked to be deleted:**
+
+- `tools/kinestart_live.py` - paired with `BLEtest.ino`'s old protocol.
+  **Its CSV format is incompatible with `AccelStream.ino`'s output** (expects
+  `elapsed_s` as a small float; `AccelStream.ino` sends `t_us`, a large raw
+  microsecond integer, in that column position) - running it against the new
+  firmware doesn't crash, it just silently produces a nonsensical time axis.
+- `Arduino/HighFrequencySampleRate/` in its entirety (`Reaction_Time_HighFreq/`,
+  `Python_Serial`, `CSV_Visualizer`) - the original HighFreq firmware computed
+  elapsed time as `sampleIndex * nominal_period`, ignoring real timing jitter;
+  its paired Python scripts have a hardcoded Windows path and crash on both
+  of the current CSV formats.
+
+**Unresolved:** the actual `BLEtest.ino` hang/crash-loop was never root-caused.
+If BLE support is needed again, don't restart from `BLEtest.ino`'s FIFO+PLL
+design - consider adding a minimal BLE characteristic to `AccelStream.ino`'s
+simple polling loop instead, one piece at a time, testing after each addition
+(that incremental approach is exactly what would have caught this bug early).
+
+---
 
 ## Goal (part 1)
 
@@ -30,9 +107,18 @@ All three are implemented. See Next Steps for what remains unverified.
 ## Project layout
 
 - `prostart/` — Flutter app (Dart, `provider` for state, `flutter_blue_plus` for BLE)
-- `Arduino/BLEtest/BLEtest.ino` — the firmware actually flashed to the board
+- `Arduino/AccelStream/AccelStream.ino` — **current working firmware** for
+  accelerometer capture (no BLE); see the 2026-09-03 section above
+- `Arduino/SerialEchoTest/SerialEchoTest.ino` — minimal hardware/cable sanity
+  check, no IMU or BLE
+- `Arduino/BLEtest/BLEtest.ino` — BLE + FIFO + phone live-view firmware;
+  **known to hang/crash-loop**, not currently flashed to anything, see above
 - `Arduino/I2C_Scanner/` — I2C debug sketch
+- `Arduino/HighFrequencySampleRate/` — deprecated, see above
 - `Arduino/libraries/Seeed_Arduino_LSM6DS3/` — vendored IMU library
+- `tools/accel_live.py` — current live capture/record tool, pairs with `AccelStream.ino`
+- `tools/csv_plot.py` — current offline CSV viewer (file-picker based)
+- `tools/kinestart_live.py` — deprecated, paired with the old `BLEtest.ino` protocol
 - `playground_IMU/` — sensor evaluation: notebook, the capture it analyses, and a README of findings
 - `docs/` — diagrams and figures used by the root README
 
@@ -247,7 +333,14 @@ them were rewritten on 2026-08-29 and force-pushed.
 
 ## State of the tree
 
-Everything above is committed and pushed on `main`:
+The table below (through `0e701f8`) is from the 2026-08-29 work described in
+this document's older sections and is committed and pushed on `main`. It
+predates both the `BLEtest.ino` FIFO+PLL+BLE rewrite (`5c2eaa1`..`1e86094`,
+already committed) and everything in the 2026-09-03 section at the top of
+this file, which is **not yet committed** as of this writing — `AccelStream.ino`,
+`SerialEchoTest.ino`, `tools/accel_live.py`, and `tools/csv_plot.py` are all
+new, uncommitted files. Run `git status` before assuming any of it is saved
+to history.
 
 | Commit | What |
 |---|---|

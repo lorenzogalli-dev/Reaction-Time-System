@@ -5,205 +5,207 @@
 // ---------------------------------------------------------------------------
 // Prostart / BlockStart firmware - XIAO nRF52840 Sense
 //
-// REGOLA FONDAMENTALE DEL TEMPO
-// -----------------------------
-// Esiste un solo orologio in tutto il sistema: micros() del nRF52840.
-// Ogni istante che finisce in una misura - il "go", il campione IMU, l'onset
-// della partenza - e' espresso in quel clock. Il telefono non timestampa
-// nulla: e' un logger/monitor passivo. La latenza del BLE puo' essere di
-// decine di ms e variabile, ma non tocca la misura perche' il tempo e' gia'
-// stato deciso a bordo prima di entrare nella radio.
+// FUNDAMENTAL TIMING RULE
+// ------------------------
+// There is exactly one clock in the whole system: the nRF52840's micros().
+// Every instant that ends up in a measurement - the "go", the IMU sample, the
+// push-off onset - is expressed on that clock. The phone never timestamps
+// anything: it's a passive logger/monitor. BLE latency can be tens of ms and
+// variable, but it never touches the measurement, because the time was
+// already decided on-board before entering the radio.
 //
-// La cattura CSV del 2026-08-31 lo dimostra al contrario: quei timestamp erano
-// ore di arrivo sul telefono, con raffiche di 1-4 campioni consegnate insieme
-// e gap di 29-31 ms (a volte 58-62). Incertezza reale +/-15-30 ms, contro un
-// target di 1-2 ms. Vedi playground_IMU/README.md.
+// The 2026-08-31 CSV capture proved the opposite the hard way: those
+// timestamps were arrival times on the phone, with bursts of 1-4 samples
+// delivered together and gaps of 29-31 ms (sometimes 58-62). Real uncertainty
+// +/-15-30 ms, against a 1-2 ms target. See playground_IMU/README.md.
 //
-// CARATTERISTICHE BLE
-//   19B10001  "go" timestamp - single-shot, micros(). Invariata.
-//   19B10002  stream accelerometro ~50 Hz per la vista Live Data.
-//             *** PAYLOAD CAMBIATO: ora 16 byte, non piu' 12. ***
-//             Decimato dal flusso ad alta frequenza, e ogni campione porta
-//             il proprio istante di cattura. Resta puramente cosmetico.
-//   19B10004  dump raw ad alta frequenza (notify) - vedi "DUMP" sotto.
-//   19B10005  comandi dall'app (write) - per ora solo "richiedi un dump".
+// BLE CHARACTERISTICS
+//   19B10001  "go" timestamp - single-shot, micros(). Unchanged.
+//   19B10002  ~50 Hz accelerometer stream for the Live Data view.
+//             *** PAYLOAD CHANGED: now 16 bytes, not 12 anymore. ***
+//             Decimated from the high-frequency stream, and each sample
+//             carries its own capture instant. Stays purely cosmetic.
+//   19B10004  high-frequency raw dump (notify) - see "DUMP" below.
+//   19B10005  commands from the app (write) - for now just "start a dump".
 //
-// Gli UUID e i formati dei payload devono restare allineati a
+// The UUIDs and payload formats must stay in sync with
 // prostart/lib/services/ble_service.dart.
 //
-// PERCHE' LA FIFO
-// ---------------
-// Prima si leggevano i registri dell'IMU in polling su millis() ogni 20 ms,
-// con l'ODR a 104 Hz: due frequenze non sincrone, quindi campioni ripetuti e
-// campioni persi, e comunque una quantizzazione di 9.6 ms sull'onset. Ora
-// l'accelerometro gira a 833 Hz dentro la FIFO hardware e il loop la svuota a
-// blocchi: il campionamento e' scandito dal sensore, non dal loop, e il jitter
-// del software non entra piu' nei dati.
+// WHY THE FIFO
+// ------------
+// Previously the IMU registers were polled on millis() every 20 ms, with the
+// ODR at 104 Hz: two unsynchronized frequencies, hence repeated and dropped
+// samples, and in any case 9.6 ms of quantization on the onset. Now the
+// accelerometer runs at 833 Hz inside the hardware FIFO and the loop drains
+// it in blocks: sampling is paced by the sensor, not by the loop, and
+// software jitter no longer leaks into the data.
 //
-// CATTURA SERIALE
+// SERIAL CAPTURE
 // ---------------
-// Il BLE non puo' portare 833 Hz in continuo, ma il cavo USB si'. I comandi
-// 'r'/'s' aprono e chiudono uno stream CSV sulla seriale con *lo stesso* tempo
-// misurato che usa tutto il resto del firmware: ogni riga porta l'elapsed
-// ricavato da sampleTimeUs(), cioe' dal PLL agganciato alla FIFO, non da un
-// contatore moltiplicato per il periodo nominale. E' la differenza fra un file
-// che sembra campionato a 833 Hz e uno che lo e' davvero. Formato compatibile
-// con lo script Python in Arduino/HighFrequencySampleRate/Python_Serial:
+// BLE can't carry 833 Hz continuously, but the USB cable can. The 'r'/'s'
+// commands open and close a CSV stream on the serial port using *the same*
+// measured time as the rest of the firmware: every row carries the elapsed
+// time from sampleTimeUs(), i.e. from the PLL locked onto the FIFO, not from
+// a counter multiplied by the nominal period. That's the difference between a
+// file that looks like it was sampled at 833 Hz and one that actually was.
+// Format compatible with the Python script in
+// Arduino/HighFrequencySampleRate/Python_Serial:
 //   elapsed_s,x_g,y_g,z_g
 //
 // DUMP
 // ----
-// A 833 Hz servono ~5 kB/s solo per i raw: il link BLE (connection interval
-// ~30 ms) non ci arriva. Quindi i campioni ad alta frequenza vivono in un ring
-// buffer in RAM (~2.4 s di storico) e vengono riversati a richiesta, a
-// pacchetti, quando non c'e' nulla di urgente da fare. Dal punto 3 in poi il
-// dump sara' innescato automaticamente dalla detection dell'onset, per portare
-// al telefono la finestra attorno alla partenza.
+// At 833 Hz the raw stream alone needs ~5 kB/s: the BLE link (connection
+// interval ~30 ms) can't keep up. So the high-frequency samples live in a RAM
+// ring buffer (~2.4 s of history) and get flushed on request, in packets,
+// whenever there's nothing more urgent to do. From step 3 onward the dump
+// will be triggered automatically by onset detection, to bring the phone the
+// window around the start.
 // ---------------------------------------------------------------------------
 
 BLEService reactionService("19B10000-E8F2-537E-4F6C-D104768A1214");
 BLEUnsignedLongCharacteristic goTimeChar("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify);
 
-// Payload live: 16 byte = uint32 t_us little-endian + 3 float32 (X, Y, Z) in g.
-// t_us e' l'istante di *cattura* del campione nel clock micros() di bordo, non
-// l'istante di invio. Il nRF52840 e' little-endian e usa IEEE-754 a 32 bit,
-// quindi il cast del buffer basta: e' esattamente quello che l'app legge con
+// Live payload: 16 bytes = little-endian uint32 t_us + 3 float32 (X, Y, Z) in g.
+// t_us is the sample's *capture* instant on the on-board micros() clock, not
+// the send instant. The nRF52840 is little-endian and uses 32-bit IEEE-754,
+// so casting the buffer is enough: it's exactly what the app reads with
 // ByteData.getUint32/getFloat32(offset, Endian.little).
 BLECharacteristic accelChar("19B10002-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 16, true);
 
-// Dump raw. Header 8 byte + N campioni da 6 byte (3 x int16 raw, non in g):
-//   [0..3]  uint32 t0_us   istante di cattura del PRIMO campione del pacchetto
-//   [4..5]  uint16 seq     numero di pacchetto dentro questo dump
-//   [6]     uint8  count   campioni nel pacchetto
-//   [7]     uint8  flags   bit0 = primo pacchetto, bit1 = ultimo
+// Raw dump. 8-byte header + N samples of 6 bytes each (3 x raw int16, not in g):
+//   [0..3]  uint32 t0_us   capture instant of the FIRST sample in the packet
+//   [4..5]  uint16 seq     packet number within this dump
+//   [6]     uint8  count   samples in the packet
+//   [7]     uint8  flags   bit0 = first packet, bit1 = last
 //   [8..]   count x { int16 x, int16 y, int16 z }
-// I campioni sono raw a 16 bit: l'app li converte in g con lo stesso fattore
-// della libreria, 0.061 * (range >> 1) / 1000 (vedi LSM6DS3::calcAccel).
-// Ogni pacchetto porta il proprio t0_us, quindi il flusso e' ricostruibile
-// anche se qualche pacchetto si perde.
-// Quanti campioni per pacchetto. 2 tiene il payload a 20 byte, che passa anche
-// con l'MTU minimo (23) senza essere troncato. Se l'app negozia un MTU piu'
-// grande (Android: requestMtu(247); iOS lo fa da solo a 185) questo valore si
-// puo' alzare a 28 -> 180 byte per pacchetto, e il dump diventa ~14x piu'
-// veloce. Da alzare solo dopo aver verificato l'MTU sul campo: se il payload
-// supera MTU-3 la notifica viene troncata in silenzio.
+// Samples are raw 16-bit: the app converts them to g with the same factor as
+// the library, 0.061 * (range >> 1) / 1000 (see LSM6DS3::calcAccel). Every
+// packet carries its own t0_us, so the stream is reconstructable even if a
+// packet gets lost.
+// How many samples per packet. 2 keeps the payload at 20 bytes, which fits
+// even with the minimum MTU (23) without being truncated. If the app
+// negotiates a bigger MTU (Android: requestMtu(247); iOS does it on its own
+// up to 185) this can be raised to 28 -> 180 bytes per packet, making the
+// dump ~14x faster. Only raise it after verifying the MTU in the field: if
+// the payload exceeds MTU-3 the notification is truncated silently.
 #define BURST_SAMPLES_PER_PKT 2
 #define BURST_HEADER_BYTES    8
 #define BURST_PKT_BYTES       (BURST_HEADER_BYTES + BURST_SAMPLES_PER_PKT * 6)
 
 BLECharacteristic burstChar("19B10004-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, BURST_PKT_BYTES, false);
 
-// Comandi dall'app. 1 byte: 0x01 = avvia un dump del ring buffer.
+// Commands from the app. 1 byte: 0x01 = start a ring-buffer dump.
 BLECharacteristic cmdChar("19B10005-E8F2-537E-4F6C-D104768A1214", BLEWrite, 1, false);
 
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
 
-// --- Configurazione IMU ---------------------------------------------------
-// 833 Hz: periodo 1.2 ms. E' la prima ODR che mette la quantizzazione sotto il
-// target di 1-2 ms *senza* interpolazione; con l'interpolazione sulla salita
-// (punto 3) si scende ampiamente sotto il millisecondo. 416 Hz sarebbe il
-// minimo accettabile, 833 lascia margine.
+// --- IMU configuration -----------------------------------------------------
+// 833 Hz: 1.2 ms period. It's the first ODR that gets quantization under the
+// 1-2 ms target *without* interpolation; with interpolation on the rising
+// edge (step 3) it drops well under a millisecond. 416 Hz would be the
+// minimum acceptable, 833 leaves margin.
 static const uint16_t ACCEL_ODR_HZ = 833;
-// Codice ODR della FIFO corrispondente a 833 Hz: la libreria lo chiama "800"
-// ma il registro e' lo stesso (FIFO_CTRL5 = 0x38). Deve combaciare con l'ODR
-// dell'accelerometro, altrimenti la FIFO decima o duplica.
+// FIFO ODR code corresponding to 833 Hz: the library calls it "800" but it's
+// the same register (FIFO_CTRL5 = 0x38). Must match the accelerometer's ODR,
+// otherwise the FIFO decimates or duplicates.
 static const int16_t FIFO_ODR_CODE = 800;
-// +/-4 g per ora. Da rivalutare a +/-8 g quando il montaggio meccanico sul
-// blocco e' definitivo: nella cattura del 31/08 il picco era 0.43 g, ma con il
-// sensore rigidamente sul blocco una partenza vera fa 2-5 g e a +/-4 g si
-// rischia il clipping proprio sul fronte di salita.
+// +/-4 g for now. Reassess to +/-8 g once the mechanical mount on the block
+// is final: in the 08/31 capture the peak was 0.43 g, but with the sensor
+// rigidly on the block a real start does 2-5 g, and at +/-4 g clipping is a
+// real risk right on the rising edge.
 static const uint8_t ACCEL_RANGE_G = 4;
 
-// La FIFO tiene parole da 16 bit e le organizza in "pattern". Con il giroscopio
-// spento e i dataset 3/4 disabilitati il pattern e' esattamente X, Y, Z.
+// The FIFO holds 16-bit words and organizes them into a "pattern". With the
+// gyro off and datasets 3/4 disabled the pattern is exactly X, Y, Z.
 static const uint8_t FIFO_PATTERN_WORDS = 3;
 
-// Registri usati direttamente: la libreria non espone ne' la lettura a blocchi
-// della FIFO ne' FIFO_STATUS3/4 (che servono per riallinearsi al pattern).
+// Registers accessed directly: the library exposes neither block reads of the
+// FIFO nor FIFO_STATUS3/4 (needed to realign to the pattern).
 static const uint8_t REG_FIFO_CTRL4    = 0x09;
 static const uint8_t REG_FIFO_STATUS1  = 0x3A;
 static const uint8_t REG_FIFO_DATA_OUT = 0x3E;
 
-// --- Ring buffer ad alta frequenza ----------------------------------------
-// 2048 campioni a 833 Hz = 2.46 s di storico, 12 kB di RAM. Abbondante per
-// coprire una finestra attorno alla partenza (tipicamente -0.5 s / +1.0 s).
+// --- High-frequency ring buffer ---------------------------------------------
+// 2048 samples at 833 Hz = 2.46 s of history, 12 kB of RAM. Plenty to cover a
+// window around the start (typically -0.5 s / +1.0 s).
 static const uint16_t RING_SAMPLES = 2048;
 static int16_t ringBuf[RING_SAMPLES * 3];
 
-// Indice globale monotono del campione piu' recente + 1, cioe' quanti campioni
-// sono stati acquisiti da sempre. La posizione nel ring e' (k % RING_SAMPLES),
-// quindi l'indice globale e' anche la base dei timestamp.
+// Monotonic global index of the most recent sample + 1, i.e. how many samples
+// have ever been acquired. The position in the ring is (k % RING_SAMPLES), so
+// the global index also serves as the timestamp base.
 static uint32_t totalSamples = 0;
 
-// --- Modello del tempo (PLL software) -------------------------------------
-// La FIFO dice *quanti* campioni ci sono, non *quando* sono stati presi. Il
-// periodo lo conosciamo (1/ODR) ma l'oscillatore dell'LSM6DS3 ha la sua
-// tolleranza (qualche %) rispetto al clock del nRF52840: estrapolare da una
-// singola ancora accumulerebbe deriva. Quindi si tiene un anello ad aggancio
-// di fase: a ogni svuotamento si confronta l'istante previsto per il campione
-// piu' recente con micros() e si correggono piano sia la fase sia il periodo.
-// Il risultato e' un periodo auto-calibrato sul clock di bordo e timestamp che
-// non sobbalzano quando un giro di loop arriva tardi.
+// --- Time model (software PLL) ---------------------------------------------
+// The FIFO tells you *how many* samples there are, not *when* they were
+// taken. We know the period (1/ODR) but the LSM6DS3's oscillator has its own
+// tolerance (a few %) relative to the nRF52840's clock: extrapolating from a
+// single anchor would accumulate drift. So a phase-locked loop is kept: on
+// every drain, the predicted instant of the most recent sample is compared
+// against micros() and both phase and period are gently corrected. The
+// result is a period self-calibrated to the on-board clock, with timestamps
+// that don't jump when a loop iteration arrives late.
 static double   estPeriodUs   = 1000000.0 / (double)ACCEL_ODR_HZ;
-static uint32_t newestSampleUs = 0;   // micros() del campione piu' recente
+static uint32_t newestSampleUs = 0;   // micros() of the most recent sample
 static bool     clockLocked    = false;
 
-// Guadagni del PLL. Proporzionale alto = riaggancio rapido dopo un buco;
-// integrale basso = il periodo si muove lentamente e filtra il jitter del loop.
+// PLL gains. High proportional = fast re-lock after a gap; low integral = the
+// period moves slowly and filters out loop jitter.
 static const double PLL_KP = 0.10;
 static const double PLL_KI = 0.0005;
-// Il periodo non puo' allontanarsi piu' del 6% dal nominale: oltre significa
-// che qualcosa e' andato storto (overrun, riallineamento), non che
-// l'oscillatore e' derivato.
+// The period can't drift more than 6% from nominal: beyond that it means
+// something went wrong (overrun, realignment), not that the oscillator
+// drifted.
 static const double PERIOD_NOMINAL_US = 1000000.0 / (double)ACCEL_ODR_HZ;
 static const double PERIOD_MIN_US     = PERIOD_NOMINAL_US * 0.94;
 static const double PERIOD_MAX_US     = PERIOD_NOMINAL_US * 1.06;
 
-// --- Stream live decimato -------------------------------------------------
-// 833 / 17 = 49 Hz, la stessa cadenza di prima per la schermata Live Data.
+// --- Decimated live stream ---------------------------------------------------
+// 833 / 17 = 49 Hz, the same cadence as before for the Live Data screen.
 static const uint16_t LIVE_DECIMATION = 17;
 static uint32_t nextLiveSample = 0;
 
-// --- Stato del dump -------------------------------------------------------
+// --- Dump state --------------------------------------------------------------
 static bool     dumpActive = false;
-static uint32_t dumpNext = 0;     // prossimo indice globale da inviare
-static uint32_t dumpEnd = 0;      // indice globale (escluso) di fine dump
+static uint32_t dumpNext = 0;     // next global index to send
+static uint32_t dumpEnd = 0;      // global index (exclusive) of the dump end
 static uint16_t dumpSeq = 0;
 
-// --- "go" simulato --------------------------------------------------------
-// Il trigger e' simulato da seriale finche' il buzzer non e' cablato, ma passa
-// dallo stesso micros() che usera' il trigger audio vero: quando si sostituira'
-// la sorgente, la gestione del tempo non cambia di una riga.
-// Non blocca piu' con delay(): un delay qui fermerebbe anche lo svuotamento
-// della FIFO e la farebbe andare in overrun (4096 byte = ~1.6 s a 833 Hz).
+// --- Simulated "go" ----------------------------------------------------------
+// The trigger is simulated over serial until the buzzer is wired up, but it
+// goes through the same micros() the real audio trigger will use: when the
+// source is swapped in, the time handling doesn't change by a single line.
+// No longer blocks with delay(): a delay() here would also stall the FIFO
+// drain and push it into overrun (4096 bytes = ~1.6 s at 833 Hz).
 static bool     goPending = false;
 static uint32_t goDueUs = 0;
 
 static bool imuReady = false;
-// BLE assente non e' un motivo per fermare la board: la cattura via cavo resta
-// utile (ed e' anzi il modo in cui si caratterizza il sensore). Vedi setup().
+// BLE being absent is no reason to stop the board: cable capture stays
+// useful (and is in fact how the sensor gets characterized). See setup().
 static bool bleReady = false;
 
-// --- Cattura seriale ad alta frequenza -------------------------------------
-// Ogni campione che entra nel ring viene emesso come riga CSV finche' lo stream
-// e' attivo. A 833 Hz sono ~30 righe/ms * 32 byte = ~27 kB/s: sotto i 921600
-// baud nominali, e sulla USB nativa del nRF52840 il baud e' comunque solo
-// un'etichetta. Se il buffer di uscita si riempie non si blocca: si riprova al
-// giro dopo, perche' un Serial.write() bloccante fermerebbe drainFifo() e
-// manderebbe la FIFO in overrun - il rimedio peggiore del male.
+// --- High-frequency serial capture -------------------------------------------
+// Every sample entering the ring is emitted as a CSV row while the stream is
+// active. At 833 Hz that's ~30 rows/ms * 32 bytes = ~27 kB/s: under the
+// nominal 921600 baud, and on the nRF52840's native USB the baud is only a
+// label anyway. If the output buffer fills up it doesn't block: it retries
+// next loop, because a blocking Serial.write() would stall drainFifo() and
+// push the FIFO into overrun - a cure worse than the disease.
 static bool     serialStreaming = false;
 static uint32_t nextSerialSample = 0;
-static uint64_t serialElapsedUs = 0;   // tempo dall'inizio dello stream
-static uint32_t serialLastUs = 0;      // sampleTimeUs() dell'ultima riga emessa
+static uint64_t serialElapsedUs = 0;   // time since the stream started
+static uint32_t serialLastUs = 0;      // sampleTimeUs() of the last row emitted
 static bool     serialFirstRow = true;
-// Campioni usciti dal ring prima di essere emessi: l'unico modo in cui la
-// cattura puo' perdere dati. Dichiararlo e' meglio che scoprirlo dal CSV.
+// Samples that fell out of the ring before being emitted: the only way this
+// capture can lose data. Declaring it is better than discovering it from the
+// CSV.
 static uint32_t serialDropped = 0;
-// Riga piu' lunga possibile con largo margine (vedi formatSampleLine).
+// Longest possible row with generous margin (see formatSampleLine).
 static const uint8_t SERIAL_ROW_MAX = 64;
 
-// Prototipi espliciti: l'auto-prototyping dell'IDE Arduino non e' affidabile
-// con le funzioni `static` in un .ino.
+// Explicit prototypes: the Arduino IDE's auto-prototyping isn't reliable with
+// `static` functions in a .ino.
 void setupImu();
 static void drainFifo();
 static void updateTimebase(uint32_t tStatus, uint16_t n, uint16_t leftBehind);
@@ -222,31 +224,31 @@ static void printLatest();
 
 void setup() {
   Serial.begin(921600);
-  // Sul XIAO nRF52840 la USB e' nativa: `Serial` diventa true solo quando un
-  // host apre la porta CDC. Aspettare all'infinito blocca setup() per sempre
-  // se la board e' alimentata da batteria, da una porta senza Serial Monitor
-  // aperto, o da un alimentatore - e quindi BLE.advertise() sotto non viene
-  // mai eseguito e nessuna app riesce a trovare il dispositivo. Aspetta al
-  // massimo 3 secondi, poi procedi comunque.
+  // On the XIAO nRF52840 USB is native: `Serial` only becomes true once a
+  // host opens the CDC port. Waiting forever blocks setup() permanently if
+  // the board is powered from a battery, from a port with no Serial Monitor
+  // open, or from a wall adapter - and so BLE.advertise() below never runs
+  // and no app can ever find the device. Wait at most 3 seconds, then
+  // proceed regardless.
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) delay(10);
 
-  // Senza seed random() ripete la stessa sequenza a ogni accensione: su un
-  // sistema di tempo di reazione significa che l'atleta impara l'attesa e
-  // anticipa. Il valore e' preso da un ingresso analogico scollegato (rumore)
-  // mescolato al clock.
+  // Without seeding random() the same sequence repeats every power-up: on a
+  // reaction-time system that means the athlete learns the wait and
+  // anticipates it. The value is taken from a disconnected analog input
+  // (noise) mixed with the clock.
   randomSeed(((uint32_t)analogRead(A0) << 16) ^ micros());
 
   setupImu();
 
-  // BLE.begin() che fallisce non deve piantare la board. Il firmware precedente
-  // faceva while(1) qui: la board restava viva ma muta, senza seriale utile e
-  // senza radio, e serviva il doppio tap di reset per riprogrammarla. Ora si
-  // procede lo stesso: la cattura via cavo e la diagnostica continuano a
-  // funzionare, e il fallimento e' dichiarato invece che silenzioso.
+  // A failing BLE.begin() must not brick the board. The previous firmware
+  // did while(1) here: the board stayed alive but mute, with no useful
+  // serial and no radio, and needed a double reset tap to reprogram it. Now
+  // it proceeds regardless: cable capture and diagnostics keep working, and
+  // the failure is declared instead of silent.
   bleReady = BLE.begin();
   if (!bleReady) {
-    Serial.println("BLE init failed - continuo senza radio (cattura seriale attiva)");
+    Serial.println("BLE init failed - continuing without radio (serial capture active)");
   } else {
     BLE.setLocalName("BlockStartDevice");
     BLE.setAdvertisedService(reactionService);
@@ -256,54 +258,55 @@ void setup() {
     reactionService.addCharacteristic(cmdChar);
     BLE.addService(reactionService);
 
-    // Richiesta (non garanzia: decide il central) di un connection interval
-    // 15-30 ms. Unita' = 1.25 ms. Con l'intervallo di default piu' lungo il
-    // grafico a 50 Hz arriva a scatti e il dump ci mette un'eternita'.
+    // Request (not a guarantee: the central decides) for a 15-30 ms
+    // connection interval. Unit = 1.25 ms. With the longer default interval
+    // the 50 Hz chart arrives in bursts and the dump takes forever.
     BLE.setConnectionInterval(12, 24);
 
     BLE.advertise();
   }
 
-  Serial.println("Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest, 'r'/'s' cattura CSV.");
+  Serial.println("Ready. Serial: 'g' go, 'd' dump, 't' timebase, 'p' latest, 'r'/'s' CSV capture.");
 }
 
 void setupImu() {
 #ifdef PIN_LSM6DS3TR_C_POWER
-  // Sul XIAO Sense l'IMU ha un pin di alimentazione dedicato: se resta basso
-  // begin() ritorna errore anche con l'I2C cablato correttamente.
+  // On the XIAO Sense the IMU has a dedicated power pin: if it stays low,
+  // begin() returns an error even with I2C wired correctly.
   pinMode(PIN_LSM6DS3TR_C_POWER, OUTPUT);
   digitalWrite(PIN_LSM6DS3TR_C_POWER, HIGH);
 #endif
-  delay(100);  // l'LSM6DS3 ha bisogno di un attimo prima di rispondere su I2C
+  delay(100);  // the LSM6DS3 needs a moment before it responds on I2C
 
-  // Solo accelerometro: il giroscopio non serve e ogni parola in meno nella
-  // FIFO e' banda I2C risparmiata, che a 833 Hz conta.
+  // Accelerometer only: the gyro isn't needed, and every word less in the
+  // FIFO is I2C bandwidth saved, which matters at 833 Hz.
   myIMU.settings.gyroEnabled = 0;
   myIMU.settings.gyroFifoEnabled = 0;
 
   myIMU.settings.accelEnabled = 1;
   myIMU.settings.accelSampleRate = ACCEL_ODR_HZ;
   myIMU.settings.accelRange = ACCEL_RANGE_G;
-  // Attenzione a questi due, insieme: la libreria azzera CTRL4_C.BW_SCAL_ODR a
-  // meno che accelODROff non sia 1, e con quel bit a 0 i bit BW_XL vengono
-  // *ignorati* e la banda la decide l'ODR (ODR/2). Nel firmware precedente
-  // accelBandWidth = 50 non aveva quindi alcun effetto: a 104 Hz la banda
-  // reale era 52 Hz per coincidenza. Qui la fissiamo esplicitamente a 200 Hz
-  // cosi' il filtro anti-alias - e il suo ritardo di gruppo, da misurare al
-  // punto 5 - resta lo stesso anche se l'ODR cambia.
+  // Watch these two together: the library clears CTRL4_C.BW_SCAL_ODR unless
+  // accelODROff is 1, and with that bit at 0 the BW_XL bits are *ignored* and
+  // the ODR decides the bandwidth (ODR/2). In the previous firmware
+  // accelBandWidth = 50 therefore had no effect at all: at 104 Hz the real
+  // bandwidth was 52 Hz by coincidence. Here it's fixed explicitly to 200 Hz
+  // so the anti-alias filter - and its group delay, to be measured at step 5
+  // - stays the same even as the ODR changes.
   myIMU.settings.accelODROff = 1;
   myIMU.settings.accelBandWidth = 200;
 
   myIMU.settings.accelFifoEnabled = 1;
-  myIMU.settings.accelFifoDecimation = 1;  // /1: nessuna decimazione
+  myIMU.settings.accelFifoDecimation = 1;  // /1: no decimation
   myIMU.settings.tempEnabled = 0;
-  // Il timestamp hardware dell'LSM6DS3 sarebbe scritto nella FIFO come dataset
-  // extra, ma e' su un altro oscillatore: non serve, il clock di riferimento e'
-  // micros(). Tenerlo fuori accorcia il pattern e semplifica l'allineamento.
+  // The LSM6DS3's hardware timestamp would be written into the FIFO as an
+  // extra dataset, but it runs on a different oscillator: not needed, the
+  // reference clock is micros(). Keeping it out shortens the pattern and
+  // simplifies alignment.
   myIMU.settings.timestampEnabled = 0;
   myIMU.settings.timestampFifoEnabled = 0;
 
-  myIMU.settings.fifoThreshold = 96;   // non usiamo il watermark, ma va scritto
+  myIMU.settings.fifoThreshold = 96;   // watermark unused, but must be written
   myIMU.settings.fifoSampleRate = FIFO_ODR_CODE;
   myIMU.settings.fifoModeWord = 6;     // continuous
 
@@ -313,14 +316,14 @@ void setupImu() {
     return;
   }
 
-  // 400 kHz invece dei 100 kHz di default: a 833 Hz si leggono ~15 kB/s dalla
-  // FIFO, a 100 kHz non ci starebbero nel budget del loop.
+  // 400 kHz instead of the default 100 kHz: at 833 Hz ~15 kB/s are read from
+  // the FIFO, which wouldn't fit the loop's budget at 100 kHz.
   Wire.setClock(400000);
 
   myIMU.fifoBegin();
-  // fifoBegin() scrive FIFO_CTRL4 = 0x09, che infila i dataset 3 e 4 nel
-  // pattern della FIFO. Non ci servono e allungherebbero il pattern da 3 a 5
-  // parole: azzerali.
+  // fifoBegin() writes FIFO_CTRL4 = 0x09, which slots datasets 3 and 4 into
+  // the FIFO pattern. We don't need them and they'd stretch the pattern from
+  // 3 to 5 words: clear it.
   myIMU.writeRegister(REG_FIFO_CTRL4, 0x00);
   myIMU.fifoClear();
 
@@ -345,8 +348,8 @@ void loop() {
 // FIFO
 // ---------------------------------------------------------------------------
 
-// Legge FIFO_STATUS1..4 in un colpo solo: parole disponibili, flag e - la cosa
-// che conta - la posizione nel pattern della prossima parola da leggere.
+// Reads FIFO_STATUS1..4 in one shot: words available, flags, and - the part
+// that matters - the position in the pattern of the next word to be read.
 static bool readFifoStatus(uint16_t* words, uint16_t* pattern, bool* overrun, bool* empty) {
   uint8_t s[4];
   if (myIMU.readRegisterRegion(s, REG_FIFO_STATUS1, 4) != IMU_SUCCESS) return false;
@@ -357,31 +360,31 @@ static bool readFifoStatus(uint16_t* words, uint16_t* pattern, bool* overrun, bo
   return true;
 }
 
-// Legge `count` parole da 16 bit dalla FIFO. Letture a blocchi da 0x3E: e' il
-// modo documentato da ST (il registro di uscita non auto-incrementa, ogni
-// coppia di byte letta fa avanzare la FIFO). A blocchi perche' una transazione
-// I2C per parola costerebbe ~2500 transazioni al secondo.
-// Diagnostica: ogni modo in cui la lettura puo' andare storta ha il suo
-// contatore, cosi' 't' dice quale sta succedendo invece di lasciarlo indovinare.
-static uint32_t errShortRead = 0;   // l'I2C ha trasferito meno del richiesto
-static uint32_t errAddrNack = 0;    // NACK sull'indirizzo del registro
-static uint32_t errMisaligned = 0;  // pattern non a 0 dopo un blocco intero
+// Reads `count` 16-bit words from the FIFO. Block reads from 0x3E: this is
+// ST's documented way (the output register doesn't auto-increment, every
+// byte pair read advances the FIFO). In blocks because one I2C transaction
+// per word would cost ~2500 transactions per second.
+// Diagnostics: every way this read can go wrong has its own counter, so 't'
+// tells you which one instead of leaving it to guesswork.
+static uint32_t errShortRead = 0;   // I2C transferred less than requested
+static uint32_t errAddrNack = 0;    // NACK on the register address
+static uint32_t errMisaligned = 0;  // pattern not at 0 after a whole block
 static uint32_t cntOverrun = 0;
 static uint32_t cntRealign = 0;
 
-// Legge `count` parole da 16 bit dalla FIFO.
+// Reads `count` 16-bit words from the FIFO.
 //
-// Scritta a mano invece di usare LSM6DS3::readRegisterRegion per due motivi,
-// entrambi emersi dal test sul banco:
-//   - readRegisterRegion butta via il valore di ritorno di requestFrom(). Se
-//     il trasferimento I2C fallisce, riempie meno byte del richiesto e ritorna
-//     comunque IMU_SUCCESS: chi chiama crede di avere dati validi, il buffer
-//     contiene avanzi della lettura precedente, e la FIFO resta disallineata.
-//     Ogni parola persa ruota gli assi X/Y/Z fra loro da li' in avanti.
-// (Il repeated START e' stato provato e scartato: vedi il commento sotto.)
+// Written by hand instead of using LSM6DS3::readRegisterRegion for two
+// reasons, both surfaced by bench testing:
+//   - readRegisterRegion discards requestFrom()'s return value. If the I2C
+//     transfer fails, it fills fewer bytes than requested and still returns
+//     IMU_SUCCESS: the caller believes it has valid data, the buffer holds
+//     leftovers from the previous read, and the FIFO stays misaligned. Every
+//     lost word rotates the X/Y/Z axes among each other from then on.
+// (Repeated START was tried and dropped: see the comment below.)
 static bool readFifoWords(int16_t* dest, uint16_t count) {
-  // Il buffer di Wire del core mbed e' 256 byte, quindi il limite vero e' il
-  // tempo che il loop puo' passare fermo su una singola transazione.
+  // The mbed core's Wire buffer is 256 bytes, so the real limit is how long
+  // the loop can stay stuck on a single transaction.
   static const uint8_t MAX_WORDS_PER_READ = 15;
   uint8_t raw[MAX_WORDS_PER_READ * 2];
 
@@ -391,11 +394,11 @@ static bool readFifoWords(int16_t* dest, uint16_t count) {
 
     Wire.beginTransmission(0x6A);
     Wire.write(REG_FIFO_DATA_OUT);
-    // STOP, non repeated START. Il repeated START sembrerebbe piu' corretto per
-    // un accesso alla FIFO, ma sul driver I2C del core mbed incastra il bus: la
-    // sua read() non ha timeout, quindi il loop si pianta e la board smette di
-    // rispondere. Provato sul banco. Con lo STOP nessuno interferisce comunque:
-    // l'I2C ha un solo master e un solo slave.
+    // STOP, not repeated START. Repeated START would seem more correct for
+    // accessing a FIFO, but on the mbed core's I2C driver it wedges the bus:
+    // its read() has no timeout, so the loop freezes and the board stops
+    // responding. Tried on the bench. With STOP nothing interferes anyway:
+    // I2C has a single master and a single slave here.
     if (Wire.endTransmission(true) != 0) {
       errAddrNack++;
       return false;
@@ -420,19 +423,20 @@ static bool readFifoWords(int16_t* dest, uint16_t count) {
   return true;
 }
 
-// Butta via parole finche' la prossima letta non e' l'inizio di un pattern, e
-// ritorna quante ne ha scartate. Serve dopo un overrun: se si legge sfasati,
-// X/Y/Z si scambiano fra loro e i dati sembrano plausibili pur essendo
-// sbagliati - il tipo di bug che non si vede guardando un grafico.
+// Discards words until the next one read is the start of a pattern, and
+// returns how many it discarded. Needed after an overrun: reading out of
+// phase swaps X/Y/Z among each other and the data looks plausible while
+// being wrong - the kind of bug that doesn't show up just by looking at a
+// chart.
 //
-// FIFO_PATTERN e' l'indice, dentro il pattern, della prossima parola che
-// uscira'. Se vale 1 la prossima e' Y, quindi per arrivare alla X successiva
-// vanno scartate 3-1 = 2 parole (non 1).
+// FIFO_PATTERN is the index, within the pattern, of the next word to come
+// out. If it's 1 the next one is Y, so reaching the next X requires
+// discarding 3-1 = 2 words (not 1).
 static uint16_t realignFifo(uint16_t pattern, uint16_t available) {
   uint16_t offset = pattern % FIFO_PATTERN_WORDS;
   if (offset == 0) return 0;
   uint16_t toDiscard = FIFO_PATTERN_WORDS - offset;
-  if (toDiscard > available) return available;  // niente da fare per ora
+  if (toDiscard > available) return available;  // nothing to do for now
   int16_t discard[FIFO_PATTERN_WORDS];
   readFifoWords(discard, toDiscard);
   return toDiscard;
@@ -444,14 +448,14 @@ static void drainFifo() {
   uint16_t words, pattern;
   bool overrun, empty;
   if (!readFifoStatus(&words, &pattern, &overrun, &empty)) return;
-  // micros() preso subito dopo lo status: e' l'ancora del PLL. Da qui in poi
-  // il tempo che passa a leggere i dati non conta piu'.
+  // micros() taken right after the status read: this is the PLL's anchor.
+  // From here on, time spent reading the data no longer counts.
   uint32_t tStatus = micros();
 
   if (overrun) {
-    // La FIFO e' andata in overrun: il loop non ha tenuto il passo e c'e' un
-    // buco di durata ignota. Riparti pulito invece di produrre timestamp che
-    // sembrano continui ma non lo sono.
+    // The FIFO went into overrun: the loop didn't keep pace and there's a
+    // gap of unknown duration. Start clean instead of producing timestamps
+    // that look continuous but aren't.
     myIMU.fifoClear();
     clockLocked = false;
     cntOverrun++;
@@ -465,30 +469,30 @@ static void drainFifo() {
   uint16_t available = usable / FIFO_PATTERN_WORDS;
   if (available == 0) return;
 
-  // Non svuotare tutto in un colpo: oltre un certo blocco il loop resta fermo
-  // troppo a lungo e BLE.poll() ne soffre. Il resto se lo prende il giro dopo.
+  // Don't drain everything in one go: past a certain block the loop stalls
+  // too long and BLE.poll() suffers. The rest gets picked up next round.
   static const uint16_t MAX_SAMPLES_PER_DRAIN = 64;
   uint16_t nSamples = (available > MAX_SAMPLES_PER_DRAIN) ? MAX_SAMPLES_PER_DRAIN : available;
-  // Quanti campioni restano nella FIFO dopo questa lettura: servono al PLL,
-  // perche' l'ancora micros() si riferisce al campione piu' recente *nella
-  // FIFO*, non all'ultimo che abbiamo letto. Senza questo, ogni svuotamento
-  // troncato sposterebbe i timestamp all'indietro di decine di ms.
+  // How many samples remain in the FIFO after this read: needed by the PLL,
+  // because the micros() anchor refers to the most recent sample *in the
+  // FIFO*, not to the last one we read. Without this, every partial drain
+  // would push the timestamps backward by tens of ms.
   uint16_t leftBehind = available - nSamples;
 
   int16_t block[MAX_SAMPLES_PER_DRAIN * 3];
   if (!readFifoWords(block, nSamples * FIFO_PATTERN_WORDS)) {
-    // Lettura fallita a meta': la FIFO e' in uno stato che non conosciamo.
-    // Non provare a indovinare quanto e' avanzata, riparti pulita.
+    // Read failed halfway through: the FIFO is in a state we don't know.
+    // Don't try to guess how far it advanced, start clean instead.
     myIMU.fifoClear();
     clockLocked = false;
     return;
   }
 
-  // Abbiamo letto un numero intero di pattern partendo da un pattern intero,
-  // quindi il prossimo deve essere di nuovo a 0. Se non lo e', qualcosa ha
-  // mangiato o aggiunto parole e da qui in poi X/Y/Z sarebbero permutati: i
-  // dati sembrerebbero plausibili pur essendo sbagliati. Meglio buttare via il
-  // blocco e risincronizzare che salvarlo.
+  // We read a whole number of patterns starting from a whole pattern, so the
+  // next one must again be at 0. If it isn't, something ate or added words
+  // and from here on X/Y/Z would be permuted: the data would look plausible
+  // while being wrong. Better to discard the block and resync than to keep
+  // it.
   uint16_t w2, p2;
   bool o2, e2;
   if (readFifoStatus(&w2, &p2, &o2, &e2) && (p2 % FIFO_PATTERN_WORDS) != 0) {
@@ -507,24 +511,24 @@ static void drainFifo() {
   totalSamples += nSamples;
 
   updateTimebase(tStatus, nSamples, leftBehind);
-  // Dopo updateTimebase(): sampleTimeUs() dipende da newestSampleUs, che e'
-  // appena stato aggiornato con questo blocco.
+  // After updateTimebase(): sampleTimeUs() depends on newestSampleUs, which
+  // has just been updated with this block.
   publishSerialSamples();
   publishLiveSamples();
 }
 
 // ---------------------------------------------------------------------------
-// Modello del tempo
+// Time model
 // ---------------------------------------------------------------------------
 
-// tStatus:     micros() letto insieme allo stato della FIFO.
-// n:           campioni appena aggiunti al ring.
-// leftBehind:  campioni rimasti nella FIFO, non ancora letti.
+// tStatus:     micros() read alongside the FIFO status.
+// n:           samples just added to the ring.
+// leftBehind:  samples remaining in the FIFO, not yet read.
 static void updateTimebase(uint32_t tStatus, uint16_t n, uint16_t leftBehind) {
-  // Il campione piu' recente *della FIFO* e' stato catturato fra 0 e un periodo
-  // prima della lettura dello status: il valore atteso e' mezzo periodo prima.
-  // Ma l'ultimo campione che abbiamo messo nel ring e' piu' vecchio di quello
-  // di `leftBehind` periodi, ed e' a lui che si riferisce newestSampleUs.
+  // The most recent sample *in the FIFO* was captured somewhere between 0 and
+  // one period before the status read: the expected value is half a period
+  // before. But the last sample we put in the ring is older than that by
+  // `leftBehind` periods, and that's the one newestSampleUs refers to.
   uint32_t measured = tStatus
                     - (uint32_t)(estPeriodUs * 0.5)
                     - (uint32_t)(estPeriodUs * (double)leftBehind);
@@ -536,15 +540,15 @@ static void updateTimebase(uint32_t tStatus, uint16_t n, uint16_t leftBehind) {
     return;
   }
 
-  // Dove ci aspettavamo che fosse il nuovo campione piu' recente, estrapolando
-  // dal modello corrente.
+  // Where we expected the new most-recent sample to be, extrapolating from
+  // the current model.
   double predicted = (double)newestSampleUs + estPeriodUs * (double)n;
-  // Differenza calcolata su uint32 e poi su int32: cosi' il wrap di micros()
-  // (ogni ~71 minuti) si gestisce da solo.
+  // Difference computed on uint32 then on int32: this way micros()'s wrap
+  // (every ~71 minutes) is handled automatically.
   int32_t err = (int32_t)(measured - (uint32_t)predicted);
 
-  // Un errore enorme non e' deriva, e' una discontinuita': riaggancia di
-  // colpo invece di trascinarla dentro il periodo.
+  // A huge error isn't drift, it's a discontinuity: snap to it instead of
+  // dragging it in slowly through the period.
   if (err > 20000 || err < -20000) {
     newestSampleUs = measured;
     estPeriodUs = PERIOD_NOMINAL_US;
@@ -557,36 +561,36 @@ static void updateTimebase(uint32_t tStatus, uint16_t n, uint16_t leftBehind) {
   if (estPeriodUs > PERIOD_MAX_US) estPeriodUs = PERIOD_MAX_US;
 }
 
-// Istante di cattura del campione con indice globale k, nel clock micros().
-// Vale per qualunque k gia' acquisito: e' cosi' che la detection dell'onset
-// (punto 3) potra' datare un campione trovato all'indietro nel ring, e come il
-// dump timestampa quello che manda.
+// Capture instant of the sample at global index k, on the micros() clock.
+// Valid for any k already acquired: this is how onset detection (step 3)
+// will be able to date a sample found looking backward in the ring, and how
+// the dump timestamps what it sends.
 static uint32_t sampleTimeUs(uint32_t k) {
   double back = (double)(totalSamples - 1 - k) * estPeriodUs;
   return newestSampleUs - (uint32_t)(back + 0.5);
 }
 
 // ---------------------------------------------------------------------------
-// Stream live (cosmetico)
+// Live stream (cosmetic)
 // ---------------------------------------------------------------------------
 
 static void publishLiveSamples() {
-  // subscribed() e' vero solo mentre l'app e' sulla schermata Live Data. La
-  // FIFO pero' si svuota comunque: la detection on-device non deve dipendere
-  // da chi sta guardando.
+  // subscribed() is only true while the app is on the Live Data screen. The
+  // FIFO drains regardless: on-device detection must not depend on who's
+  // watching.
   if (!bleReady || !BLE.connected() || !accelChar.subscribed()) {
     nextLiveSample = totalSamples;
     return;
   }
   uint32_t oldest = (totalSamples > RING_SAMPLES) ? (totalSamples - RING_SAMPLES) : 0;
-  // Rimasti indietro oltre il ring: riparti dal presente invece di leggere
-  // campioni gia' sovrascritti.
+  // Fell behind past the ring: start over from the present instead of
+  // reading samples that were already overwritten.
   if (nextLiveSample < oldest) nextLiveSample = totalSamples;
-  // Non e' ancora ora del prossimo campione decimato.
+  // Not yet time for the next decimated sample.
   if (nextLiveSample >= totalSamples) return;
 
-  // Un pacchetto per svuotamento: a 833 Hz gli svuotamenti sono ogni pochi ms,
-  // quindi 49 Hz si mantengono comunque e la coda del BLE non si intasa.
+  // One packet per drain: at 833 Hz drains happen every few ms, so 49 Hz is
+  // maintained regardless and BLE's queue doesn't clog up.
   uint32_t k = nextLiveSample;
   nextLiveSample = k + LIVE_DECIMATION;
 
@@ -604,13 +608,14 @@ static void publishLiveSamples() {
 }
 
 // ---------------------------------------------------------------------------
-// Cattura seriale ad alta frequenza
+// High-frequency serial capture
 // ---------------------------------------------------------------------------
 
-// Scrive `value / scale` con `decimals` cifre decimali, senza toccare printf sui
-// float: su questo core la printf con %f e' pesante (e in alcune configurazioni
-// di newlib nano non c'e' proprio), e a 833 Hz sarebbe comunque il pezzo piu'
-// costoso del giro. Tutto in aritmetica intera. Ritorna i caratteri scritti.
+// Writes `value / scale` with `decimals` decimal digits, without touching
+// printf on floats: on this core printf with %f is heavy (and on some newlib
+// nano configurations it isn't even present), and at 833 Hz it would be the
+// most expensive part of the loop anyway. All in integer arithmetic. Returns
+// the characters written.
 static uint8_t writeFixed(char* out, int64_t value, uint32_t scale, uint8_t decimals) {
   uint8_t n = 0;
   if (value < 0) {
@@ -637,23 +642,23 @@ static uint8_t writeFixed(char* out, int64_t value, uint32_t scale, uint8_t deci
   return n;
 }
 
-// Costruisce la riga CSV del campione con indice globale k:
+// Builds the CSV row for the sample at global index k:
 //   elapsed_s,x_g,y_g,z_g\n
 //
-// L'elapsed e' accumulato dai delta fra timestamp *misurati* (sampleTimeUs), non
-// contato in campioni: e' esattamente questa la differenza rispetto allo sketch
-// HighFreq, dove l'asse dei tempi e' un indice moltiplicato per il periodo
-// nominale e quindi ignora sia la deriva dell'oscillatore sia i buchi. Sommare
-// i delta invece di fare una sottrazione secca regge anche oltre il wrap di
-// micros() (~71 minuti), che una cattura lunga incontrerebbe.
+// The elapsed time is accumulated from deltas between *measured* timestamps
+// (sampleTimeUs), not counted in samples: this is exactly the difference from
+// the HighFreq sketch, where the time axis is an index multiplied by the
+// nominal period and therefore ignores both oscillator drift and gaps.
+// Summing deltas instead of doing a plain subtraction also holds up past
+// micros()'s wrap (~71 minutes), which a long capture would run into.
 static uint8_t formatSampleLine(uint32_t k, char* out) {
   uint32_t t = sampleTimeUs(k);
   if (serialFirstRow) {
     serialLastUs = t;
     serialFirstRow = false;
   }
-  // Il PLL puo' spostare i timestamp all'indietro di poco quando riaggancia:
-  // un delta negativo diventa 0, mai un salto di 4000 secondi.
+  // The PLL can shift timestamps slightly backward when it re-locks: a
+  // negative delta becomes 0, never a 4000-second jump.
   int32_t d = (int32_t)(t - serialLastUs);
   if (d < 0) d = 0;
   serialElapsedUs += (uint32_t)d;
@@ -664,8 +669,8 @@ static uint8_t formatSampleLine(uint32_t k, char* out) {
   uint32_t slot = (k % RING_SAMPLES) * 3;
   for (uint8_t a = 0; a < 3; a++) {
     out[n++] = ',';
-    // Stesso fattore di LSM6DS3::calcAccel - raw * 0.061 * (range>>1) / 1000 -
-    // ma espresso in decimillesimi di g e in interi:
+    // Same factor as LSM6DS3::calcAccel - raw * 0.061 * (range>>1) / 1000 -
+    // but expressed in ten-thousandths of a g and in integers:
     //   g * 10000 = raw * 61 * (range>>1) / 100
     int32_t num = (int32_t)ringBuf[slot + a] * 61L * (int32_t)(ACCEL_RANGE_G >> 1);
     int32_t units = (num >= 0) ? (num + 50) / 100 : (num - 50) / 100;
@@ -678,9 +683,9 @@ static uint8_t formatSampleLine(uint32_t k, char* out) {
 static void publishSerialSamples() {
   if (!serialStreaming) return;
 
-  // Se lo stream e' rimasto indietro oltre il ring, quei campioni sono stati
-  // sovrascritti: si riparte dal piu' vecchio ancora valido e la perdita viene
-  // contata. Il CSV mostrera' comunque il buco, perche' l'elapsed salta.
+  // If the stream fell behind past the ring, those samples were overwritten:
+  // resume from the oldest one still valid and count the loss. The CSV will
+  // still show the gap, because the elapsed time jumps.
   uint32_t oldest = (totalSamples > RING_SAMPLES) ? (totalSamples - RING_SAMPLES) : 0;
   if (nextSerialSample < oldest) {
     serialDropped += oldest - nextSerialSample;
@@ -689,10 +694,10 @@ static void publishSerialSamples() {
 
   char row[SERIAL_ROW_MAX];
   while (nextSerialSample < totalSamples) {
-    // Il controllo va fatto *prima* di formattare, perche' formatSampleLine
-    // fa avanzare l'elapsed accumulato: formattare e poi rinunciare a scrivere
-    // lascerebbe un buco nell'asse dei tempi. Si chiede lo spazio per la riga
-    // piu' lunga possibile, cosi' basta un confronto solo.
+    // The check must happen *before* formatting, because formatSampleLine
+    // advances the accumulated elapsed time: formatting and then giving up
+    // on writing would leave a gap in the time axis. It asks for room for
+    // the longest possible row, so a single comparison is enough.
     if ((int)Serial.availableForWrite() < (int)SERIAL_ROW_MAX) return;
     uint8_t len = formatSampleLine(nextSerialSample, row);
     Serial.write((const uint8_t*)row, len);
@@ -701,8 +706,8 @@ static void publishSerialSamples() {
 }
 
 static void startSerialStream() {
-  // Si parte dal presente: il contenuto del ring e' storia precedente al
-  // comando e non appartiene a questa cattura.
+  // Start from the present: the ring's current contents are history that
+  // predates the command and doesn't belong to this capture.
   nextSerialSample = totalSamples;
   serialElapsedUs = 0;
   serialFirstRow = true;
@@ -718,11 +723,11 @@ static void stopSerialStream() {
 }
 
 // ---------------------------------------------------------------------------
-// Dump del ring buffer
+// Ring buffer dump
 // ---------------------------------------------------------------------------
 
-// Avvia il dump degli ultimi `count` campioni. Dal punto 3 questa sara'
-// chiamata dalla detection con una finestra centrata sull'onset.
+// Starts dumping the last `count` samples. From step 3 onward this will be
+// called by detection with a window centered on the onset.
 static void startDump(uint32_t count) {
   if (totalSamples == 0) return;
   uint32_t available = min(totalSamples, (uint32_t)RING_SAMPLES);
@@ -742,8 +747,8 @@ static void serviceDump() {
     dumpActive = false;
     return;
   }
-  // Se il ring ha girato sotto i piedi del dump, salta avanti: meglio un buco
-  // dichiarato che campioni sovrascritti spacciati per buoni.
+  // If the ring wrapped around under the dump's feet, skip ahead: better a
+  // declared gap than overwritten samples passed off as good.
   uint32_t oldest = (totalSamples > RING_SAMPLES) ? (totalSamples - RING_SAMPLES) : 0;
   if (dumpNext < oldest) dumpNext = oldest;
 
@@ -773,8 +778,8 @@ static void serviceDump() {
 
   dumpNext += count;
   dumpSeq++;
-  // Un pacchetto per giro di loop: il resto del tempo serve a svuotare la FIFO
-  // e a far girare la radio. Il dump e' logging, non ha fretta.
+  // One packet per loop iteration: the rest of the time is needed to drain
+  // the FIFO and let the radio run. The dump is logging, it's in no hurry.
 }
 
 // ---------------------------------------------------------------------------
@@ -786,9 +791,9 @@ static void serviceGo() {
   if ((int32_t)(micros() - goDueUs) < 0) return;
   goPending = false;
 
-  // L'istante che conta e' quello in cui l'evento si e' verificato, letto qui
-  // e non quando la notifica parte. Quando al posto della seriale ci sara' il
-  // buzzer, cambia solo chi arma goDueUs.
+  // The instant that matters is when the event actually happened, read here,
+  // not when the notification goes out. Once the buzzer replaces the serial
+  // trigger, only whoever arms goDueUs changes.
   uint32_t goTimestamp = micros();
   if (bleReady) goTimeChar.writeValue(goTimestamp);
 
@@ -800,8 +805,8 @@ static void handleSerial() {
   if (!Serial.available()) return;
   char c = Serial.read();
   if (c == 'g') {
-    // Ritardo casuale come prima, ma armato invece che atteso con delay():
-    // il loop continua a svuotare la FIFO nel frattempo.
+    // Random delay as before, but armed instead of waited-on with delay():
+    // the loop keeps draining the FIFO in the meantime.
     goDueUs = micros() + (uint32_t)random(1000000, 4000000);
     goPending = true;
     Serial.println("Go armed");
@@ -812,8 +817,8 @@ static void handleSerial() {
   } else if (c == 'p') {
     printLatest();
   } else if (c == 'r') {
-    // 'r'/'s' sono le lettere che manda gia' lo script Python: cosi' la cattura
-    // funziona senza toccare il lato host.
+    // 'r'/'s' are the letters the Python script already sends: this way
+    // capture works without touching the host side.
     startSerialStream();
   } else if (c == 's') {
     stopSerialStream();
@@ -821,15 +826,16 @@ static void handleSerial() {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostica
+// Diagnostics
 // ---------------------------------------------------------------------------
 
-// Verifica della timebase. Il confronto che conta e' fra il periodo stimato dal
-// PLL e il periodo *misurato*: campioni acquisiti contro microsecondi passati
-// sul clock di bordo, fra due invocazioni di questo comando. Se la FIFO si
-// svuota correttamente e l'ODR e' davvero 833 Hz, entrambi stanno attorno a
-// 1200 us. Guardare i delta fra timestamp consecutivi non proverebbe nulla:
-// sono generati dal periodo stimato, quindi tornerebbero per costruzione.
+// Timebase check. What matters is the comparison between the period
+// estimated by the PLL and the *measured* period: samples acquired versus
+// microseconds elapsed on the on-board clock, between two invocations of
+// this command. If the FIFO drains correctly and the ODR really is 833 Hz,
+// both should sit around 1200 us. Looking at deltas between consecutive
+// timestamps would prove nothing: they're generated from the estimated
+// period, so they'd match by construction.
 static uint32_t lastStatSamples = 0;
 static uint32_t lastStatMicros = 0;
 
@@ -841,8 +847,8 @@ static void printTimebase() {
   Serial.print("totalSamples   "); Serial.println(n);
   Serial.print("estPeriod_us   "); Serial.println(estPeriodUs, 3);
   Serial.print("estRate_Hz     "); Serial.println(1000000.0 / estPeriodUs, 2);
-  // Quanto e' vecchio il campione piu' recente: se il loop sta al passo deve
-  // essere di pochi ms. Un valore grande significa FIFO che si accumula.
+  // How old the most recent sample is: if the loop is keeping pace this
+  // should be a few ms. A large value means the FIFO is backing up.
   Serial.print("newestAge_us   "); Serial.println((int32_t)(now - newestSampleUs));
   Serial.print("overruns       "); Serial.println(cntOverrun);
   Serial.print("realigns       "); Serial.println(cntRealign);
@@ -868,9 +874,9 @@ static void printTimebase() {
   lastStatMicros = now;
 }
 
-// Ultimo campione in g. Serve a controllare l'allineamento del pattern FIFO:
-// con la board ferma sul tavolo Z deve stare attorno a 1 g e X/Y vicini a 0.
-// Se il pattern fosse sfasato gli assi risulterebbero permutati.
+// Latest sample in g. Used to check the FIFO pattern's alignment: with the
+// board resting on a table, Z should sit around 1 g and X/Y close to 0. If
+// the pattern were out of phase the axes would come out permuted.
 static void printLatest() {
   if (totalSamples == 0) {
     Serial.println("no samples yet");
