@@ -137,7 +137,17 @@ Steps 3–5 of the original list are now answered by a real capture (see the
 sensor evaluation below). What remains:
 
 1. **Flash `Arduino/BLEtest/BLEtest.ino`** and watch the Serial Monitor for `IMU OK`. If it prints `IMU error - live data disabled`, BLE still works and reaction time is unaffected — but the live view will be dead. The sketch sets `PIN_LSM6DS3TR_C_POWER` high inside an `#ifdef` (the XIAO Sense IMU has a dedicated power pin; if it stays low `begin()` fails even with I2C wired correctly). If the macro is missing from the installed core, that guard compiles it away and the pin is never driven — check the variant header.
-2. **The sketch has never been compiled by an agent.** No `arduino-cli` on this machine. It has since been flashed successfully by hand, so this is largely moot — but no automated check exists.
+2. **`arduino-cli` is now installed and all four sketches compile clean.**
+   Toolchain: `arduino-cli` 1.5.1 (Homebrew), cores `Seeeduino:mbed` 2.9.3 and
+   `Seeeduino:nrf52` 1.1.13, libs `ArduinoBLE` 2.1.0, `Adafruit GFX` /
+   `Adafruit ST7735`, plus the vendored `Seeed_Arduino_LSM6DS3`. Each sketch
+   folder has a `sketch.yaml` pinning `default_fqbn:
+   Seeeduino:mbed:xiaonRF52840Sense` and `default_port: /dev/cu.usbmodem101`, so
+   a bare `arduino-cli compile` (and `upload` / `monitor`) works from the sketch
+   dir. **The FQBN matters:** ArduinoBLE fails to link on the `Seeeduino:nrf52`
+   (Adafruit) core with `undefined reference to HCITransport` — it must be built
+   with the `mbed` core. A XIAO nRF52840 Sense is currently attached at
+   `/dev/cu.usbmodem101`, so upload and serial capture are available too.
 3. **Act on the firmware changes** the evaluation calls for (ODR, detector, audio-latency calibration) — listed under *What the evaluation implies for the firmware*.
 4. **Resolve the board question.** The system diagram shows an **ESP32-WROOM-32U with an external IMU**; the README's "Hardware direction under evaluation" note right below it argues for the **Arduino Nano 33 IoT** precisely because it avoids an external IMU. One of the two is stale. Nothing else can be finalised until this is settled.
 5. **Verify the CSV export on iPad.** It works on iPhone (the capture in `playground_IMU/` came out of it). On iPad the share sheet is a popover needing an anchor rect; `_export` in `live_data_screen.dart` derives one from the summary card's `RenderBox`, still unexercised. "Save to Files" is the save-to-device path.
