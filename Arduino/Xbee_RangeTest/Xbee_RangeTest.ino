@@ -207,7 +207,7 @@ static const uint8_t MAGIC = 0x4B;
 
 static void waitForSerial() {
   // Native USB: Serial only goes true when a host opens the port. Bounded wait
-  // so a battery-powered board still runs. Same pattern as BLEtest.ino.
+  // so a battery-powered board still runs.
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 3000) delay(10);
 }
@@ -253,7 +253,7 @@ static Sent ring[32];
 
 // Explicit prototypes: the Arduino auto-prototype generator mangles `static`
 // functions that take a struct by reference (it inserts the prototype above the
-// struct definition). Same note as BLEtest.ino.
+// struct definition).
 static Sent* ringAlloc();
 static void  emit(Sent& e);
 static void  resetStats();

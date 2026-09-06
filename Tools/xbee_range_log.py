@@ -4,7 +4,7 @@ Host logger for Arduino/Xbee_RangeTest.
 
 Tether one of the two range-test boards over USB, run this, and walk the other
 board away in measured steps. It transcribes the board's per-packet rows to a
-CSV under data/, tags each row with the distance you are currently at, and
+CSV under Data/, tags each row with the distance you are currently at, and
 prints a rolling PDR / RSSI / RTT readout so you can decide when to move on.
 
 TIME
@@ -28,8 +28,8 @@ it, RTT jitter is the only jitter figure available, and it folds both hops plus
 the receiver's ATDB turnaround into one number.
 
 USAGE
-    python3 tools/xbee_range_log.py --distance 0
-    python3 tools/xbee_range_log.py --port /dev/cu.usbmodem1101 --distance 25
+    python3 Tools/xbee_range_log.py --distance 0
+    python3 Tools/xbee_range_log.py --port /dev/cu.usbmodem1101 --distance 25
 
 While running, type a command + Enter:
     d <metres>   set the current distance tag (also resets the board + host
@@ -50,7 +50,7 @@ import time
 from datetime import datetime, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "data")
+DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "Data")
 
 SENDER_COLS = ("host_iso,distance_m,seq,unicast,tx_delivery,tx_retries,"
                "echo_ok,rtt_us,rssi_remote_dbm")

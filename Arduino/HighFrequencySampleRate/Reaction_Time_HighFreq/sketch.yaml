@@ -1,2 +1,0 @@
-default_fqbn: Seeeduino:mbed:xiaonRF52840Sense
-default_port: /dev/cu.usbmodem101

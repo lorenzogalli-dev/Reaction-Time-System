@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyse and plot Xbee_RangeTest logs written by tools/xbee_range_log.py.
+Analyse and plot Xbee_RangeTest logs written by Tools/xbee_range_log.py.
 
 Groups rows by their distance_m tag and produces, per distance:
   - packet delivery ratio (from sequence-number continuity)
@@ -14,9 +14,9 @@ if it falls short of the 200 m target, which antenna/radio upgrade that points
 to.
 
 USAGE
-    python3 tools/xbee_range_plot.py                       # newest data/xbee_range_*.csv
-    python3 tools/xbee_range_plot.py data/xbee_range_*.csv  # merge several runs
-    python3 tools/xbee_range_plot.py --save out.png
+    python3 Tools/xbee_range_plot.py                       # newest Data/xbee_range_*.csv
+    python3 Tools/xbee_range_plot.py Data/xbee_range_*.csv  # merge several runs
+    python3 Tools/xbee_range_plot.py --save out.png
 
 Requires: numpy, matplotlib.
 """
@@ -30,7 +30,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(REPO_ROOT, "data")
+DATA_DIR = os.path.join(REPO_ROOT, "Data")
 
 PDR_PASS = 0.95
 RANGE_TARGET_M = 200.0
@@ -239,7 +239,7 @@ def plot(role, table, save):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv", nargs="*", help="log files (default: newest data/xbee_range_*.csv)")
+    ap.add_argument("csv", nargs="*", help="log files (default: newest Data/xbee_range_*.csv)")
     ap.add_argument("--save", help="write the figure here instead of showing it")
     args = ap.parse_args(argv)
 
@@ -247,7 +247,7 @@ def main(argv=None):
     if not paths:
         found = sorted(glob.glob(os.path.join(DATA_DIR, "xbee_range_*.csv")))
         if not found:
-            sys.exit("no data/xbee_range_*.csv found - run tools/xbee_range_log.py first")
+            sys.exit("no Data/xbee_range_*.csv found - run Tools/xbee_range_log.py first")
         paths = [found[-1]]
 
     role, d = load(paths)

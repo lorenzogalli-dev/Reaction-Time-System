@@ -1,8 +1,8 @@
 # XBee link range & reliability — test and findings
 
-Parallels `playground_IMU/`: the method, the raw captures, and the conclusion.
-This covers the **start box ↔ finish box** radio link only. The finish box ↔
-phone BLE hop is separate.
+The method, the raw captures, and the conclusion for one question. This covers
+the **start unit ↔ finish unit** radio link only; the finish unit ↔ phone BLE
+hop is separate (measured at ~25 m — see the root `README.md`).
 
 ## Hardware under test
 
@@ -103,15 +103,15 @@ XBee is 3.3 V; the XIAO is native 3.3 V, so **no level shifter**.
      have only RTT jitter, which folds both radio hops and the receiver's ATDB
      turnaround into a single number — usable as a trend, but not a clean
      one-way figure.
-   - `python3 tools/xbee_range_log.py --distance 0`, then type `d 25`, `d 50`,
+   - `python3 Tools/xbee_range_log.py --distance 0`, then type `d 25`, `d 50`,
      … at each point. Each `d` resets the board + host counters and starts a
      new segment.
 3. **Two antenna heights** at each distance: on the ground, and on a ~1 m
    mast. Ground reflection / Fresnel-zone clearance changes the result a lot.
 4. **Note the environment**: open field vs track, people present, weather, and
    whether a phone with BLE/Wi-Fi is active nearby (2.4 GHz coexistence — the
-   finish box will have exactly that).
-5. **Analyse.** `python3 tools/xbee_range_plot.py data/xbee_range_*.csv` →
+   finish unit will have exactly that).
+5. **Analyse.** `python3 Tools/xbee_range_plot.py Data/xbee_range_*.csv` →
    PDR / RSSI / RTT vs distance, and the max distance meeting the criterion.
 
 ## Pass criteria
@@ -143,4 +143,4 @@ _To fill in after the walk test._
 **If not — recommended upgrade:** _wire-whip antenna / XBee-PRO_
 **Coexistence / jitter observations:** _tbd_
 
-Raw captures: `data/xbee_range_*.csv`. Figures: `data/xbee_range_*.png`.
+Raw captures: `Data/xbee_range_*.csv`. Figures: `Data/xbee_range_*.png`.
