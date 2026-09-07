@@ -1,11 +1,141 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-08-29. Written for an agent starting with no prior context.
+Last updated: 2026-09-04. Written for an agent starting with no prior context.
 
-Two pieces of work, in order: the live accelerometer view in the Flutter app,
-and then an evaluation of what the captured data says about the sensor's
-suitability for false-start detection. The second is the one with consequences
-for the firmware — see **Sensor evaluation** below.
+## READ THIS SECOND — README.md rewritten, new architecture direction, unresolved discrepancy
+
+Later on 2026-09-04, after the repo reorganization described in the section
+below, `README.md` was rewritten from scratch and `BUILD.md` was added.
+None of this changed anything in `Arduino/`, `Tools/`, or `Flutter App/` —
+it's documentation and product/business content only. What changed:
+
+- **New target architecture (not yet implemented in code):** the starting
+  device and a new **finish unit** (a second XIAO nRF52840 Sense) link over
+  **Zigbee** instead of Wi-Fi. Wi-Fi was dropped for UX reasons (forces the
+  user to join a device-hosted network each session); a straight BLE link
+  was found in real testing to max out at **~25 m** range, too short for a
+  100 m track, hence splitting into two hops with Zigbee for the long,
+  fixed start↔finish leg.
+- **A new system diagram** was added: `Docs/reaction_time_diagram_v2.png`
+  (the original `Docs/reaction_time_diagram.png` was kept, not replaced).
+  `README.md`'s "System at a glance" image now points at the v2 diagram.
+- **A business plan section** was added to `README.md` (hardware BOM/pricing,
+  a freemium app model with monthly/6-month/annual/club tiers, ad-supported
+  free tier, and an illustrative TAM/revenue projection). All figures in it
+  are explicitly invented/illustrative for a course business case, not real
+  financials — don't treat them as sourced data if reusing this content
+  elsewhere.
+- **The old ASCII "System Architecture" diagram was removed** from
+  `README.md` (redundant with the image), replaced by a prose "How the
+  System Works" section.
+
+**Discrepancy above: resolved 2026-09-04, same day.** The first
+`reaction_time_diagram_v2.png` the user supplied showed the finish block
+talking Zigbee to the phone (no BLE anywhere in it), contradicting the
+user's own verbal description and `README.md`'s prose (both said BLE). The
+user then supplied a corrected diagram (same filename, overwritten) that
+matches the verbal description: **Zigbee for start↔finish, BLE for
+finish↔phone**, with **WiFi Direct (SoftAP) as a fallback specifically for
+the start↔finish hop** if Zigbee proves unreliable — not a phone-facing
+fallback. `README.md`'s "How the System Works", "Key design decisions"
+table, and "Open Risks" section were updated to state the WiFi-fallback
+nuance explicitly, so the image and the prose now agree. Nothing further to
+reconcile here.
+
+## READ THIS FIRST — repo reorganized 2026-09-04, BLEtest.ino removed
+
+Everything below this section (up to **State of the tree**) describes work from
+2026-08-29 and earlier, centered on a firmware called `BLEtest.ino` that no
+longer exists in this repo (deleted 2026-09-04 — see why below). Treat paths
+in those older sections as **historical**, not current: several folders were
+renamed or moved on 2026-09-04:
+
+| Old path | New path |
+|---|---|
+| `prostart/` | `Flutter App/prostart/` |
+| `data/` | `Data/` |
+| `tools/` | `Tools/` |
+| `docs/` | `Docs/` |
+| `playground_IMU/` | **deleted entirely** — see note below |
+| `Arduino/BLEtest/` | **deleted** — see why below |
+| `Arduino/HighFrequencySampleRate/` | **deleted** — superseded, see why below |
+| `tools/kinestart_live.py` | **deleted** — superseded by `Tools/accel_live.py` |
+
+**Why `BLEtest.ino` is gone:** it combined a hardware-FIFO accelerometer
+capture at 833 Hz, a software PLL to derive real timestamps from the FIFO's
+sample count, and a full BLE stack (live view + "go" trigger + raw dump
+characteristics). On 2026-09-03 it reproducibly hung or crash-looped
+(`setup()` re-running on its own, "IMU OK"/"Ready" reprinting with no user
+input) on **two separate physical XIAO nRF52840 Sense boards**, ruling out a
+single bad board. A bare-bones sanity sketch with no IMU/BLE/FIFO
+(`Arduino/SerialEchoTest/SerialEchoTest.ino` — heartbeat print + serial echo,
+nothing else) worked correctly on both boards, ruling out the cable, USB
+port, and Mac-side toolchain — the fault was specifically in `BLEtest.ino`'s
+code. One concrete symptom caught along the way: `BLE.begin()` was observed
+taking **~2 minutes** to return instead of milliseconds; disabling BLE
+entirely didn't fix responsiveness by itself, and with BLE *and* the FIFO
+drain both disabled the board was still unresponsive to serial commands. The
+root cause was **never isolated** — debugging was abandoned in favor of a
+clean rewrite rather than continuing to guess blindly. It was fully deleted
+(not just deprecated) on 2026-09-04 during a repo cleanup, so it can't be
+accidentally reflashed. It's still recoverable from git history
+(`git log --all --oneline -- Arduino/BLEtest/BLEtest.ino`) if ever needed for
+reference, but starting over cleanly is the recommended path — see
+**Unresolved** below.
+
+**Current, working pipeline** (verified end-to-end on real hardware, real
+push-off-scale data already captured — see `Data/accel_2026*.png`):
+
+- **Firmware:** `Arduino/AccelStream/AccelStream.ino` — deliberately minimal.
+  No BLE, no hardware FIFO, no hand-rolled I2C register/FIFO code - just the
+  vendored LSM6DS3 library's plain polling reads (`readFloatAccelX/Y/Z`) on a
+  `micros()`-scheduled loop at **416 Hz**, **±8 g** (raised from the old
+  ±4 g: a real push-off rigidly mounted on the block can hit 2-5 g and would
+  clip at ±4 g). Each sample's timestamp is a direct `micros()` read taken
+  immediately after that sample's I2C transaction - a real measurement, not
+  a count-times-nominal-period model like the old (also now-deleted)
+  `Reaction_Time_HighFreq.ino`, or a PLL-inferred one like `BLEtest.ino` was.
+  Serial protocol: `'r'` start CSV stream, `'s'` stop, `'p'` one immediate
+  reading; streaming rows are `t_us,x_g,y_g,z_g`.
+- **Live capture:** `Tools/accel_live.py` — live X/Y/Z + magnitude plot,
+  autodetects the port, Record/Stop/Snapshot buttons with an actually-visible
+  state change (button turns solid red with "● Recording..." while
+  recording, flashes green "✓ Saved" on stop), gap/clipping detection, CSV +
+  a 4-panel PNG (X, Y, Z separately, then magnitude) saved on stop.
+- **Offline review:** `Tools/csv_plot.py` — always opens a native file-picker
+  dialog (no CLI path to type), auto-detects the CSV's time column (`t_s`
+  from `accel_live.py`, or `elapsed_s` from older captures like
+  `Data/blockstart_20260831_test0.csv`, the old `Block_Start_Data.csv`
+  renamed on 2026-09-04), same 4-panel layout, standard matplotlib zoom/pan
+  toolbar for inspecting sub-second detail.
+- **Diagnostic sketch:** `Arduino/SerialEchoTest/SerialEchoTest.ino` - keep
+  this around. Flash it first on any new or suspect board before trusting
+  more complex firmware; it isolates hardware/cable/port problems from
+  firmware bugs in about a minute.
+
+**Deleted on 2026-09-04, not just deprecated — don't go looking for these:**
+
+- `tools/kinestart_live.py` - was paired with `BLEtest.ino`'s old protocol
+  and is incompatible with `AccelStream.ino`'s CSV output (`elapsed_s` vs.
+  `t_us`). Superseded by `Tools/accel_live.py`.
+- `Arduino/HighFrequencySampleRate/` in its entirety (`Reaction_Time_HighFreq/`,
+  `Python_Serial`, `CSV_Visualizer`) - the original HighFreq firmware computed
+  elapsed time as `sampleIndex * nominal_period`, ignoring real timing jitter;
+  its paired Python scripts had a hardcoded Windows path and crashed on both
+  of the current CSV formats.
+- `playground_IMU/` - the sensor-evaluation notebook, its six figures, and
+  the raw capture CSV it analyzed. The **findings** are preserved below under
+  **Sensor evaluation**, but the notebook and raw data themselves are gone
+  from the repo (recoverable from git history if needed:
+  `git log --all --oneline -- playground_IMU`).
+
+**Unresolved:** the actual `BLEtest.ino` hang/crash-loop was never root-caused.
+If BLE support is needed again, don't restart from its FIFO+PLL design -
+consider adding a minimal BLE characteristic to `AccelStream.ino`'s simple
+polling loop instead, one piece at a time, testing after each addition (that
+incremental approach is exactly what would have caught this bug early).
+
+---
 
 ## Goal (part 1)
 
@@ -29,12 +159,23 @@ All three are implemented. See Next Steps for what remains unverified.
 
 ## Project layout
 
-- `prostart/` — Flutter app (Dart, `provider` for state, `flutter_blue_plus` for BLE)
-- `Arduino/BLEtest/BLEtest.ino` — the firmware actually flashed to the board
+Current, as of the 2026-09-04 reorganization:
+
+- `Flutter App/prostart/` — Flutter app (Dart, `provider` for state, `flutter_blue_plus` for BLE)
+- `Arduino/AccelStream/AccelStream.ino` — **current working firmware** for
+  accelerometer capture (no BLE); see the top section above
+- `Arduino/SerialEchoTest/SerialEchoTest.ino` — minimal hardware/cable sanity
+  check, no IMU or BLE
 - `Arduino/I2C_Scanner/` — I2C debug sketch
+- `Arduino/Reaction_HardwareTest/` — TFT display/buzzer/XBee hardware bring-up test
 - `Arduino/libraries/Seeed_Arduino_LSM6DS3/` — vendored IMU library
-- `playground_IMU/` — sensor evaluation: notebook, the capture it analyses, and a README of findings
-- `docs/` — diagrams and figures used by the root README
+- `Tools/accel_live.py` — current live capture/record tool, pairs with `AccelStream.ino`
+- `Tools/csv_plot.py` — current offline CSV viewer (file-picker based)
+- `Data/` — recorded CSV captures and their plots
+- `Docs/` — diagrams and figures used by the root README
+
+`Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`, `tools/kinestart_live.py`,
+and `playground_IMU/` are all **deleted** — see the top section for why.
 
 The root `README.md` used to describe a `firmware/` and `app/` layout that does
 not exist; that is now corrected. It still links to `report/main.tex`, but no
@@ -57,9 +198,10 @@ Service `19B10000-E8F2-537E-4F6C-D104768A1214`, device local name
 | `19B10001-…` | "go" timestamp — single-shot `micros()`, little-endian uint. **Untouched.** |
 | `19B10002-…` | **New.** Accelerometer stream, ~50 Hz notify, 12 bytes = 3 × float32 little-endian (X, Y, Z) in g. |
 
-The UUID and the 12-byte layout are duplicated in two places and must stay in
-sync: `prostart/lib/services/ble_service.dart` and
-`Arduino/BLEtest/BLEtest.ino`. Both files carry a comment saying so.
+The UUID and the 12-byte layout were duplicated in two places and had to stay
+in sync: `Flutter App/prostart/lib/services/ble_service.dart` and the
+now-deleted `Arduino/BLEtest/BLEtest.ino`. The Dart side still has this BLE
+code; there is currently no firmware counterpart for it.
 
 ### Flutter — files added
 
@@ -174,8 +316,13 @@ from scratch (`flutter clean` + `pod install`) when you do.
 
 ## Sensor evaluation — read this before touching the firmware
 
+> **`playground_IMU/` was deleted on 2026-09-04** (see the top section) — the
+> notebook, its six figures, and the raw capture CSV are gone from the repo.
+> The findings below are what survive; they're summarized conclusions, not
+> reproducible from anything currently in this tree.
+
 A 14 s capture was taken from real hardware through the live view and exported
-via the CSV path. Full analysis in **`playground_IMU/`** (notebook with six
+via the CSV path. Full analysis was in `playground_IMU/` (notebook with six
 figures, plus a README covering the architecture questions). The headlines:
 
 **The sensor is not the constraint.** Noise floor 0.65 mg (1σ). A light finger
@@ -247,7 +394,19 @@ them were rewritten on 2026-08-29 and force-pushed.
 
 ## State of the tree
 
-Everything above is committed and pushed on `main`:
+The table below (through `0e701f8`) is from the 2026-08-29 work described in
+this document's older sections and is committed and pushed on `main`. It
+predates the `BLEtest.ino` FIFO+PLL+BLE rewrite (`5c2eaa1`..`1e86094`, also
+committed and pushed) and the `AccelStream.ino`/`accel_live.py`/`csv_plot.py`
+introduction (`a6e9787`, committed and pushed 2026-09-04).
+
+The folder reorganization described in the top section of this file
+(`data`→`Data`, `tools`→`Tools`, `docs`→`Docs`, `prostart`→`Flutter App/prostart`,
+plus deleting `Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`,
+`tools/kinestart_live.py`, and `playground_IMU/`) was made **after** `a6e9787`
+and its commit/push status should be checked with `git status` / `git log`
+rather than assumed from this document — it may or may not be pushed by the
+time you're reading this.
 
 | Commit | What |
 |---|---|
@@ -256,6 +415,8 @@ Everything above is committed and pushed on `main`:
 | `56e90cb` | CSV export fix (`path_provider_foundation` pin) |
 | `4e8d220` | IMU evaluation (`playground_IMU/`) |
 | `0e701f8` | System overview diagram in the README |
+| `5c2eaa1`..`1e86094` | `BLEtest.ino` FIFO+PLL+BLE rewrite, `kinestart_live.py` |
+| `a6e9787` | `AccelStream.ino` no-BLE pipeline, `accel_live.py`, `csv_plot.py` |
 
 Hashes changed in the 2026-08-29 history rewrite; anything referencing the old
 `37060b5` means `de65ad6`.
