@@ -101,6 +101,10 @@ def main():
         if line == "DUMP_END":
             print("[board] DUMP_END")
             break
+        if line.startswith(("ON,", "SET,", "GO,")):
+            # Marker header lines - always present, 0 when unused. Not junk.
+            print(f"[board] {line}")
+            continue
         if line.startswith("DROPPED,"):
             val = line.split(",", 1)[1].strip()
             dropped = int(val) if val.isdigit() else None

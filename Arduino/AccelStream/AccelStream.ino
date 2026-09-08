@@ -59,10 +59,10 @@
 // the data-ready watchdog had to recover rather than receive an edge for;
 // anything other than 0 means some timestamps in that capture are degraded.
 //
-// t_us is the instant the SENSOR latched the sample (captured in the INT1
-// data-ready ISR), not the instant this firmware finished reading it over
-// I2C - the two differ by the ~1023 us the burst read takes, and before v3
-// the recorded value was the latter.
+// t_us is read the moment the INT1 data-ready flag is seen and BEFORE the
+// I2C burst read, so it no longer includes the ~1023 us that read takes -
+// which is what the pre-v3 value did. It is not taken in the ISR itself:
+// micros() has no microsecond resolution there on this core (see drdyIsr).
 //
 // t_us is an unsigned micros() value (wraps every ~71 minutes, ignored here
 // since captures are short bench/block tests, not multi-hour sessions).
@@ -172,10 +172,7 @@ static Mode mode = MODE_IDLE;
 static bool imuReady = false;
 static uint32_t idleSampleIndex = 0;
 
-// Written by the data-ready ISR, read by the main loop. drdyT is the whole
-// point of the interrupt: it is micros() at the instant the sensor latched
-// the sample, so it does not include the ~1023 us the I2C read then takes.
-static volatile uint32_t drdyT = 0;
+// Set by the data-ready ISR, cleared by the main loop.
 static volatile bool drdyPending = false;
 static uint32_t lastSampleUs = 0;
 
@@ -196,13 +193,14 @@ static uint32_t droppedSamples = 0;
 static uint32_t onT = 0, setT = 0, goT = 0;
 static bool onCaptured = false, setCaptured = false, goCaptured = false;
 
-// Kept to the bare minimum: timestamp and flag, no I2C, no Serial. The read
-// itself stays in the main loop, where it can block on the bus safely.
-// If a sample is still unconsumed when this fires, the sensor's output
-// registers already hold the newer sample, so the newer timestamp is the
-// correct one to keep - overwriting is right, not a lost update.
+// Deliberately does NOT timestamp. micros() called from interrupt context on
+// this core does not have microsecond resolution - it falls back to a 1024 Hz
+// counter, so every timestamp lands on a ~976.6 us grid. A first cut of v3
+// took the timestamp here and a bench run showed it plainly: dt collapsed to
+// just two values, 977 us and 1954 us, where the v2 captures it replaced had
+// 59 distinct values around 1022 us. Reading the clock in the main loop is
+// both finer and, given the flag is serviced promptly, barely later.
 static void drdyIsr() {
-  drdyT = micros();
   drdyPending = true;
 }
 
@@ -312,13 +310,14 @@ static void serviceSampling() {
 
   uint32_t t;
   if (drdyPending) {
-    // Normal path. Take the ISR's timestamp under a brief critical section:
-    // drdyT is 32-bit and the ISR could otherwise land between reading it
-    // and clearing the flag, which would drop that sample entirely.
-    noInterrupts();
-    t = drdyT;
     drdyPending = false;
-    interrupts();
+    // Timestamp taken here rather than in the ISR (see drdyIsr) and, within
+    // the main loop, before the I2C read rather than after it - so it is as
+    // close to the sensor's latch instant as this core can measure. What is
+    // left is the loop's latency in noticing the flag: small, and roughly
+    // constant, so it is a calibratable bias rather than the 0-602 us of
+    // random staleness the free-running v2 read carried.
+    t = micros();
   } else if ((uint32_t)(micros() - lastSampleUs) > DRDY_STALL_TIMEOUT_US) {
     // Watchdog path - see DRDY_STALL_TIMEOUT_US. Reading clears the latched
     // line so edges resume. The sample is kept (it is real data) but its
