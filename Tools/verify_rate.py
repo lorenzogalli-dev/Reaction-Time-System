@@ -2,8 +2,8 @@
 """
 verify_rate.py - CLI-only check of AccelStream.ino's real recorded rate.
 
-No GUI, no matplotlib: connects, arms a full-rate recording ('r'), waits a
-fixed window, stops it ('S'), reads the DUMP_START/.../DUMP_END burst, and
+No GUI, no matplotlib: connects, waits a fixed window while the firmware's
+sample ring fills, asks for it ('d'), reads the DUMP_START/.../DUMP_END burst, and
 reports whether the achieved sample rate and data integrity are what the
 firmware promises (833 Hz, no dropped/corrupted rows, DROPPED=0).
 
@@ -13,7 +13,7 @@ Usage:
     python3 Tools/verify_rate.py --port /dev/cu.usbmodem1101
 
 Only one program can hold the serial port at a time - close the Arduino
-Serial Monitor (or accel_live.py) before running this.
+Serial Monitor (or capture.py) before running this.
 """
 
 import argparse
@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--port", help="serial port (default: autodetected)")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--seconds", type=float, default=3.0,
-                     help="how long to record before stopping")
+                     help="how long to let the sample ring fill before dumping it")
     ap.add_argument("--target-hz", type=float, default=833.0,
                      help="expected firmware ODR, for the pass/fail check")
     ap.add_argument("--range", type=float, default=16.0,
@@ -77,11 +77,18 @@ def main():
             print("[board]", line)
     print("----------------------------------")
 
-    print(f"Arming full-rate recording for {args.seconds:.1f}s...")
+    # v4: the sample ring is always filling, so there is nothing to arm or
+    # stop - just let it fill for the window and ask for it. 'd' dumps the
+    # ring as it stands, with no start sequence and no markers.
+    #
+    # Note the ring is the full ~13.9 s regardless of --seconds, so the dump
+    # is normally the whole ring, not the window waited for. That is fine and
+    # deliberate: every check below is computed from the rows' own timestamps,
+    # not from the elapsed wall time, so more rows only makes them stronger.
+    print(f"Letting the ring fill for {args.seconds:.1f}s, then dumping...")
     ser.reset_input_buffer()
-    ser.write(b"r")
     time.sleep(args.seconds)
-    ser.write(b"S")  # 'S' stops and dumps; lowercase 's' is the "set" marker
+    ser.write(b"d")
 
     rows = []
     expected = None
@@ -102,8 +109,9 @@ def main():
         if line == "DUMP_END":
             print("[board] DUMP_END")
             break
-        if line.startswith(("ON,", "SET,", "GO,")):
-            # Marker header lines - always present, 0 when unused. Not junk.
+        if line.startswith(("ON,", "SET,", "GO,", "PREROLL,", "TRUNCATED,")):
+            # Header lines - always present, 0 when unused. Not junk. A 'd'
+            # dump carries no start sequence, so the markers are all 0 here.
             print(f"[board] {line}")
             continue
         if line.startswith("CLOCKSTEP,"):
@@ -125,7 +133,10 @@ def main():
                     print(f"!! malformed row (skipped): {line!r}")
             else:
                 print(f"!! unexpected line during dump (skipped): {line!r}")
-        else:
+        elif line.count(",") != 3:
+            # Pre-dump chatter: banner text worth seeing. The idle preview's
+            # own CSV rows are backlogged in the buffer by the wait above and
+            # are just noise here, so they are dropped silently.
             print("[board]", line)
     ser.close()
 
