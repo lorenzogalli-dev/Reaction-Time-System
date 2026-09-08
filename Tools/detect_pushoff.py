@@ -215,6 +215,18 @@ def run_csv(path, odr_hz, **detector_kwargs):
     t = df["t_s"].values if "t_s" in df.columns else df["t_us"].values / 1e6
     x, y, z = df["x_g"].values, df["y_g"].values, df["z_g"].values
 
+    if odr_hz is None:
+        # Derive the rate from the capture itself rather than assuming one.
+        # The firmware's rate has already changed once (v2 free-ran at
+        # ~977 Hz, v3 is a fixed 833 Hz), and the STA/LTA window lengths are
+        # sized in samples from this number - so a stale default silently
+        # mis-sizes every time constant instead of failing. Median dt, not
+        # mean, so a single gap can't skew it.
+        dt = float(np.median(np.diff(t)))
+        if not (dt > 0):
+            raise ValueError(f"{path}: cannot derive sample rate from timestamps")
+        odr_hz = 1.0 / dt
+
     det = PushOffDetector(odr_hz=odr_hz, **detector_kwargs)
     for i in range(len(t)):
         det.update(t[i], x[i], y[i], z[i])
@@ -349,8 +361,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csvs", nargs="+", help="one or more recorded CSV files (globs OK, quote them)")
-    ap.add_argument("--odr", type=float, default=977.5,
-                     help="sample rate of the CSV, for the EMA time constants")
+    ap.add_argument("--odr", type=float, default=None,
+                     help="sample rate of the CSV, for the EMA time constants "
+                          "(default: measured from the capture's own timestamps)")
     ap.add_argument("--sta-ms", type=float, default=15.0)
     ap.add_argument("--lta-ms", type=float, default=800.0)
     ap.add_argument("--ratio", type=float, default=6.0, help="STA/LTA ratio trigger threshold")

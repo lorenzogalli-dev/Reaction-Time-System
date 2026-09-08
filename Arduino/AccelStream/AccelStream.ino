@@ -54,19 +54,74 @@
 //   ... then idle decimated streaming resumes automatically.
 // 'p' prints one immediate reading, independent of the above.
 //
+// The dump's header lines are DUMP_START,<n> / ON,<t> / SET,<t> / GO,<t> /
+// DROPPED,<n>, then the rows, then DUMP_END. DROPPED is the number of samples
+// the data-ready watchdog had to recover rather than receive an edge for;
+// anything other than 0 means some timestamps in that capture are degraded.
+//
+// t_us is the instant the SENSOR latched the sample (captured in the INT1
+// data-ready ISR), not the instant this firmware finished reading it over
+// I2C - the two differ by the ~1023 us the burst read takes, and before v3
+// the recorded value was the latter.
+//
 // t_us is an unsigned micros() value (wraps every ~71 minutes, ignored here
 // since captures are short bench/block tests, not multi-hour sessions).
 // ---------------------------------------------------------------------------
 
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
 
-// 1660 Hz is the fastest ODR the vendored library's settings switch actually
-// recognizes (its own comment says "1666" but the switch case is literally
-// 1660 - passing 1666 silently falls through to the 104 Hz default, which
-// would be a very quiet way to lose 16x the sample rate). Verified against
-// LSM6DS3.cpp's accelSampleRate switch before picking this constant.
-static const uint16_t ACCEL_ODR_HZ = 1660;
+// 833 Hz, paced by the sensor's own data-ready line (INT1) rather than by
+// however fast this loop happens to run - see serviceSampling().
+//
+// v2 asked for 1660 Hz and measured ~977 Hz. That was not the sensor falling
+// back: the chip really did run at 1660 Hz, but one burst read costs ~1023 us
+// against a 602 us budget, so the pacing deadline below could never be met
+// and the loop simply free-ran at whatever I2C throughput allowed. The rate
+// was repeatable (977.5-978.5 Hz) but *emergent* - it is whatever is left
+// after the loop's workload, so adding the on-device STA/LTA detector would
+// have lowered it silently. That is exactly the failure mode that capped v1
+// at 232 Hz (a Serial.print per sample), so it is worth not building on.
+//
+// 833 Hz is the next ODR step the library recognizes and one the read path
+// can genuinely sustain: a 1200 us budget against ~1023 us of work leaves
+// ~177 us per sample (~11k cycles at 64 MHz with FPU) of headroom for the
+// detector - and headroom can be measured, whereas a drifting rate cannot.
+//
+// Accuracy is deliberately NOT the point here: total sample-timing error
+// goes from sigma ~0.34 ms to ~0.35 ms, i.e. unchanged. Coarser quantisation
+// (1200 us steps instead of 1023) is traded against removing the 0-602 us
+// staleness the old timestamps carried, and the two cancel. What is bought
+// is a rate that is specified instead of observed, and a timestamp taken at
+// the instant the sample was produced. The dominant error in a reaction time
+// remains where the detector threshold lands on the push-off ramp - tens of
+// ms, and still untuned - not this.
+//
+// The library's accelSampleRate switch silently falls through to its 104 Hz
+// default for any value not in its list (its own comment says "1666" while
+// the case is literally 1660), which would be a very quiet way to lose 8x
+// the rate - hence the static_assert rather than a bare constant.
+static const uint16_t ACCEL_ODR_HZ = 833;
+static_assert(ACCEL_ODR_HZ == 13 || ACCEL_ODR_HZ == 26 || ACCEL_ODR_HZ == 52 ||
+              ACCEL_ODR_HZ == 104 || ACCEL_ODR_HZ == 208 || ACCEL_ODR_HZ == 416 ||
+              ACCEL_ODR_HZ == 833 || ACCEL_ODR_HZ == 1660 || ACCEL_ODR_HZ == 3330 ||
+              ACCEL_ODR_HZ == 6660 || ACCEL_ODR_HZ == 13330,
+              "ACCEL_ODR_HZ must be a value LSM6DS3.cpp's accelSampleRate switch "
+              "handles; anything else silently configures 104 Hz instead");
 static const uint32_t SAMPLE_PERIOD_US = 1000000UL / ACCEL_ODR_HZ;
+
+// The IMU's data-ready line has to reach a GPIO for any of this to work.
+#ifndef PIN_LSM6DS3TR_C_INT1
+#error "AccelStream needs the IMU data-ready line on a GPIO (PIN_LSM6DS3TR_C_INT1) - select a XIAO nRF52840 Sense board."
+#endif
+
+// DRDY is level-latched: it goes high when a sample is ready and only drops
+// once the output registers are read. So a single missed edge is permanent -
+// no read means no falling edge means no next rising edge, and sampling would
+// stop dead. This watchdog bounds that: if no edge arrives for three sample
+// periods, read anyway (which clears DRDY and lets edges resume) and count it.
+// It also covers startup, where DRDY can already be high before
+// attachInterrupt() is in place and there is no edge left to catch.
+static const uint32_t DRDY_STALL_TIMEOUT_US = 3 * SAMPLE_PERIOD_US;
 
 // +/-16 g: a real push-off rigidly mounted on the block is expected around
 // 1-3 g, but a 2026-09-07 bench test (a hard hand hit, well above a real
@@ -80,14 +135,14 @@ static const uint8_t ACCEL_RANGE_G = 16;
 // here so the burst read path doesn't need three separate library calls.
 static const float ACCEL_SCALE_G_PER_LSB = 0.061f * (ACCEL_RANGE_G >> 1) / 1000.0f;
 
-// Idle live-preview rate = ACCEL_ODR_HZ / STREAM_DECIMATE (~332 Hz) - fast
+// Idle live-preview rate = ACCEL_ODR_HZ / STREAM_DECIMATE (~167 Hz) - fast
 // enough for a smooth chart, slow enough that ASCII float printing has huge
 // timing margin and can never throttle the underlying sample schedule.
 static const uint16_t STREAM_DECIMATE = 5;
 
 // RAM budget for a recording: 10 bytes/sample (uint32 t_us + 3x int16 raw)
 // x 12000 = ~117 KB, comfortably inside the XIAO nRF52840's 256 KB RAM with
-// no BLE stack running. ~7.2 s at 1660 Hz - generous for one on-your-marks
+// no BLE stack running. ~14.4 s at 833 Hz - generous for one on-your-marks
 // to push-off window; raise it if a longer capture is ever needed.
 static const uint32_t MAX_REC_SAMPLES = 12000;
 static uint32_t recT[MAX_REC_SAMPLES];
@@ -100,8 +155,20 @@ enum Mode { MODE_IDLE, MODE_RECORDING };
 static Mode mode = MODE_IDLE;
 
 static bool imuReady = false;
-static uint32_t nextSampleDueUs = 0;
 static uint32_t idleSampleIndex = 0;
+
+// Written by the data-ready ISR, read by the main loop. drdyT is the whole
+// point of the interrupt: it is micros() at the instant the sensor latched
+// the sample, so it does not include the ~1023 us the I2C read then takes.
+static volatile uint32_t drdyT = 0;
+static volatile bool drdyPending = false;
+static uint32_t lastSampleUs = 0;
+
+// Samples whose true instant is unknown because the watchdog had to recover
+// them rather than an edge delivering them. Reported with every dump: a
+// capture with a non-zero count here is not clean data, and silently
+// discarding that fact is how a timing bug survives to the next person.
+static uint32_t droppedSamples = 0;
 
 // Bench-test ground-truth markers: a human presses 'o'/'s'/'g' on the
 // keyboard (relayed over serial by accel_live.py) and says the word out
@@ -113,6 +180,16 @@ static uint32_t idleSampleIndex = 0;
 // reaction-time design (see README's audio "go" signal instead).
 static uint32_t onT = 0, setT = 0, goT = 0;
 static bool onCaptured = false, setCaptured = false, goCaptured = false;
+
+// Kept to the bare minimum: timestamp and flag, no I2C, no Serial. The read
+// itself stays in the main loop, where it can block on the bus safely.
+// If a sample is still unconsumed when this fires, the sensor's output
+// registers already hold the newer sample, so the newer timestamp is the
+// correct one to keep - overwriting is right, not a lost update.
+static void drdyIsr() {
+  drdyT = micros();
+  drdyPending = true;
+}
 
 void setup() {
   Serial.begin(921600);
@@ -142,16 +219,30 @@ void setup() {
     Serial.println("IMU error - check wiring/power pin");
   } else {
     Wire.setClock(400000);
+
+    // Route accelerometer data-ready to INT1.
+    myIMU.writeRegister(LSM6DS3_ACC_GYRO_INT1_CTRL,
+                        LSM6DS3_ACC_GYRO_INT1_DRDY_XL_ENABLED);
+
+    // DRDY may already be latched high from a sample taken during begin(),
+    // in which case there is no rising edge left for attachInterrupt() to
+    // catch. One throwaway read clears it so edges start cleanly.
+    int16_t discardX, discardY, discardZ;
+    readSampleRaw(&discardX, &discardY, &discardZ);
+    lastSampleUs = micros();
+
+    pinMode(PIN_LSM6DS3TR_C_INT1, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_LSM6DS3TR_C_INT1), drdyIsr, RISING);
+
     Serial.print("IMU OK - accel ");
     Serial.print(ACCEL_ODR_HZ);
-    Serial.print(" Hz, +/-");
+    Serial.print(" Hz (data-ready on INT1), +/-");
     Serial.print(ACCEL_RANGE_G);
     Serial.println(" g");
   }
 
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
   Serial.println("Markers: 'o' on-your-marks, 's' set (also arms recording), 'g' go, 'S' stop+dump.");
-  nextSampleDueUs = micros();
 }
 
 // Single I2C transaction: X/Y/Z occupy six consecutive registers
@@ -189,6 +280,12 @@ static void dumpRecording() {
   Serial.println(setCaptured ? setT : 0);
   Serial.print("GO,");
   Serial.println(goCaptured ? goT : 0);
+  // Non-zero means the data-ready watchdog had to recover samples, so some
+  // timestamps in this capture are only good to DRDY_STALL_TIMEOUT_US. The
+  // host treats an unrecognised 2-field line as banner text, so this is safe
+  // to add to the protocol.
+  Serial.print("DROPPED,");
+  Serial.println(droppedSamples);
   for (uint32_t i = 0; i < recCount; i++) {
     printCsvRow(recT[i], recX[i], recY[i], recZ[i]);
   }
@@ -197,13 +294,29 @@ static void dumpRecording() {
 
 static void serviceSampling() {
   if (!imuReady) return;
-  uint32_t now = micros();
-  if ((int32_t)(now - nextSampleDueUs) < 0) return;
-  nextSampleDueUs += SAMPLE_PERIOD_US;
+
+  uint32_t t;
+  if (drdyPending) {
+    // Normal path. Take the ISR's timestamp under a brief critical section:
+    // drdyT is 32-bit and the ISR could otherwise land between reading it
+    // and clearing the flag, which would drop that sample entirely.
+    noInterrupts();
+    t = drdyT;
+    drdyPending = false;
+    interrupts();
+  } else if ((uint32_t)(micros() - lastSampleUs) > DRDY_STALL_TIMEOUT_US) {
+    // Watchdog path - see DRDY_STALL_TIMEOUT_US. Reading clears the latched
+    // line so edges resume. The sample is kept (it is real data) but its
+    // instant is only known to within the timeout, so it is counted.
+    t = micros();
+    droppedSamples++;
+  } else {
+    return;
+  }
 
   int16_t rawX, rawY, rawZ;
   readSampleRaw(&rawX, &rawY, &rawZ);
-  uint32_t t = micros();  // real instant the data was obtained
+  lastSampleUs = micros();
 
   if (mode == MODE_RECORDING) {
     if (recCount < MAX_REC_SAMPLES) {
@@ -239,6 +352,7 @@ static void handleSerial() {
     // marker sequence below.
     if (mode == MODE_IDLE) {
       recCount = 0;
+      droppedSamples = 0;
       mode = MODE_RECORDING;
     }
   } else if (c == 'o') {
@@ -258,6 +372,7 @@ static void handleSerial() {
     goCaptured = false;
     if (mode == MODE_IDLE) {
       recCount = 0;
+      droppedSamples = 0;
       mode = MODE_RECORDING;
     }
   } else if (c == 'g') {
