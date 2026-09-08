@@ -1,8 +1,395 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-08. Written for an agent starting with no prior context.
+Last updated: 2026-09-08 (evening). Written for an agent starting with no prior context.
+Sections are newest first.
 
-## READ THIS FIRST — 2026-09-08: the Arduino core silently decides your timestamp resolution
+## READ THIS FIRST — 2026-09-08 (evening): firmware v4, the board now runs the start
+
+The single most important change in the project so far, and it is not about
+precision. Through v3 the `go` reference was **a human pressing a key**, relayed
+over serial. That made the reference worse than the thing being measured: on
+`Data/data_before_080926/accel_20260907_160108.csv` the `go` marker lands **~90 ms
+after** the
+movement it was supposed to mark. Tuning a ±10 ms detection threshold against a
+±100 ms reference is circular, and that is why "the detector is not tuned" had
+been the standing open item for two sessions.
+
+v4 removes the human from the timing path. A button starts a real, randomised
+start sequence; the firmware sounds the three beeps itself and timestamps each
+one with the same `micros()` every accelerometer sample uses. No cross-clock
+sync, no keypress jitter, no host latency. **The go marker's error goes from
+±100 ms to the buzzer's own acoustic latency: 5-20 ms, systematic and constant,
+therefore calibrated once and subtracted rather than fought on every run.**
+
+The consequence for planning: the LED + 240 fps video jig the previous session
+called for is **no longer a prerequisite for tuning**. It is now only a way to
+measure that one buzzer constant.
+
+### What v4 does
+
+```
+button ──rand 2-3 s──> BEEP "on your marks"
+       ──rand 20-25 s──> BEEP "set"      <- the judged window opens
+       ──rand 2.2-3 s─> BEEP "go"
+       ──1 s──> stop, dump the window over serial
+```
+
+All three delays are randomised, and `random()` is seeded from `micros()` at
+the instant the button was pressed. This is not decoration: an **unseeded**
+`random()` on Arduino replays the identical sequence after every reset, so by
+the third attempt an athlete would know when `go` is coming — which would
+invalidate precisely the measurement the system exists to make.
+
+The state machine is entirely non-blocking; every wait is a `micros()` deadline
+checked from `loop()`. **Nothing in it may ever call `delay()`.** Sampling is
+paced by the IMU's data-ready interrupt on a *level-latched* line, so a loop
+that blocks past one sample period does not merely stutter — the missed edge is
+permanent until the watchdog recovers it (see `DRDY_STALL_TIMEOUT_US`).
+
+Deadline comparisons use a signed difference (`(int32_t)(micros() - deadline)`)
+so they stay correct across the ~71 minute `micros()` wrap.
+
+### The pre-roll — the design point most likely to be broken by a "simplification"
+
+The recording window is **`[set − 3 s, go + 1 s]`**, not `[set, go + 1 s]`.
+
+The three extra seconds are not padding. The detector's LTA has an 800 ms time
+constant, and the gravity estimate and baseline need settled data too. A capture
+starting exactly at `set` would leave the detector **blind for the first 800 ms
+of the window in which a false start can actually happen** — the worst
+possible place for it to be blind.
+
+The mechanism: the sample buffer is now a **ring that is always filling**, in
+every state, with no arm/start step at all. `set` merely records a position in
+data that already exists (`setSampleIdx = recWritten`), and the dump reaches
+`PREROLL_SAMPLES` back behind it. The ring holds ~13.9 s against a ~5 s window,
+so the 20-25 s "on your marks" pause overwriting it several times over is
+harmless and expected.
+
+`dumpRecording()` clamps the window to what the ring still physically holds and
+reports `TRUNCATED,1` if it had to. Without that clamp, a request reaching
+further back than the ring would read slots newer samples have already
+overwritten and emit them as if they were old — a silently wrong capture, which
+is exactly the class of bug that cost this project a day (see the morning
+section below).
+
+### Serial protocol, replacing the old `o`/`s`/`g`/`S`
+
+The marker keys are **gone**. There is nothing to arm and nothing to stop.
+
+| | |
+|---|---|
+| `b` | same as pressing the button — walks the whole sequence with no hardware wired |
+| `a` | abort a running sequence (a second button press does the same) |
+| `d` | dump the ring as it stands, no sequence, no markers — this is what `verify_rate.py` uses |
+| `p` | one immediate reading |
+
+Dump framing gained three lines: `PREROLL,<n>` (samples actually present before
+`set`), `TRUNCATED,<0|1>`, alongside the existing `ON`/`SET`/`GO`/`DROPPED`/
+`CLOCKSTEP`. The idle preview is suppressed while a sequence runs, so nothing
+can interleave with a run or with the dump that follows it.
+
+### Wiring — required reading before anything is soldered
+
+| Part | Wiring |
+|---|---|
+| **Active** buzzer (has its own oscillator) | `+` → **D1**, `−` → **GND** |
+| Momentary button | one leg → **D0**, the **diagonally opposite** leg → **GND** |
+
+No resistors: `D0` is `INPUT_PULLUP` and the button pulls it to ground. On a
+4-pin tactile button the pins are paired internally, so two legs on the *same*
+side are a permanently closed circuit — take them diagonally opposite. D0/D1 are
+clear of the IMU's I2C and of the UART on D6/D7.
+
+**The buzzer must be an active one.** A passive buzzer needs a driven waveform
+(`tone()`/PWM), which puts an unmeasured delay on the very instant that defines
+the reaction time's zero — and `tone()`'s behaviour on the mbed core is one more
+thing that would need verifying.
+
+**Everything works with neither part attached.** Send `b` instead of pressing
+the button; `D0` reads a stable HIGH through its pull-up and never triggers
+spuriously. What you lose without a buzzer is only the audible `go`, so the
+pipeline can be validated but a real reaction time cannot be taken. Do not touch
+the board during a run — the detector will fire on it.
+
+### The firmware compiles, and `arduino-cli` exists
+
+`HANDOFF.md` had long said "no `arduino-cli` on this machine", which is why no
+sketch had ever been compiled by an agent. **It is false.** The Arduino IDE
+bundles one:
+
+```bash
+"/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli" \
+  compile --fqbn Seeeduino:mbed:xiaonRF52840Sense \
+  --libraries Arduino/libraries Arduino/AccelStream
+```
+
+v4 result: flash 12%, **RAM 69% (166 KB used, 71.5 KB free)** — the ring buffer
+is most of it. Compile before handing over any firmware change, and report the
+RAM figure; a future addition that pushes this over will fail at link time
+rather than mysteriously at runtime, but only if someone looks.
+
+**The button and buzzer code has never seen hardware.** Compilation is not
+validation. First thing on the bench: send `b` and check `SEQ,armed` →
+`SEQ,marks` → `SEQ,set` → `SEQ,go` → dump.
+
+---
+
+## Tooling: five Python scripts became three
+
+The `Tools/` directory had two overlapping detectors and two overlapping
+viewers, and it was no longer obvious which was current. It is now:
+
+| File | Role |
+|---|---|
+| `capture.py` | **new** — writes the board's dumps to CSV. Nothing else. |
+| `start_detector.py` | **new** — onset + false-start detection, GUI and CLI |
+| `verify_rate.py` | unchanged in purpose; updated to the `d` command |
+
+Deleted: `accel_live.py`, `detect_pushoff.py`, `sta_lta_start_detector.py`,
+`csv_plot.py`. Also deleted: `Arduino/Reaction_HardwareTest/` (ST7735 + buzzer +
+XBee on `Serial1` — hardware from an architecture that is no longer the plan),
+and a **127 MB untracked duplicate `prostart/` in the repo root**, which held
+170 files of pure build output and IDE state, an empty `lib/`, and no
+`pubspec.yaml`. The real app is and always was `Flutter App/prostart/`.
+
+### Why `capture.py` is deliberately stupid
+
+It opens the port, prints the board's `SEQ,*` progress lines, and writes each
+dump to a CSV. It holds no recording state and makes no timing decision, so it
+cannot corrupt one. **Keep it that way.** Anything that needs to *decide*
+belongs in the firmware (if it is about *when*) or in `start_detector.py` (if it
+is about *what the data means*). The whole v4 change is the removal of host-side
+timing authority; re-adding a "record" button would walk it back.
+
+Markers are written into the **leading** comment block now, since the firmware
+sends them before the rows. `accel_live.py` had to append them after the data
+(it only learned them once the dump finished), and a reader that stopped
+scanning at the first non-comment line silently found no markers at all. The new
+reader scans the whole file anyway, so old captures still load.
+
+### `start_detector.py` — the algorithm, in detail
+
+It is `sta_lta_start_detector.py`'s interface (sidebar of parameters, results
+table, matplotlib canvas) with `detect_pushoff.py`'s causal structure and a
+corrected decision signal.
+
+**1. The signal it decides on.** Not `|a|`. The 3-axis vector magnitude is the
+intuitive choice and the wrong one: horizontal acceleration adds *in quadrature*
+with gravity, so a purely lateral event is under-reported — measured at 4.2× on
+the sensor-evaluation capture (46 mg against a true 196 mg). The drive out of
+the blocks is predominantly horizontal, which is exactly what `|a|` hides.
+
+Not "drop whichever axis gravity is on", either, which is what `detect_pushoff`
+did. That is only correct if the board is mounted perfectly flat. Tilt it 20° on
+the block and part of gravity leaks onto the two "horizontal" axes while part of
+the real horizontal drive leaks onto the "vertical" one.
+
+What it does instead is the standard, mount-angle-independent form: estimate
+gravity as a **vector** `ĝ` from the resting window, then split every sample:
+
+```
+a_vert  = a · ĝ
+a_horiz = a − (a · ĝ) ĝ
+```
+
+No axis is chosen, no mounting angle is assumed, and `a_vert` falls out for
+free. **This is only possible because v4 supplies a resting window** — the
+3 s pre-roll. On a pre-v4 capture there is barely one.
+
+**2. The trigger.** STA/LTA — the standard seismological trigger — on
+`|a_horiz − baseline|²`: a short-window energy average against a long-window
+one. The ratio asks "is there much more energy now than in the recent
+background", which adapts to whatever baseline jitter is present instead of
+trusting one fixed absolute number. A candidate opens when `horiz` crosses an
+absolute floor **and** the ratio crosses `ratio_on`; the horizontal baseline is
+frozen at that instant so a real movement cannot drag its own reference along
+and hide itself.
+
+**3. Confirmation and backdating.** The candidate must hold above a lower
+confirm floor for `confirm_ms`, which rejects single-sample blips. The reported
+time is then **backdated** to the first raw sample in the rolling window that
+crossed the floor — the confirm window costs decision latency, never timestamp
+accuracy.
+
+**4. Re-arming — fixed from `detect_pushoff`.** That version set
+`self.triggered = True` and reported exactly one event per file, so a settling
+twitch would mask the real push-off behind it. This one uses hysteresis: after
+an event it waits for the ratio to fall back under `ratio_off` before it will
+trigger again. One capture can now legitimately contain a settling twitch, a
+false start and a real push-off, and report all three.
+
+**5. Warmup.** Triggering (not the EMA updates) is gated for one full LTA time
+constant. Without it the LTA is still climbing away from its seed and every
+file's opening samples look like an infinite-ratio event.
+
+**6. The verdict — product rule, not a diagnostic convenience.**
+
+| Event lands | Verdict |
+|---|---|
+| before `set` | pre-set settling — not judged |
+| within `blank_ms` (1 s) after `set` | **rise into set position — not judged** |
+| between then and `go` | **FALSE START** |
+| after `go`, under 100 ms | **FALSE START** (IAAF-style floor: no human reacts faster) |
+| after `go`, over 100 ms | valid start, reaction time reported |
+
+**The blanking window is the part most likely to be "simplified" away.** At the
+`set` command an athlete *raises the hips into the set position* — a real
+movement of several hundred mg lasting about a second. A rule that flags any
+movement between `set` and `go` therefore flags, every single time, exactly the
+movement `set` just ordered. The first second after `set` is not judged.
+
+It is still **analysed**: events there are reported and labelled, not discarded,
+so an athlete who really did start during the rise shows up in the table for a
+human to look at.
+
+A stillness gate was considered instead — arm only once the signal has been
+quiet — and rejected: an athlete who never settles *because they are already
+starting* would never satisfy it, so the detector would never arm, disarming
+itself in precisely the case it exists to catch. A clock always runs out.
+
+There is a third outcome, `NOT JUDGEABLE`: if the signal is still above
+`settled_mg` in the last 200 ms of the blanking, the rise had not finished, so
+nothing after it can be told apart from its tail. Saying so beats calling the
+attempt clean or false on a coin flip.
+
+`GO_DELAY` in the firmware was raised from 1-2 s to **2.2-3 s** to match — with
+a 1 s blanking, a 1-2 s window left almost nothing judged, and the `go` could
+fire while the athlete was still settling. **These two numbers are a pair:**
+change one and revisit the other.
+
+Note this replaces `detect_pushoff.py`'s `--after-go` flag, which existed to
+*hide* pre-go movement. A real false-start detector must never do that —
+catching movement before `go` is the entire point.
+
+**7. Second stage: the AIC onset picker.** STA/LTA is good at deciding *that*
+something happened and bad at deciding *when* it started, because "when" comes
+out as a threshold crossing on a rising ramp. Measured on
+`Data/accel_20260908_233722.csv`: the ramp climbs at **1.28 mg/ms** against a
+noise floor of **1.19 mg (1σ)**, so 1 mg of doubt about the threshold is 0.8 ms
+of doubt about the time — and to sit clear of the noise the threshold must be
+5-8 mg, which is already 4-6 ms late. Moving the floor from 10 to 50 mg moves
+the reported reaction time by **29 ms**.
+
+That is not measurement error. The detector is perfectly repeatable; it is the
+*definition* of onset that moves with the threshold. Worse, the lateness scales
+with how steep the ramp is, so it varies with how explosive the athlete is and
+does **not** cancel out of a calibration.
+
+So there is a second stage, the standard one from seismology, where the problem
+has exactly this shape: STA/LTA triggers, then **Maeda's AIC picker** refines
+the onset with no threshold at all. It finds the sample that best splits the
+window into a noise segment and a signal segment:
+
+```
+AIC(k) = k·log(var(sig[:k])) + (n-k-1)·log(var(sig[k:]))
+```
+
+Measured, same file, reported reaction time against floor:
+
+| floor | with AIC | without |
+|---|---|---|
+| 10 mg | 302.6 ms | 307.2 ms |
+| 20 mg | 302.6 ms | 315.3 ms |
+| 30 mg | 302.6 ms | 323.4 ms |
+| 50 mg | 302.6 ms | 336.2 ms |
+
+**Spread 0.0 ms against 29.0 ms.** The floor stops being a critical parameter:
+it only has to say "something happened here", and being wrong about it by a
+factor of five no longer moves the measurement.
+
+Three things this does *not* mean, all of which matter:
+
+- **Stable is not correct.** AIC stops depending on tuning; that it lands on
+  the *true* onset is unproven and needs an independent reference.
+- **AIC is not causal** in the STA/LTA sense — it reads `aic_post_ms` (50 ms)
+  of samples after the trigger. Harmless for reporting a reaction time; on
+  device it would add that much latency to a live false-start alarm, without
+  touching the reported timestamp's accuracy.
+- **AIC assumes the window contains a quiet part and an active part.** For an
+  event that fires in the middle of movement already in progress there is no
+  such split, and AIC dutifully reports the largest variance change it can find
+  inside a uniformly active window — which is meaningless. Caught on
+  `Data/accel_20260908_233329.csv`, where a third event 200 ms into a 400 mg
+  movement was dragged 83 ms backwards. Guarded now: the window's opening
+  quarter must be 16x quieter than its closing quarter, or the threshold
+  estimate is kept and the event is reported as
+  `AIC: no clear onset, kept the threshold`. Conservative on purpose — falling
+  back to a known-biased number beats silently substituting a wrong one.
+
+`use_aic=False` / `--no-aic` / the GUI checkbox turns the stage off, which is
+how the table above was produced. The plot draws the reported onset solid and,
+when AIC moved it, the original threshold crossing dotted.
+
+**The error budget with the second stage in:**
+
+| Term | Contribution |
+|---|---|
+| clock resolution | 8 µs |
+| sample timing | σ ≈ 334 µs |
+| AIC (~1 sample) | ~1.2 ms |
+| **detection total** | **~1-2 ms** |
+| buzzer acoustic latency | **5-20 ms, systematic** ← now the dominant term |
+
+So the detection side meets a 1-2 ms target, and the bottleneck moves to the
+buzzer — which is constant and calibrated once.
+
+**8. The plot.** Three panels sharing an x axis: raw x/y/z, **`horiz` with its
+floors drawn**, and the STA/LTA ratio with its thresholds; the `set`→`go` window
+is shaded. Use the `horiz` panel, not the raw one, to sanity-check where a
+marker landed. Plotting `|a|` instead once produced a "the marker is in the
+wrong place" report that turned out to be the plot and not the placement: `|a|`
+crept 1.00 → 0.93 g, invisible on its axis, while `horiz` climbed cleanly
+through the floor at the same samples.
+
+### Where the captures live
+
+`Data/` holds only v4 captures. Everything from before the evening of
+2026-09-08 was moved to `Data/data_before_080926/`, which has a README
+explaining why those files' `go` markers cannot be used to tune thresholds
+(they are human keypresses, +/-100 ms) even though the data itself is fine.
+
+### Verified against the existing captures
+
+Run over every file in `Data/`, the new detector reproduces the reaction times
+the 2026-09-07 session documented (**313.4 ms**, **265.2 ms**) and, thanks to
+re-arming, now also reports the events that were previously masked:
+
+```
+accel_20260907_160354.csv   valid start                 t=2.2277s   +313.4 ms
+accel_20260907_160755.csv   #1 FALSE START (pre-go)     t=1.5633s   −419.3 ms
+                            #2 valid start              t=2.2478s   +265.2 ms
+```
+
+The GUI was smoke-tested headlessly: it builds, loads a capture, runs the
+analysis and draws all three panels without error.
+
+### What is still open
+
+- **The thresholds are still not tuned against real on-block data.** Everything
+  above changes the *reference* and the *signal*, not the constants.
+
+  A floor sweep on the three 2026-09-08 captures shows the absolute floor is
+  **not** the dominant term: the reported reaction time moves only 307 → 328 ms
+  across floors of 5 → 40 mg, and 8 ms of that is between 5 and 20. Nor does 5 mg
+  produce a false positive on the still-board control (its noise peaks at 7.6 mg).
+  There is far more headroom than assumed — but on a block, with an athlete
+  holding their own weight and real ambient vibration, that headroom is unmeasured.
+  Leave the floor at 20 mg until it is.
+
+  The number actually worth measuring first: **how much a real athlete moves
+  while holding the set position.** It sets `settled_mg`, and it decides whether
+  the judged window has any margin at all. On the clean bench run the window
+  peaked at 12.3 mg against a 20 mg floor — only 1.6x.
+- **The buzzer's acoustic latency is unmeasured.** Until it is, every reaction
+  time carries a 5-20 ms systematic offset in a known direction. Measure it once
+  with a GPIO edge and a microphone on one time base.
+- **Button and buzzer code is untested on hardware** (see above).
+- Nothing from this session is committed yet.
+
+---
+
+## READ THIS SECOND — 2026-09-08 (morning): the Arduino core silently decides your timestamp resolution
 
 **If you read nothing else: build `AccelStream.ino` with the `Seeeduino:mbed`
 core — the board menu entry labelled `XIAO nRF52840 Sense (No Updates)`. Not
@@ -117,7 +504,8 @@ had also been silently compiling away the `PIN_LSM6DS3TR_C_POWER` guard.
 Everything above concerns sub-millisecond sampling. Deciding **where on the
 push-off ramp the movement began** is worth tens of milliseconds and is still
 untuned — roughly 100× larger. It cannot be tuned against the current `go`
-marker either, which is a human keypress: on `Data/accel_20260907_160108.csv`
+marker either, which is a human keypress: on
+`Data/data_before_080926/accel_20260907_160108.csv`
 the marker lands ~90 ms *after* the movement had already started. Tuning a
 ±10 ms threshold against a ±100 ms reference is circular.
 
@@ -437,7 +825,7 @@ reference, but starting over cleanly is the recommended path — see
 **Unresolved** below.
 
 **Current, working pipeline** (verified end-to-end on real hardware, real
-push-off-scale data already captured — see `Data/accel_2026*.png`):
+push-off-scale data already captured — see `Data/data_before_080926/`):
 
 - **Firmware:** `Arduino/AccelStream/AccelStream.ino` — deliberately minimal.
   No BLE, no hardware FIFO, no hand-rolled I2C register/FIFO code - just the
@@ -512,20 +900,28 @@ All three are implemented. See Next Steps for what remains unverified.
 
 ## Project layout
 
-Current, as of the 2026-09-04 reorganization:
+Current, as of the 2026-09-08 evening cleanup:
 
 - `Flutter App/prostart/` — Flutter app (Dart, `provider` for state, `flutter_blue_plus` for BLE)
-- `Arduino/AccelStream/AccelStream.ino` — **current working firmware** for
-  accelerometer capture (no BLE); see the top section above
+- `Arduino/AccelStream/AccelStream.ino` — **current working firmware**: start
+  sequence, buzzer, button, ring buffer, capture; no BLE. See the top section.
+- `Arduino/ClockCheck/ClockCheck.ino` — diagnostic: reports which core it was
+  built with and measures `micros()`'s real resolution
 - `Arduino/SerialEchoTest/SerialEchoTest.ino` — minimal hardware/cable sanity
   check, no IMU or BLE
 - `Arduino/I2C_Scanner/` — I2C debug sketch
-- `Arduino/Reaction_HardwareTest/` — TFT display/buzzer/XBee hardware bring-up test
 - `Arduino/libraries/Seeed_Arduino_LSM6DS3/` — vendored IMU library
-- `Tools/accel_live.py` — current live capture/record tool, pairs with `AccelStream.ino`
-- `Tools/csv_plot.py` — current offline CSV viewer (file-picker based)
+- `Tools/capture.py` — writes the board's dumps to CSV; holds no state
+- `Tools/start_detector.py` — onset + false-start detector, GUI and CLI
+- `Tools/verify_rate.py` — pass/fail on clock, rate and integrity
 - `Data/` — recorded CSV captures and their plots
 - `Docs/` — diagrams and figures used by the root README
+
+Deleted 2026-09-08: `Arduino/Reaction_HardwareTest/` (TFT/buzzer/XBee bring-up
+for an architecture no longer planned), `Tools/accel_live.py`,
+`Tools/csv_plot.py`, `Tools/detect_pushoff.py`,
+`Tools/sta_lta_start_detector.py`, and an untracked duplicate `prostart/` in the
+repo root that held only build output.
 
 `Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`, `tools/kinestart_live.py`,
 and `playground_IMU/` are all **deleted** — see the top section for why.
@@ -632,7 +1028,7 @@ Steps 3–5 of the original list are now answered by a real capture (see the
 sensor evaluation below). What remains:
 
 1. **Flash `Arduino/BLEtest/BLEtest.ino`** and watch the Serial Monitor for `IMU OK`. If it prints `IMU error - live data disabled`, BLE still works and reaction time is unaffected — but the live view will be dead. The sketch sets `PIN_LSM6DS3TR_C_POWER` high inside an `#ifdef` (the XIAO Sense IMU has a dedicated power pin; if it stays low `begin()` fails even with I2C wired correctly). If the macro is missing from the installed core, that guard compiles it away and the pin is never driven — check the variant header.
-2. **The sketch has never been compiled by an agent.** No `arduino-cli` on this machine. It has since been flashed successfully by hand, so this is largely moot — but no automated check exists.
+2. ~~**The sketch has never been compiled by an agent.** No `arduino-cli` on this machine.~~ **Wrong, corrected 2026-09-08:** the Arduino IDE bundles an `arduino-cli` and `AccelStream.ino` now compiles from the command line. See the top section for the exact invocation.
 3. **Act on the firmware changes** the evaluation calls for (ODR, detector, audio-latency calibration) — listed under *What the evaluation implies for the firmware*.
 4. **Resolve the board question.** The system diagram shows an **ESP32-WROOM-32U with an external IMU**; the README's "Hardware direction under evaluation" note right below it argues for the **Arduino Nano 33 IoT** precisely because it avoids an external IMU. One of the two is stale. Nothing else can be finalised until this is settled.
 5. **Verify the CSV export on iPad.** It works on iPhone (the capture in `playground_IMU/` came out of it). On iPad the share sheet is a popover needing an anchor rect; `_export` in `live_data_screen.dart` derives one from the summary card's `RenderBox`, still unexercised. "Save to Files" is the save-to-device path.

@@ -105,7 +105,7 @@ Both units are the same board family, which keeps the bill of materials simple a
 - **Firmware (implemented today):** Arduino IDE (C/C++), the vendored Seeed `LSM6DS3` library, `Wire.h` (I2C) — see `Arduino/AccelStream/AccelStream.ino`, the current no-BLE accelerometer capture firmware used for on-block validation.
 - **Firmware (not yet implemented):** the Zigbee start↔finish link and the finish-unit's BLE bridge to the phone described above don't exist in this repo yet — likely to need Nordic's own SDK/Zephyr for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain `ArduinoBLE` library. Tracked on the [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
 - **Companion app:** Flutter (Dart) — `flutter_blue_plus` for BLE.
-- **Capture/analysis tooling:** Python (`Tools/accel_live.py`, `Tools/csv_plot.py`) — see [BUILD.md](./BUILD.md) for exact versions and setup.
+- **Capture/analysis tooling:** Python (`Tools/capture.py`, `Tools/start_detector.py`) — see [BUILD.md](./BUILD.md) for exact versions and setup.
 - **Photo-finish AI pipeline:** computer-vision torso-crossing detection + sub-frame interpolation *(premium tier, planned)*.
 
 ---
@@ -170,18 +170,20 @@ This is a back-of-the-envelope model to size the opportunity, not a forecast —
 ```
 Reaction-Time-System/
 ├── Arduino/                     # Arduino sketches (.ino), one folder per sketch
-│   ├── AccelStream/             # current firmware: accelerometer capture, no BLE
+│   ├── AccelStream/             # current firmware: start sequence + capture
+│   ├── ClockCheck/              # diagnostic: measures real micros() resolution
 │   ├── SerialEchoTest/          # minimal hardware/cable sanity check
 │   ├── I2C_Scanner/             # I2C bus debug sketch
-│   ├── Reaction_HardwareTest/   # TFT/buzzer/XBee hardware bring-up test
 │   └── libraries/               # vendored board libraries (Seeed LSM6DS3)
 ├── Flutter App/
 │   └── prostart/                # Flutter companion app
 ├── Tools/                       # Python capture/analysis scripts
-│   ├── accel_live.py            # live view + record, pairs with AccelStream.ino
-│   └── csv_plot.py              # offline CSV viewer
+│   ├── capture.py               # writes the board's dumps to CSV; no logic
+│   ├── start_detector.py        # STA/LTA onset + false-start detector (GUI/CLI)
+│   └── verify_rate.py           # pass/fail check on rate, clock and integrity
 ├── Data/                        # recorded CSV captures and their plots
 ├── Docs/                        # diagrams and figures
+├── INFO.md                      # how the detection algorithm works, and why
 ├── BUILD.md                     # exact versions and how to run every component
 ├── HANDOFF.md                   # working notes for an agent picking this up
 └── README.md

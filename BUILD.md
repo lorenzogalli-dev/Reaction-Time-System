@@ -80,14 +80,18 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
    IMU OK - accel 833 Hz (data-ready on INT1), +/-16 g
    clock: micros() resolution ~8 us
    Ready. Idle preview streaming. 'p' one reading.
-   Markers: 'o' on-your-marks, 's' set (also arms recording), 'g' go, 'S' stop+dump.
+   Start sequence: press the button on D0 (or send 'b'); buzzer on D1
+     button -> 2-3s -> MARKS -> 20-25s -> SET -> 2.2-3s -> GO -> 1s -> dump
+     'a' or a second press aborts. 'd' dumps the ring as-is.
    ```
    If the clock line reports a resolution in the hundreds of µs, a five-line
    `!! WARNING` block follows it — you are on the wrong core, go back to step 2.
    If it prints `IMU error` instead, or the banner repeats on its own, see
    `HANDOFF.md` — those are both documented, previously-seen failure modes.
 6. Type `p` and press enter — you should get one `t_us=... x=... y=... z=...`
-   line back immediately. **Close the Serial Monitor before step 7** — only one
+   line back immediately. Type `b` to walk the whole start sequence with no
+   button wired: you should see `SEQ,armed`, then `SEQ,marks`, `SEQ,set`,
+   `SEQ,go` and a dump, with the buzzer sounding at each of the three. **Close the Serial Monitor before step 7** — only one
    process can hold the serial port at a time.
 7. Run the automated check, board sitting still on the desk:
    ```bash
@@ -109,7 +113,29 @@ very easy to misdiagnose.
 
 ---
 
-## 2. Python capture tooling — `Tools/accel_live.py`, `Tools/verify_rate.py`, `Tools/detect_pushoff.py`, `Tools/csv_plot.py`
+### Wiring for the start sequence
+
+Both parts are optional for a bench rate check and required for a real start.
+Breadboard is fine.
+
+| Part | Wiring |
+|---|---|
+| **Active** buzzer (with its own oscillator) | `+` to **D1**, `-` to **GND** |
+| Momentary button | one leg to **D0**, the diagonally opposite leg to **GND** |
+
+The button needs no resistor — D0 is configured `INPUT_PULLUP` and the button
+pulls it to ground. On a 4-pin tactile button the pins are paired internally;
+using two legs on the *same* side gives a permanently closed circuit, so take
+them diagonally opposite. D0/D1 are clear of the IMU's I2C and of the UART on
+D6/D7.
+
+The buzzer must be an **active** one. A passive buzzer needs a driven waveform
+(`tone()`/PWM), which adds an unmeasured delay to the very instant that defines
+the reaction time's zero.
+
+---
+
+## 2. Python tooling — `Tools/capture.py`, `Tools/verify_rate.py`, `Tools/start_detector.py`
 
 **Tested with:**
 
@@ -119,22 +145,24 @@ very easy to misdiagnose.
 | pyserial | 3.5 |
 | matplotlib | 3.11.1 |
 | numpy | 2.5.2 |
-| pandas | 3.0.5 (needed by `csv_plot.py` and `detect_pushoff.py`) |
+| pandas | 3.0.5 (needed by `start_detector.py`) |
 
 **Install**
 ```bash
 pip3 install pyserial matplotlib numpy pandas
 ```
 
-**Run — live view + record** (board flashed with `AccelStream.ino`, plugged
-in, Serial Monitor closed):
+**Run — capture** (board flashed with `AccelStream.ino`, plugged in, Serial
+Monitor closed):
 ```bash
-python3 Tools/accel_live.py                    # autodetects the serial port
-python3 Tools/accel_live.py --port /dev/cu.usbmodemXXXX
-python3 Tools/accel_live.py --simulate         # no hardware needed - fake data, for UI testing
+python3 Tools/capture.py                       # autodetects the serial port
+python3 Tools/capture.py --port /dev/cu.usbmodemXXXX --outdir Data
 ```
-Buttons (or keys `r`/`s`/`p`) start/stop recording and save a snapshot. Every
-recording writes a CSV plus a 4-panel PNG (X, Y, Z, magnitude) to `Data/`.
+Then press the board's button and run the start. The script only prints the
+board's progress (`SEQ,armed` / `marks` / `set` / `go`) and writes each dump to
+`Data/accel_<timestamp>.csv`; it holds no recording state and makes no timing
+decision, which is the point. It stays running, so you can do attempt after
+attempt without restarting it.
 
 **Run — verify the board and the capture path** (the first thing to run after
 flashing; see step 7 of the firmware section):
@@ -144,26 +172,25 @@ python3 Tools/verify_rate.py --seconds 5      # autodetects the port; must print
 Checks clock resolution, effective sample rate, dropped samples, gaps, timestamp
 monotonicity and clipping in one shot.
 
-**Run — offline push-off detection on a recorded CSV:**
+**Run — detection and tuning on a recorded CSV:**
 ```bash
-python3 Tools/detect_pushoff.py Data/accel_YYYYMMDD_HHMMSS.csv --plot
-python3 Tools/detect_pushoff.py "Data/*.csv" --after-go
+python3 Tools/start_detector.py                       # GUI, browse to a file
+python3 Tools/start_detector.py Data/accel_X.csv      # GUI, preloaded
+python3 Tools/start_detector.py "Data/*.csv" --cli    # batch, terminal only
 ```
-Reports the detected push-off instant and, when the capture has a `go` marker,
-the reaction time; `--plot` writes a `<name>_detect.png` beside the CSV.
-The sample rate is measured from the capture's own timestamps, so CSVs recorded
-at different rates all work without flags. `--after-go` restricts the search to
-after the `go` marker — useful when a pre-go blip triggers the detector.
+The GUI has every threshold in the sidebar and redraws on **Analyse**, so
+tuning is a loop against real captures rather than an edit-rerun cycle. Three
+panels share an x axis: raw x/y/z, the **horizontal-plane magnitude the
+detector actually decides on** with its floors drawn, and the STA/LTA ratio with
+its on/off thresholds. The set→go window is shaded — anything detected inside it
+is a false start.
+
+The sample rate is measured from each capture's own timestamps, so files
+recorded at different rates all work with no flags, and the older
+`t_s,t_us,x_g,y_g,z_g,host_iso` captures still load.
+
 **The thresholds are not yet tuned against real on-block data** — read the
 module docstring before changing them.
-
-**Run — offline review of a saved CSV:**
-```bash
-python3 Tools/csv_plot.py
-```
-Always opens a native file-picker dialog defaulting to `Data/` — no path to
-type. Handles both the current CSV format (`t_s,t_us,x_g,y_g,z_g,host_iso`)
-and the older one (`timestamp_iso,elapsed_s,x_g,y_g,z_g`) automatically.
 
 ---
 
