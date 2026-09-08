@@ -27,37 +27,62 @@
 //    dumped over serial only after the capture stops. Serial timing can
 //    never rob a sample during the window that actually matters.
 //
+// v4 (2026-09-08): THE BOARD RUNS THE START, THE HOST ONLY WRITES THE FILE
+// ------------------------------------------------------------------------
+// Through v3 the o/s/g markers were human keypresses relayed over serial.
+// That made the reference worse than the thing being measured: on
+// Data/accel_20260907_160108.csv the "go" marker lands ~90 ms AFTER the
+// movement it was supposed to mark, so tuning a +/-10 ms detection threshold
+// against it was circular. v4 removes the human from the timing path
+// entirely - a button starts a real, randomised start sequence and the
+// firmware sounds the three beeps itself, timestamping each one on the same
+// micros() clock as every accelerometer sample. No cross-clock sync, no
+// keypress jitter. What remains is the buzzer's own acoustic latency
+// (5-20 ms): systematic and constant, so it is calibrated once and
+// subtracted, not fought on every run.
+//
+// Sequence, all delays randomised so the rhythm cannot be learned:
+//   button -> 2-3 s -> beep "on your marks" -> 20-25 s -> beep "set"
+//          -> 2.2-3 s -> beep "go" -> 1 s -> dump
+//
+// The recording window is [set - PREROLL_SAMPLES, go + 1 s]. The pre-roll is
+// not padding: the detector's LTA needs ~800 ms to converge, so a capture
+// starting exactly at "set" would leave it blind for the first 800 ms of the
+// 1-2 s window in which a false start can happen. The sample buffer is
+// therefore a ring that is ALWAYS filling; "set" merely marks a position in
+// data that already exists.
+//
 // SERIAL PROTOCOL
 // ----------------
-// Idle (default from boot): the board streams decimated CSV rows
-// continuously, no command needed - this is the live-preview rate.
+// Idle (default from boot, only while no sequence is running): the board
+// streams decimated CSV rows continuously, no command needed - live preview.
 //   t_us,x_g,y_g,z_g
-// 'r' arms a full-ODR recording into the RAM buffer, no on/set/go marker
-//     semantics (no serial output while armed).
-// 'o' marks "on your marks" (micros() timestamp only, doesn't touch
-//     recording state) - clears any leftover set/go from a previous
-//     attempt.
-// 's' marks "set" AND arms a full-ODR recording (no separate 'r' needed
-//     for this workflow) - starting the buffer here, not at "on your
-//     marks", is what keeps a real pause between the two from ever
-//     overflowing it.
-// 'g' marks "go" - the reference timestamp the push-off is measured
-//     against (micros() timestamp only, doesn't touch recording state).
-// 'S' (uppercase - lowercase 's' means "set") stops recording and dumps
-//     the buffer:
-//   DUMP_START,<n>
-//   ON,<t_us or 0>
-//   SET,<t_us or 0>
-//   GO,<t_us or 0>
-//   <n CSV rows, same t_us,x_g,y_g,z_g format, full ODR, no decimation>
-//   DUMP_END
-//   ... then idle decimated streaming resumes automatically.
+// The button (BUTTON_PIN to GND) starts a sequence; pressing it again during
+// one aborts. Nothing is printed during a sequence except its progress lines
+// SEQ,armed / SEQ,marks / SEQ,set / SEQ,go / SEQ,abort,<why>.
+// 'b' does exactly what the button does - so the whole sequence can be
+//     exercised with no button wired yet.
+// 'a' aborts a running sequence.
+// 'd' dumps the whole ring immediately (no sequence, no markers) - this is
+//     what verify_rate.py uses for its rate/integrity check.
 // 'p' prints one immediate reading, independent of the above.
 //
-// The dump's header lines are DUMP_START,<n> / ON,<t> / SET,<t> / GO,<t> /
-// DROPPED,<n>, then the rows, then DUMP_END. DROPPED is the number of samples
-// the data-ready watchdog had to recover rather than receive an edge for;
-// anything other than 0 means some timestamps in that capture are degraded.
+// One second after "go" the board dumps the window by itself:
+//   DUMP_START,<n>
+//   ON,<t_us or 0>        beep 1, "on your marks"
+//   SET,<t_us or 0>       beep 2, "set"
+//   GO,<t_us or 0>        beep 3, "go" - the reaction-time reference
+//   PREROLL,<n>           samples present BEFORE the "set" instant
+//   TRUNCATED,<0|1>       1 = the ring wrapped, the pre-roll is short
+//   DROPPED,<n>           samples the data-ready watchdog had to recover
+//   CLOCKSTEP,<us>        measured micros() resolution of this build
+//   <n CSV rows, t_us,x_g,y_g,z_g, full ODR, no decimation>
+//   DUMP_END
+//   ... then idle decimated streaming resumes automatically.
+//
+// DROPPED other than 0 means some timestamps in that capture are degraded.
+// TRUNCATED 1 means the detector has less warmup than intended - the run is
+// still usable, but PREROLL says how much it actually got.
 //
 // t_us is read the moment the INT1 data-ready flag is seen and BEFORE the
 // I2C burst read, so it no longer includes the ~1023 us that read takes -
@@ -155,19 +180,81 @@ static const float ACCEL_SCALE_G_PER_LSB = 0.061f * (ACCEL_RANGE_G >> 1) / 1000.
 // timing margin and can never throttle the underlying sample schedule.
 static const uint16_t STREAM_DECIMATE = 5;
 
-// RAM budget for a recording: 10 bytes/sample (uint32 t_us + 3x int16 raw)
-// x 12000 = ~117 KB, comfortably inside the XIAO nRF52840's 256 KB RAM with
-// no BLE stack running. ~14.4 s at 833 Hz - generous for one on-your-marks
-// to push-off window; raise it if a longer capture is ever needed.
+// RAM budget: 10 bytes/sample (uint32 t_us + 3x int16 raw) x 12000 = ~117 KB,
+// comfortably inside the XIAO nRF52840's 256 KB RAM with no BLE stack
+// running. ~13.9 s at the 863 Hz this actually achieves.
+//
+// v4 fills this CIRCULARLY and continuously, rather than starting it at
+// "set" - that is what makes the pre-roll possible. See the header: the
+// dumped window reaches PREROLL_SAMPLES back behind the "set" instant, into
+// data that was already there. 13.9 s of ring against a ~6 s window is ~2x
+// margin, so the 20-25 s "on your marks" pause overwriting the ring several
+// times over is harmless and expected.
 static const uint32_t MAX_REC_SAMPLES = 12000;
 static uint32_t recT[MAX_REC_SAMPLES];
 static int16_t recX[MAX_REC_SAMPLES];
 static int16_t recY[MAX_REC_SAMPLES];
 static int16_t recZ[MAX_REC_SAMPLES];
-static uint32_t recCount = 0;
+// Total samples ever written. Sample i lives in slot i % MAX_REC_SAMPLES;
+// only the newest MAX_REC_SAMPLES of them still exist. A plain counter rather
+// than a head index because the "set" boundary has to be comparable against
+// it across a wrap.
+static uint32_t recWritten = 0;
 
-enum Mode { MODE_IDLE, MODE_RECORDING };
-static Mode mode = MODE_IDLE;
+// How far behind "set" the dump reaches. Sized in samples at the nominal ODR,
+// so ~2.9 s at the 863 Hz really achieved - still 3.6x the detector's 800 ms
+// LTA time constant, and it costs nothing: the samples are already in RAM.
+static const uint32_t PREROLL_SAMPLES = 3UL * ACCEL_ODR_HZ;
+// Recording tail after "go". A push-off is long over inside this.
+static const uint32_t TAIL_AFTER_GO_MS = 1000;
+
+// --- Start sequence --------------------------------------------------------
+// D0/D1 are plain GPIO on the XIAO nRF52840 Sense - clear of the I2C the IMU
+// sits on and of the UART on D6/D7. The macros come from the core's
+// pins_arduino.h, pulled in above; the fallbacks keep this compiling if a
+// core ever declines to define them, since on this board they are pins 0/1.
+#ifndef D0
+#define D0 0
+#endif
+#ifndef D1
+#define D1 1
+#endif
+static const int BUTTON_PIN = D0;   // momentary button to GND, INPUT_PULLUP
+static const int BUZZER_PIN = D1;   // ACTIVE buzzer (+); (-) to GND
+
+static const uint32_t BUTTON_DEBOUNCE_MS = 30;
+static const uint32_t BEEP_MS = 100;
+
+// Randomised so the athlete cannot learn the rhythm - the reason this matters
+// is that an anticipated "go" is exactly what a reaction time must not
+// measure. Arduino's random(a, b) is inclusive of a, exclusive of b.
+static const long MARKS_DELAY_MIN_MS = 2000,  MARKS_DELAY_MAX_MS = 3001;
+static const long SET_DELAY_MIN_MS   = 20000, SET_DELAY_MAX_MS   = 25001;
+// set -> go raised from 1-2 s to 2.2-3 s on 2026-09-08. An athlete needs about
+// a second to rise into the set position after the command, and that rise is a
+// real movement of several hundred mg. At 1-2 s the "go" could fire while they
+// were still settling, which makes the reaction time meaningless, and left
+// almost no judged window after the rise. The detector blanks the first second
+// after "set" to match (blank_ms in start_detector.py); these two numbers are
+// a pair - change one and revisit the other.
+static const long GO_DELAY_MIN_MS    = 2200,  GO_DELAY_MAX_MS    = 3001;
+
+enum SeqState {
+  SEQ_IDLE,        // nothing running; idle preview streams
+  SEQ_WAIT_MARKS,  // button pressed, waiting to sound "on your marks"
+  SEQ_WAIT_SET,    // "on your marks" sounded, waiting to sound "set"
+  SEQ_WAIT_GO,     // "set" sounded - this is the false-start window
+  SEQ_TAIL         // "go" sounded, capturing TAIL_AFTER_GO_MS more
+};
+static SeqState seqState = SEQ_IDLE;
+static uint32_t seqDeadlineUs = 0;
+static uint32_t buzzerOffUs = 0;
+static bool buzzerOn = false;
+static bool randomSeeded = false;
+
+// Value of recWritten at the instant "set" sounded - the boundary the dump
+// window is measured from, in both directions.
+static uint32_t setSampleIdx = 0;
 
 static bool imuReady = false;
 static uint32_t idleSampleIndex = 0;
@@ -214,14 +301,11 @@ static uint32_t measureClockStepUs() {
   return (minStep == 0xFFFFFFFFUL) ? 0 : minStep;
 }
 
-// Bench-test ground-truth markers: a human presses 'o'/'s'/'g' on the
-// keyboard (relayed over serial by accel_live.py) and says the word out
-// loud at the same instant. Each keypress is timestamped with the
-// firmware's own micros() - the same clock every accelerometer sample
-// uses - so the marker and the push-off it's compared against are always
-// on one shared timeline, no separate PC/audio-latency or clock-sync
-// problem to worry about. Purely a bench-test aid, not part of the final
-// reaction-time design (see README's audio "go" signal instead).
+// The three start markers. As of v4 these are set by the firmware itself
+// when it drives the buzzer, not by a relayed keypress - each is a micros()
+// reading on the same clock every accelerometer sample uses, so a marker and
+// the push-off measured against it are always on one timeline with no
+// cross-clock or host-latency term at all.
 static uint32_t onT = 0, setT = 0, goT = 0;
 static bool onCaptured = false, setCaptured = false, goCaptured = false;
 
@@ -243,6 +327,10 @@ void setup() {
   // here forever.
   unsigned long waitStart = millis();
   while (!Serial && millis() - waitStart < 3000) delay(10);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef PIN_LSM6DS3TR_C_POWER
   // XIAO Sense IMU power-enable pin: if left low, begin() fails even with
@@ -299,7 +387,12 @@ void setup() {
   }
 
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
-  Serial.println("Markers: 'o' on-your-marks, 's' set (also arms recording), 'g' go, 'S' stop+dump.");
+  Serial.print("Start sequence: press the button on D");
+  Serial.print(BUTTON_PIN);
+  Serial.print(" (or send 'b'); buzzer on D");
+  Serial.println(BUZZER_PIN);
+  Serial.println("  button -> 2-3s -> MARKS -> 20-25s -> SET -> 2.2-3s -> GO -> 1s -> dump");
+  Serial.println("  'a' or a second press aborts. 'd' dumps the ring as-is.");
 }
 
 // Single I2C transaction: X/Y/Z occupy six consecutive registers
@@ -328,15 +421,41 @@ static void printCsvRow(uint32_t t_us, int16_t rawX, int16_t rawY, int16_t rawZ)
   Serial.println(rawToG(rawZ), 4);
 }
 
-static void dumpRecording() {
+// wholeRing dumps everything the ring still holds, ignoring the sequence
+// markers entirely - that is the rate/integrity check's path (verify_rate.py),
+// which needs a long uninterrupted stretch of samples and no start sequence.
+// It exists because the ring is always full anyway: "dump what you have" needs
+// no arm/stop handshake at all, which is one less piece of state than the
+// start/stop commands it replaces.
+static void dumpRecording(bool wholeRing) {
+  // Window is [set - PREROLL_SAMPLES, recWritten), clamped to what the ring
+  // still physically holds. The clamp is not defensive noise: without it, a
+  // request reaching further back than MAX_REC_SAMPLES would read slots that
+  // newer samples have already overwritten and emit them as if they were old
+  // ones - a silently wrong capture, which is the failure mode this firmware
+  // has already been bitten by once (see the CLOCKSTEP note above).
+  uint32_t oldest = (recWritten > MAX_REC_SAMPLES) ? (recWritten - MAX_REC_SAMPLES) : 0;
+  uint32_t from = wholeRing
+                      ? oldest
+                      : ((setSampleIdx > PREROLL_SAMPLES) ? (setSampleIdx - PREROLL_SAMPLES) : 0);
+  bool truncated = (from < oldest);
+  if (truncated) from = oldest;
+  uint32_t n = recWritten - from;
+
   Serial.print("DUMP_START,");
-  Serial.println(recCount);
+  Serial.println(n);
   Serial.print("ON,");
   Serial.println(onCaptured ? onT : 0);
   Serial.print("SET,");
   Serial.println(setCaptured ? setT : 0);
   Serial.print("GO,");
   Serial.println(goCaptured ? goT : 0);
+  // How much pre-"set" history the detector actually gets, in samples. It is
+  // reported rather than assumed because TRUNCATED can shorten it.
+  Serial.print("PREROLL,");
+  Serial.println(wholeRing ? 0 : (setSampleIdx - from));
+  Serial.print("TRUNCATED,");
+  Serial.println(truncated ? 1 : 0);
   // Non-zero means the data-ready watchdog had to recover samples, so some
   // timestamps in this capture are only good to DRDY_STALL_TIMEOUT_US. The
   // host treats an unrecognised 2-field line as banner text, so this is safe
@@ -347,8 +466,9 @@ static void dumpRecording() {
   // fact, instead of trusting that whoever recorded it used the right core.
   Serial.print("CLOCKSTEP,");
   Serial.println(clockStepUs);
-  for (uint32_t i = 0; i < recCount; i++) {
-    printCsvRow(recT[i], recX[i], recY[i], recZ[i]);
+  for (uint32_t i = from; i < recWritten; i++) {
+    uint32_t slot = i % MAX_REC_SAMPLES;
+    printCsvRow(recT[slot], recX[slot], recY[slot], recZ[slot]);
   }
   Serial.println("DUMP_END");
 }
@@ -380,20 +500,20 @@ static void serviceSampling() {
   readSampleRaw(&rawX, &rawY, &rawZ);
   lastSampleUs = micros();
 
-  if (mode == MODE_RECORDING) {
-    if (recCount < MAX_REC_SAMPLES) {
-      recT[recCount] = t;
-      recX[recCount] = rawX;
-      recY[recCount] = rawY;
-      recZ[recCount] = rawZ;
-      recCount++;
-    }
-    if (recCount >= MAX_REC_SAMPLES) {
-      Serial.println("Buffer full - auto-stopped");
-      mode = MODE_IDLE;
-      dumpRecording();
-    }
-  } else {
+  // The ring fills in every state, always - that IS the pre-roll. There is no
+  // "start recording" step any more, only a "set" boundary marked in data
+  // that is already being kept.
+  uint32_t slot = recWritten % MAX_REC_SAMPLES;
+  recT[slot] = t;
+  recX[slot] = rawX;
+  recY[slot] = rawY;
+  recZ[slot] = rawZ;
+  recWritten++;
+
+  // Preview only while no sequence is running: during a start, serial stays
+  // silent apart from the SEQ lines, so nothing can interleave with the run
+  // or with the dump that follows it.
+  if (seqState == SEQ_IDLE) {
     idleSampleIndex++;
     if (idleSampleIndex % STREAM_DECIMATE == 0) {
       // Wait for room for the whole row before printing, same reasoning as
@@ -406,46 +526,133 @@ static void serviceSampling() {
   }
 }
 
+// Drives the buzzer and stamps the marker in one place. The timestamp is
+// taken immediately AFTER the pin goes high, so it marks the electrical
+// instant the transducer was driven. What separates that from the first
+// pressure wave reaching the athlete is the buzzer's own latency: 5-20 ms,
+// but constant and one-directional, so it is a calibration constant rather
+// than an error. Measure it once (GPIO + microphone on one time base) and
+// subtract it; re-measure only if the buzzer changes.
+static void beep(uint32_t* markerOut, bool* capturedOut) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  uint32_t t = micros();
+  buzzerOn = true;
+  buzzerOffUs = t + BEEP_MS * 1000UL;
+  *markerOut = t;
+  *capturedOut = true;
+}
+
+// Nothing in the sequence may call delay(). Sampling is paced by the DRDY
+// interrupt on a LEVEL-LATCHED line, so a loop that blocks past one sample
+// period does not merely stutter - a missed edge is permanent until the
+// watchdog recovers it (see DRDY_STALL_TIMEOUT_US). Hence every wait below is
+// a micros() deadline checked from loop(), never a delay.
+static void serviceBuzzer() {
+  if (buzzerOn && (int32_t)(micros() - buzzerOffUs) >= 0) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOn = false;
+  }
+}
+
+static void startSequence() {
+  if (seqState != SEQ_IDLE) return;
+  uint32_t seed = micros();
+  // Seeded from the instant a human pressed the button. An unseeded random()
+  // replays the identical sequence after every reset, so by the third attempt
+  // the athlete would know when "go" is coming - which would invalidate
+  // precisely the measurement this exists to make.
+  if (!randomSeeded) {
+    randomSeed(seed);
+    randomSeeded = true;
+  }
+  onCaptured = setCaptured = goCaptured = false;
+  droppedSamples = 0;
+  seqState = SEQ_WAIT_MARKS;
+  seqDeadlineUs = seed + (uint32_t)random(MARKS_DELAY_MIN_MS, MARKS_DELAY_MAX_MS) * 1000UL;
+  Serial.println("SEQ,armed");
+}
+
+static void abortSequence(const char* why) {
+  if (seqState == SEQ_IDLE) return;
+  seqState = SEQ_IDLE;
+  digitalWrite(BUZZER_PIN, LOW);
+  buzzerOn = false;
+  Serial.print("SEQ,abort,");
+  Serial.println(why);
+}
+
+// Deadline comparisons are done on a signed difference so they stay correct
+// across the ~71 minute micros() wrap.
+static void serviceSequence() {
+  serviceBuzzer();
+  if (seqState == SEQ_IDLE) return;
+  if ((int32_t)(micros() - seqDeadlineUs) < 0) return;
+
+  switch (seqState) {
+    case SEQ_WAIT_MARKS:
+      beep(&onT, &onCaptured);
+      seqState = SEQ_WAIT_SET;
+      seqDeadlineUs = onT + (uint32_t)random(SET_DELAY_MIN_MS, SET_DELAY_MAX_MS) * 1000UL;
+      Serial.println("SEQ,marks");
+      break;
+    case SEQ_WAIT_SET:
+      beep(&setT, &setCaptured);
+      // No buffer to start: the ring already holds the last ~13.9 s. "Set"
+      // only records where in it the judged window begins.
+      setSampleIdx = recWritten;
+      seqState = SEQ_WAIT_GO;
+      seqDeadlineUs = setT + (uint32_t)random(GO_DELAY_MIN_MS, GO_DELAY_MAX_MS) * 1000UL;
+      Serial.println("SEQ,set");
+      break;
+    case SEQ_WAIT_GO:
+      beep(&goT, &goCaptured);
+      seqState = SEQ_TAIL;
+      seqDeadlineUs = goT + TAIL_AFTER_GO_MS * 1000UL;
+      Serial.println("SEQ,go");
+      break;
+    case SEQ_TAIL:
+      seqState = SEQ_IDLE;
+      dumpRecording(false);
+      break;
+    default:
+      break;
+  }
+}
+
+// Polled, not interrupt-driven: loop() already turns over at the sample rate,
+// so a press is seen within ~1.2 ms, and a bouncing mechanical contact on an
+// interrupt is a well-known way to flood a system.
+static void serviceButton() {
+  static bool lastLevel = HIGH;
+  static uint32_t lastChangeMs = 0;
+  bool level = (digitalRead(BUTTON_PIN) == HIGH);
+  uint32_t now = millis();
+  if (level == lastLevel) return;
+  if (now - lastChangeMs < BUTTON_DEBOUNCE_MS) return;  // still bouncing
+  lastChangeMs = now;
+  lastLevel = level;
+  if (!level) {
+    // Falling edge = pressed (INPUT_PULLUP, button to GND). Pressing during a
+    // running sequence aborts it, so a spoiled start can be thrown away
+    // without reaching for a keyboard.
+    if (seqState == SEQ_IDLE) startSequence();
+    else abortSequence("button");
+  }
+}
+
 static void handleSerial() {
   if (!Serial.available()) return;
   char c = Serial.read();
-  if (c == 'r') {
-    // Manual/quick arm, no on/set/go semantics - independent of the o/s/g
-    // marker sequence below.
-    if (mode == MODE_IDLE) {
-      recCount = 0;
-      droppedSamples = 0;
-      mode = MODE_RECORDING;
-    }
-  } else if (c == 'o') {
-    // "On your marks" - fresh attempt, clear any leftover set/go markers
-    // from a previous one.
-    onT = micros();
-    onCaptured = true;
-    setCaptured = false;
-    goCaptured = false;
-  } else if (c == 's') {
-    // "Set" - also arms a full-rate recording, so a separate 'r' isn't
-    // needed for the o/s/g protocol. Starting the buffer only here (not at
-    // "on your marks") is what keeps a real on-your-marks/set pause from
-    // ever overflowing it.
-    setT = micros();
-    setCaptured = true;
-    goCaptured = false;
-    if (mode == MODE_IDLE) {
-      recCount = 0;
-      droppedSamples = 0;
-      mode = MODE_RECORDING;
-    }
-  } else if (c == 'g') {
-    // "Go" - the actual reference marker for the push-off.
-    goT = micros();
-    goCaptured = true;
-  } else if (c == 'S') {
-    if (mode == MODE_RECORDING) {
-      mode = MODE_IDLE;
-      dumpRecording();
-    }
+  if (c == 'b') {
+    // Same effect as the button, so the whole sequence can be exercised
+    // before any button is wired.
+    if (seqState == SEQ_IDLE) startSequence();
+    else abortSequence("serial");
+  } else if (c == 'a') {
+    abortSequence("serial");
+  } else if (c == 'd') {
+    // Dump whatever the ring holds right now, no sequence involved.
+    if (seqState == SEQ_IDLE) dumpRecording(true);
   } else if (c == 'p') {
     if (!imuReady) {
       Serial.println("IMU not ready");
@@ -463,5 +670,7 @@ static void handleSerial() {
 
 void loop() {
   serviceSampling();
+  serviceSequence();
+  serviceButton();
   handleSerial();
 }
