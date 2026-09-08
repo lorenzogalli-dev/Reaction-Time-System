@@ -86,6 +86,7 @@ def main():
     rows = []
     expected = None
     dropped = None
+    clockstep = None
     started = False
     deadline = time.time() + 20.0  # generous: dump of a few seconds' data can take a few seconds to transmit
     while time.time() < deadline:
@@ -103,6 +104,11 @@ def main():
             break
         if line.startswith(("ON,", "SET,", "GO,")):
             # Marker header lines - always present, 0 when unused. Not junk.
+            print(f"[board] {line}")
+            continue
+        if line.startswith("CLOCKSTEP,"):
+            val = line.split(",", 1)[1].strip()
+            clockstep = int(val) if val.isdigit() else None
             print(f"[board] {line}")
             continue
         if line.startswith("DROPPED,"):
@@ -128,6 +134,14 @@ def main():
     print(f"Received {n} rows" + (f" (board says it buffered {expected})" if expected is not None else ""))
 
     ok = True
+    if clockstep is not None and clockstep > 100:
+        print(f"!! micros() on the board resolves only ~{clockstep} us, so every timestamp "
+              f"below is ~1 ms granular - rebuild with the mbed core "
+              f'("XIAO nRF52840 Sense (No Updates)")')
+        ok = False
+    elif clockstep:
+        print(f"clock: micros() resolution ~{clockstep} us (fine)")
+
     if dropped is None:
         print("!! board reported no DROPPED count - firmware older than v3?")
     elif dropped:

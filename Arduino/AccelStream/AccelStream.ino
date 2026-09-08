@@ -182,6 +182,38 @@ static uint32_t lastSampleUs = 0;
 // discarding that fact is how a timing bug survives to the next person.
 static uint32_t droppedSamples = 0;
 
+// Measured resolution of micros() on this build, in microseconds. Every
+// timestamp in a capture is only as good as this number, and it is NOT a
+// property of the sketch - it depends on which core the sketch was built
+// with, silently:
+//   - Seeeduino:mbed  -> mbed::Timer, a real 1 MHz counter. ~1 us. Good.
+//   - Seeeduino:nrf52 -> DWT cycle counter IF enabled, otherwise it falls
+//     back to the FreeRTOS tick, and configTICK_RATE_HZ is 1024, giving
+//     976.5625 us steps. DWT is off unless a debugger enabled it, so the
+//     normal case is the bad one.
+// A 2026-09-08 bench run hit exactly that: sample intervals collapsed to
+// only 977 us and 1954 us. The data looked plausible - no gaps, no dropped
+// samples, sane accelerations - while every timestamp was ~1 ms granular.
+// That is the dangerous kind of wrong, so it is measured at boot and
+// reported with every capture rather than assumed.
+static uint32_t clockStepUs = 0;
+
+// Smallest non-zero increment micros() is observed to make. A 1 MHz source
+// gives 1-2; the 1024 Hz tick fallback can only ever give ~977.
+static uint32_t measureClockStepUs() {
+  uint32_t minStep = 0xFFFFFFFFUL;
+  uint32_t prev = micros();
+  for (uint32_t i = 0; i < 40000; i++) {
+    uint32_t now = micros();
+    uint32_t d = now - prev;
+    if (d > 0) {
+      if (d < minStep) minStep = d;
+      prev = now;
+    }
+  }
+  return (minStep == 0xFFFFFFFFUL) ? 0 : minStep;
+}
+
 // Bench-test ground-truth markers: a human presses 'o'/'s'/'g' on the
 // keyboard (relayed over serial by accel_live.py) and says the word out
 // loud at the same instant. Each keypress is timestamped with the
@@ -254,6 +286,18 @@ void setup() {
     Serial.println(" g");
   }
 
+  clockStepUs = measureClockStepUs();
+  Serial.print("clock: micros() resolution ~");
+  Serial.print(clockStepUs);
+  Serial.println(" us");
+  if (clockStepUs > 100) {
+    Serial.println("!! WARNING: this build's micros() is ~1 ms granular, not microsecond.");
+    Serial.println("!! Every timestamp below inherits that. Reaction times are NOT reliable.");
+    Serial.println("!! Cause: the Seeeduino:nrf52 core falls back to the 1024 Hz FreeRTOS");
+    Serial.println("!! tick when the DWT cycle counter is off. Build with the mbed core");
+    Serial.println("!! (\"XIAO nRF52840 Sense (No Updates)\"), which uses a real 1 MHz timer.");
+  }
+
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
   Serial.println("Markers: 'o' on-your-marks, 's' set (also arms recording), 'g' go, 'S' stop+dump.");
 }
@@ -299,6 +343,10 @@ static void dumpRecording() {
   // to add to the protocol.
   Serial.print("DROPPED,");
   Serial.println(droppedSamples);
+  // Stamped into every capture so a CSV can always be checked after the
+  // fact, instead of trusting that whoever recorded it used the right core.
+  Serial.print("CLOCKSTEP,");
+  Serial.println(clockStepUs);
   for (uint32_t i = 0; i < recCount; i++) {
     printCsvRow(recT[i], recX[i], recY[i], recZ[i]);
   }
