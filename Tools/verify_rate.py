@@ -3,9 +3,9 @@
 verify_rate.py - CLI-only check of AccelStream.ino's real recorded rate.
 
 No GUI, no matplotlib: connects, arms a full-rate recording ('r'), waits a
-fixed window, stops it ('s'), reads the DUMP_START/.../DUMP_END burst, and
+fixed window, stops it ('S'), reads the DUMP_START/.../DUMP_END burst, and
 reports whether the achieved sample rate and data integrity are what the
-firmware promises (~1660 Hz, no dropped/corrupted rows).
+firmware promises (833 Hz, no dropped/corrupted rows, DROPPED=0).
 
 Usage:
     python3 Tools/verify_rate.py                  # autodetect port, 3 s
@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--seconds", type=float, default=3.0,
                      help="how long to record before stopping")
-    ap.add_argument("--target-hz", type=float, default=1660.0,
+    ap.add_argument("--target-hz", type=float, default=833.0,
                      help="expected firmware ODR, for the pass/fail check")
     ap.add_argument("--range", type=float, default=16.0,
                      help="full-scale range in g; must match ACCEL_RANGE_G in the firmware")
@@ -66,8 +66,9 @@ def main():
     ser.reset_input_buffer()
 
     # Drain and print whatever idle-preview/banner text shows up first, so
-    # you can see "IMU OK - accel 1660 Hz" go by - confirms the ODR register
-    # was actually accepted, not silently downgraded.
+    # you can see "IMU OK - accel 833 Hz (data-ready on INT1)" go by -
+    # confirms the ODR register was accepted, not silently downgraded to the
+    # library's 104 Hz default.
     print("--- board output (1s warm-up) ---")
     t_end = time.time() + 1.0
     while time.time() < t_end:
@@ -80,10 +81,11 @@ def main():
     ser.reset_input_buffer()
     ser.write(b"r")
     time.sleep(args.seconds)
-    ser.write(b"s")
+    ser.write(b"S")  # 'S' stops and dumps; lowercase 's' is the "set" marker
 
     rows = []
     expected = None
+    dropped = None
     started = False
     deadline = time.time() + 20.0  # generous: dump of a few seconds' data can take a few seconds to transmit
     while time.time() < deadline:
@@ -99,6 +101,11 @@ def main():
         if line == "DUMP_END":
             print("[board] DUMP_END")
             break
+        if line.startswith("DROPPED,"):
+            val = line.split(",", 1)[1].strip()
+            dropped = int(val) if val.isdigit() else None
+            print(f"[board] {line}")
+            continue
         if started:
             parts = line.split(",")
             if len(parts) == 4:
@@ -117,6 +124,15 @@ def main():
     print(f"Received {n} rows" + (f" (board says it buffered {expected})" if expected is not None else ""))
 
     ok = True
+    if dropped is None:
+        print("!! board reported no DROPPED count - firmware older than v3?")
+    elif dropped:
+        print(f"!! board recovered {dropped} sample(s) via the data-ready watchdog - "
+              f"their timestamps are only good to ~3 sample periods, not clean data")
+        ok = False
+    else:
+        print("data-ready watchdog: 0 recovered samples (clean)")
+
     if expected is not None and n != expected:
         print(f"!! ROW COUNT MISMATCH: received {n}, expected {expected} - some rows were lost in transit")
         ok = False
