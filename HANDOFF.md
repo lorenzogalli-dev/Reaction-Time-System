@@ -1,6 +1,133 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-07. Written for an agent starting with no prior context.
+Last updated: 2026-09-08. Written for an agent starting with no prior context.
+
+## READ THIS FIRST — 2026-09-08: the Arduino core silently decides your timestamp resolution
+
+**If you read nothing else: build `AccelStream.ino` with the `Seeeduino:mbed`
+core — the board menu entry labelled `XIAO nRF52840 Sense (No Updates)`. Not
+the `Seeeduino:nrf52` entry, despite what earlier versions of `BUILD.md` said.**
+
+### What happened
+
+A day was lost to timestamps that looked fine and were not. Symptom: sample
+intervals in a capture took only two values, 977 µs and 1954 µs (= 2 × 977),
+against captures from 2026-09-03/07 that had 59 distinct interval values around
+1022 µs. Same board, same sketch.
+
+Two wrong diagnoses were pursued before anyone measured anything:
+
+1. *"`micros()` inside the ISR is coarse"* — plausible, wrong. Moving the
+   timestamp out of the ISR changed nothing.
+2. *"the mbed core is the broken one"* — exactly backwards, and acting on it
+   is what introduced the fault, by switching a working setup onto the
+   `nrf52` core.
+
+`Arduino/ClockCheck/ClockCheck.ino` was then written to stop the guessing: it
+reports which core it was compiled with and measures `micros()`'s smallest
+observable step. It answered in three seconds.
+
+### Root cause
+
+`Seeeduino:nrf52`, `cores/nRF5/delay.h`:
+
+```c
+static inline uint32_t micros( void )
+{
+  // Use DWT cycle count if it is enabled, otherwise use rtos tick
+  return dwt_enabled() ? (DWT->CYCCNT / 64) : tick2us(xTaskGetTickCount());
+}
+```
+
+`dwt_enabled()` tests `CoreDebug->DEMCR & TRCENA` and `DWT->CTRL & CYCCNTENA`.
+The DWT cycle counter is off unless a debugger enabled it, so on a normally
+flashed board the fallback is what runs — and `tick2us` divides by
+`configTICK_RATE_HZ`, which `freertos/config/FreeRTOSConfig.h` sets to **1024**.
+That is 976.5625 µs per step: coarser than the sampling interval itself.
+
+`Seeeduino:mbed` implements `micros()` as `timer.elapsed_time().count()` off a
+real hardware timer — measured at **8 µs** resolution on the board. That is why
+the September captures were fine: they were taken on the mbed core all along.
+
+### Why this class of bug matters more than the millisecond
+
+Nothing in the bad captures looked bad. `DROPPED` was 0, there were no gaps, no
+duplicate timestamps, and the accelerations were physically sensible. Only the
+distribution of `dt` gave it away, and only because someone plotted it. A
+product shipped in that state would compute confident, wrong reaction times.
+
+Three defences now exist, all cheap:
+
+- **Firmware measures `micros()` resolution at boot**, prints it in the banner,
+  and emits a loud five-line `!! WARNING` block if it exceeds 100 µs.
+- **Every dump carries `CLOCKSTEP,<us>`**, so any CSV stays checkable after the
+  fact instead of relying on whoever recorded it having picked the right core.
+- **`verify_rate.py` fails** if the reported resolution exceeds 100 µs.
+
+Prefer this shape of fix — make the machine assert its own preconditions —
+over documenting the trap. The trap *was* documented, in `HANDOFF.md:504`,
+about the very same `#ifdef`-invisible-macro hazard on the very same core, and
+it still cost a day.
+
+### Firmware v3, validated on hardware
+
+`AccelStream.ino` now samples at **ODR 833 Hz, paced by the IMU's data-ready
+interrupt on INT1** (pin 18) instead of by however fast the read loop happens
+to run.
+
+Why the change: v2 configured 1660 Hz and achieved ~977 Hz. That was never a
+sensor fallback — the chip really ran at 1660 Hz, but one burst read costs
+~1023 µs against a 602 µs budget, so the pacing deadline was unreachable and
+the loop free-ran at I2C throughput. The rate was repeatable but *emergent*:
+whatever is left after the loop's workload. Since the STA/LTA detector is meant
+to run on-device, adding it would have lowered the sample rate silently — the
+same failure that capped v1 at 232 Hz.
+
+`verify_rate.py` on 2026-09-08, PASS:
+
+| | |
+|---|---|
+| effective rate | **863.6 Hz** (ODR 833 nominal; the sensor's oscillator runs ~3.4% high — normal tolerance) |
+| `dt` | mean 1158.1 µs, **std 11.5 µs**, min 1115, max 1199 |
+| `CLOCKSTEP` | 8 µs |
+| `DROPPED` / gaps | 0 / 0 |
+
+Note what this did *not* buy: total sample-timing error is σ ≈ 334 µs, against
+≈ 342 µs for v2. Unchanged. Coarser quantisation (1158 µs steps vs 1023) is
+traded against removing the 0–602 µs of random staleness the free-running read
+carried, and the two cancel. **The gain is determinism, not precision** — a
+rate set by the sensor rather than by the loop's workload, ~135 µs/sample of
+headroom for the detector, and an error budget that is now measured instead of
+assumed.
+
+Do **not** go back to ODR 1660 with this design: DRDY would fire every 602 µs
+while the read takes ~1023 µs, so roughly half the interrupts would be missed.
+1660 only ever worked in the old free-running scheme.
+
+Other v3 changes: a `static_assert` on `ACCEL_ODR_HZ` (the library's
+`accelSampleRate` switch silently falls through to 104 Hz for any value not in
+its list); a watchdog for the latched DRDY line (a missed edge would otherwise
+be permanent — no read means no falling edge means no next rising edge) whose
+recoveries are counted and reported; and the pin macros are now pulled in
+explicitly, since `pins_arduino.h` is not auto-included on the mbed core, which
+had also been silently compiling away the `PIN_LSM6DS3TR_C_POWER` guard.
+
+### Still the dominant error, and untouched
+
+Everything above concerns sub-millisecond sampling. Deciding **where on the
+push-off ramp the movement began** is worth tens of milliseconds and is still
+untuned — roughly 100× larger. It cannot be tuned against the current `go`
+marker either, which is a human keypress: on `Data/accel_20260907_160108.csv`
+the marker lands ~90 ms *after* the movement had already started. Tuning a
+±10 ms threshold against a ±100 ms reference is circular.
+
+The agreed next step is an independent reference: an LED driven by the firmware
+at the same instant it timestamps `g`, filmed at 240 fps, so video and CSV point
+at one physical event. That is a temporary calibration jig, **not** a product
+change — the shipped system stays IMU-only (a force sensor was already
+evaluated and rejected as invasive, `README.md:65`).
+
+---
 
 ## READ THIS FIRST — 2026-09-07: AccelStream.ino v2, detection algorithm work, real end-to-end reaction times
 
@@ -215,6 +342,9 @@ before moving, or use two people: one marking, one reacting).
 - **Rate: settled at ~977 Hz for now**, deliberately not pursuing 1660 Hz via FIFO
   unless someone decides the extra precision is actually needed (see point 3 above)
   - it already beats the sensor evaluation's own 833 Hz bar.
+  *(Superseded 2026-09-08: now a deterministic 833 Hz ODR paced by the INT1
+  data-ready interrupt, ~863 Hz measured. See the 2026-09-08 section at the top.
+  FIFO is still not being pursued.)*
 - **Detection algorithm: prototyped and causally correct, not yet tuned against real
   on-block data.** The bench captures validate the *mechanism* (rate, markers,
   sample-level placement, gravity-axis handling) but not the *thresholds* - the open

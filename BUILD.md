@@ -12,17 +12,48 @@ link and the finish-unit's BLE bridge to the phone, described in the root
 
 ## 1. Firmware — `Arduino/AccelStream/AccelStream.ino`
 
-The only firmware currently implemented and verified working on real
-hardware: accelerometer capture at 416 Hz, no BLE, no hardware FIFO.
+The only firmware currently implemented and verified working on real hardware:
+accelerometer capture at **833 Hz nominal (~863 Hz measured)**, paced by the
+IMU's data-ready interrupt, no BLE, no hardware FIFO.
+
+### ⚠️ Use the mbed core — this is not a preference
+
+Board menu entry: **`XIAO nRF52840 Sense (No Updates)`**.
+
+The "No Updates" label makes this look like the wrong choice. It is not. The
+two cores that can build for this board provide different `micros()`
+implementations, and only one of them can timestamp a reaction time:
+
+| Core | Board menu entry | `micros()` | Resolution |
+|---|---|---|---|
+| **`Seeeduino:mbed`** ✅ | XIAO nRF52840 Sense **(No Updates)** | `mbed::Timer` | **~8 µs** |
+| `Seeeduino:nrf52` ❌ | Seeed XIAO nRF52840 Sense | FreeRTOS tick fallback | **~977 µs** |
+
+On `Seeeduino:nrf52`, `cores/nRF5/delay.h` returns the DWT cycle counter *only
+if the DWT is enabled* — and it is off unless a debugger turned it on.
+Otherwise it silently falls back to `tick2us(xTaskGetTickCount())`, and
+`configTICK_RATE_HZ` is **1024**, giving 976.5625 µs steps.
+
+This cost two days on 2026-09-08. The failure is silent and looks healthy:
+captures came back with zero gaps, zero dropped samples and sensible
+accelerations, while every sample interval was either 977 µs or 1954 µs
+because that was the entire available grid. Reaction times computed from that
+data are wrong by up to a millisecond with nothing to indicate it.
+
+The firmware now measures this at boot, prints it, refuses to be quiet about
+it, and stamps `CLOCKSTEP,<us>` into every capture — but check the board menu
+anyway.
 
 **Prerequisites**
 - Arduino IDE (any recent release; developed against the current 2.x stable)
 - Board package **"Seeed nRF52 Boards"**, via Boards Manager URL:
   `https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json`
+  (this one package supplies *both* cores; you want the mbed board entries
+  from it, per the table above)
 - Vendored library `Arduino/libraries/Seeed_Arduino_LSM6DS3/` — the Arduino
   IDE only scans its own sketchbook `libraries/` folder, so symlink or copy
   it in (default sketchbook location on macOS: `~/Documents/Arduino/libraries/`)
-- Board: **Seeed XIAO nRF52840 Sense**
+- Board: **XIAO nRF52840 Sense (No Updates)**
 
 **Setup**
 ```bash
@@ -38,7 +69,7 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
 
 **Flash and verify**
 1. Open `Arduino/AccelStream/AccelStream.ino`.
-2. Tools → Board → **Seeed nRF52 Boards → Seeed XIAO nRF52840 Sense**.
+2. Tools → Board → **XIAO nRF52840 Sense (No Updates)**. See the warning above.
 3. Tools → Port → the board's port (`/dev/cu.usbmodem...` on macOS, `COMx` on Windows).
 4. **Upload.** If it times out waiting for the board, double-tap the board's
    physical reset button (until a `XIAO-SENSE` drive appears) to force
@@ -46,18 +77,39 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
 5. Open the **Serial Monitor at 921600 baud**. You should see, once, with no
    repeats:
    ```
-   IMU OK - accel 416 Hz, +/-8 g
-   Ready. Serial: 'r' start CSV, 's' stop, 'p' one reading.
+   IMU OK - accel 833 Hz (data-ready on INT1), +/-16 g
+   clock: micros() resolution ~8 us
+   Ready. Idle preview streaming. 'p' one reading.
+   Markers: 'o' on-your-marks, 's' set (also arms recording), 'g' go, 'S' stop+dump.
    ```
+   If the clock line reports a resolution in the hundreds of µs, a five-line
+   `!! WARNING` block follows it — you are on the wrong core, go back to step 2.
    If it prints `IMU error` instead, or the banner repeats on its own, see
    `HANDOFF.md` — those are both documented, previously-seen failure modes.
 6. Type `p` and press enter — you should get one `t_us=... x=... y=... z=...`
-   line back immediately. **Close the Serial Monitor before step 2 below** —
-   only one process can hold the serial port at a time.
+   line back immediately. **Close the Serial Monitor before step 7** — only one
+   process can hold the serial port at a time.
+7. Run the automated check, board sitting still on the desk:
+   ```bash
+   python3 Tools/verify_rate.py --seconds 5
+   ```
+   It must end in **PASS**. A healthy board reports `CLOCKSTEP,8`, `DROPPED,0`,
+   an effective rate near **863 Hz** and `gaps: 0`. This is the single command
+   that proves the whole capture path, so run it after any firmware change.
+
+**Serial protocol** — `o` "on your marks", `s` "set" (also arms the recording),
+`g` "go" (the reference marker for the push-off), `S` stop and dump, `r` arm a
+recording without markers, `p` one immediate reading. Each marker is timestamped
+with the firmware's own `micros()`, the same clock the samples use.
+
+**If something looks wrong with the clock**, `Arduino/ClockCheck/ClockCheck.ino`
+is a standalone sketch that reports which core it was built with and measures
+`micros()` resolution directly. It answers in three seconds what is otherwise
+very easy to misdiagnose.
 
 ---
 
-## 2. Python capture tooling — `Tools/accel_live.py`, `Tools/csv_plot.py`
+## 2. Python capture tooling — `Tools/accel_live.py`, `Tools/verify_rate.py`, `Tools/detect_pushoff.py`, `Tools/csv_plot.py`
 
 **Tested with:**
 
@@ -67,7 +119,7 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
 | pyserial | 3.5 |
 | matplotlib | 3.11.1 |
 | numpy | 2.5.2 |
-| pandas | 3.0.5 (only needed by `csv_plot.py`) |
+| pandas | 3.0.5 (needed by `csv_plot.py` and `detect_pushoff.py`) |
 
 **Install**
 ```bash
@@ -83,6 +135,27 @@ python3 Tools/accel_live.py --simulate         # no hardware needed - fake data,
 ```
 Buttons (or keys `r`/`s`/`p`) start/stop recording and save a snapshot. Every
 recording writes a CSV plus a 4-panel PNG (X, Y, Z, magnitude) to `Data/`.
+
+**Run — verify the board and the capture path** (the first thing to run after
+flashing; see step 7 of the firmware section):
+```bash
+python3 Tools/verify_rate.py --seconds 5      # autodetects the port; must print PASS
+```
+Checks clock resolution, effective sample rate, dropped samples, gaps, timestamp
+monotonicity and clipping in one shot.
+
+**Run — offline push-off detection on a recorded CSV:**
+```bash
+python3 Tools/detect_pushoff.py Data/accel_YYYYMMDD_HHMMSS.csv --plot
+python3 Tools/detect_pushoff.py "Data/*.csv" --after-go
+```
+Reports the detected push-off instant and, when the capture has a `go` marker,
+the reaction time; `--plot` writes a `<name>_detect.png` beside the CSV.
+The sample rate is measured from the capture's own timestamps, so CSVs recorded
+at different rates all work without flags. `--after-go` restricts the search to
+after the `go` marker — useful when a pre-go blip triggers the detector.
+**The thresholds are not yet tuned against real on-block data** — read the
+module docstring before changing them.
 
 **Run — offline review of a saved CSV:**
 ```bash
