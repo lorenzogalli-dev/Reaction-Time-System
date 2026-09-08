@@ -1,8 +1,231 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-04. Written for an agent starting with no prior context.
+Last updated: 2026-09-07. Written for an agent starting with no prior context.
 
-## READ THIS SECOND — README.md rewritten, new architecture direction, unresolved discrepancy
+## READ THIS FIRST — 2026-09-07: AccelStream.ino v2, detection algorithm work, real end-to-end reaction times
+
+Big session, done live with three people testing hardware in real time. Everything
+below is committed and pushed on `main` as of this write-up. `Arduino/AccelStream/AccelStream.ino`
+and `Tools/accel_live.py` were both substantially rewritten (not incrementally
+patched) - read them fresh rather than diffing against memory of the old version.
+
+### Firmware: why it changed, in order
+
+1. **The 416 Hz sketch only actually delivered ~232 Hz.** Diagnosed by capturing real
+   data and computing `dt` between consecutive `t_us` values - median was 4.31 ms, not
+   the 2.4 ms the 416 Hz config implied, with almost no jitter (a hard ceiling, not
+   scheduling noise). Root cause: `readFloatAccelX/Y/Z()` each does two I2C
+   transactions (write register pointer, read 2 bytes) - six transactions per sample.
+   Each transaction has a large, fairly fixed driver overhead on the nRF52840's Wire
+   implementation (measured indirectly at ~510 us/transaction). **Fix:** X/Y/Z occupy
+   six consecutive registers on the LSM6DS3, so one `readRegisterRegion()` burst call
+   reads all six bytes in one transaction, replacing three library calls (six
+   transactions) with two. This alone took measured throughput from 232 Hz to ~977 Hz.
+2. **ODR bumped 416 -> 1660 Hz** (`ACCEL_ODR_HZ`). Careful gotcha here: the vendored
+   library's own settings comment says "1666" but `LSM6DS3.cpp`'s `accelSampleRate`
+   switch statement's case label is literally `1660` - passing 1666 silently falls
+   through to the 104 Hz default. Verified against the library source before picking
+   the constant; costs nothing to double check again if this ever gets touched.
+3. **Even with the burst read, printing an ASCII CSV row over serial for every single
+   sample leaves near-zero timing margin at high rate**, and was the second half of
+   the original 232 Hz ceiling (not just the I2C cost). Fix: printing is decoupled
+   from sampling entirely.
+   - **Idle** (default, from boot, no command needed): every `STREAM_DECIMATE`-th
+     sample (5, so ~332 Hz) is printed as a live-preview CSV row
+     (`t_us,x_g,y_g,z_g`) - fast enough for a chart, slow enough that ASCII
+     formatting has huge margin and can never rob a sample.
+   - **Recording**: nothing is printed. Every sample at full ODR goes straight into a
+     RAM buffer (`recT`/`recX`/`recY`/`recZ`, `MAX_REC_SAMPLES = 12000` -> ~12.3 s at
+     the ~977 Hz *achieved* rate, ~117 KB, comfortably inside the XIAO nRF52840's
+     256 KB with no BLE stack running). The whole buffer is dumped over serial only
+     after the capture stops (`DUMP_START,<n>` / rows / `DUMP_END` framing). This is
+     the real fix for rate-under-load: serial timing can never compete with sampling
+     during the window that actually matters.
+   - **Real achieved rate is ~977-979 Hz, not 1660 Hz**, verified repeatedly on real
+     hardware (`Tools/verify_rate.py`, and every real capture's own `t_s` column).
+     Root cause: even at 2 I2C transactions/sample (~510 us each = ~1020 us total),
+     there's no margin left in a 1660 Hz (602 us) budget - the code is now
+     I2C-transaction-bound, not print-bound. **This was a deliberate stopping point,
+     not an oversight**: 977 Hz already exceeds the 833 Hz the earlier sensor
+     evaluation (below) called sufficient (quantization σ ≈ 0.30 ms at 977 Hz vs its
+     0.35 ms figure at 833 Hz). Going further would mean batching multiple samples
+     per I2C read via the chip's hardware FIFO - explicitly **not attempted**, since
+     the one prior firmware here that used the FIFO (`BLEtest.ino`, see below) had an
+     unresolved crash, and reintroducing FIFO complexity wasn't judged worth it for a
+     rate that's already past the target. If someone wants to chase 1660 Hz later,
+     FIFO batching (amortizing the per-transaction I2C cost over many samples) is the
+     way, done incrementally and tested at each step - not the BLEtest.ino path.
+4. **Range raised 8g -> 16g.** A 2026-09-07 bench test (hard hand-hit, well above a
+   real push-off) clipped hard at ±8g on two axes simultaneously for ~200 ms. 16g
+   costs almost nothing (LSB resolution 0.244 mg -> 0.488 mg, still far below the
+   ~20 mg detection floor) so it's cheap margin.
+5. **Ground-truth markers for bench testing: `o` / `s` / `g` / `S`.** Needed a way to
+   know when a push-off *should* have started, to validate the detection algorithm
+   against something other than eyeballing a chart. Iterated through two designs
+   before landing here - both false starts are worth knowing about if this gets
+   touched again:
+   - First tried a GPIO button wired to a pin, debounced in firmware. Replaced before
+     ever being wired up in favor of the option below (simpler, zero extra hardware).
+   - Then tried an automatic firmware-generated 3-beep "ready/set/go" sequence
+     relayed to the PC to play audibly. Abandoned at the design stage: a realistic
+     15 s "on your marks" + 2 s "set" pause doesn't fit in the ~12.3 s recording
+     buffer (buffer only starts filling at "set", so the beep-timing idea would have
+     needed either a much longer buffer - real RAM pressure - or an unrealistically
+     short pause).
+   - **What's actually in the firmware now:** a human presses three keys/buttons and
+     says the word out loud at the same instant. `o` = "on your marks" (clears any
+     leftover set/go from a previous attempt). `s` = "set" - **also arms full-rate
+     recording**, no separate arm command needed; this is what keeps a real
+     on-your-marks/set pause from ever overflowing the buffer, since nothing is
+     buffered before "set". `g` = "go" - the reference timestamp a push-off is
+     measured against. `S` (**uppercase** - lowercase `s` means "set") stops and
+     dumps. Every marker is timestamped with the firmware's own `micros()`, the same
+     clock every accelerometer sample uses, so there's no cross-clock sync problem
+     and no PC-audio-latency to account for (the human's own voice is the real
+     stimulus - arguably more realistic than a synthesized beep would have been
+     anyway, at the cost of some small, unavoidable human tap/say coordination jitter
+     that doesn't matter for this bench-reference use).
+   - Firmware dump order: `DUMP_START,<n>` / `ON,<t_us|0>` / `SET,<t_us|0>` /
+     `GO,<t_us|0>` / `<n data rows>` / `DUMP_END`.
+
+### `accel_live.py`: what changed to match
+
+- Command bytes: `CMD_ON=b"o"`, `CMD_SET=b"s"`, `CMD_GO=b"g"`, `CMD_STOP=b"S"`.
+  `start_recording()` (bound to the "Set" button/key) now sends `CMD_SET`, not the
+  old `CMD_START`. New `mark_on()`/`mark_go()` just relay a marker, no recording
+  state change.
+- Saved CSVs get trailing comment lines when a marker was captured -
+  `# on_t_us` / `# on_t_s`, `# set_t_us` / `# set_t_s`, `# go_t_us` / `# go_t_s` -
+  written in `_finalize_recording()`, right before the file closes. `*_t_s` is
+  already relative to the recording's own `t_s` clock (same zero as the data rows),
+  so e.g. `go_t_s` is directly usable against the `t_s` column. **These are appended
+  after all the data rows, not in the header** - a first cut at reading them back
+  (`Tools/detect_pushoff.py`'s `read_go_t_s()`) stopped scanning at the first
+  non-comment line and missed them entirely until that was caught by testing against
+  a real saved file, not assumed.
+- **Real bug, caught live, not hypothetical:** matplotlib binds `o`/`s`/`g`/`p` to
+  built-in figure actions by default (zoom-rect / save-figure-dialog / toggle-grid /
+  pan) - exactly this app's marker keys. Pressing `s` popped matplotlib's own save
+  dialog instead of sending the "set" marker. Fixed in `_build_ui()` by stripping
+  just those letters out of the relevant `plt.rcParams['keymap.*']` lists before the
+  figure is created (leaves `ctrl+s` etc. alone). `S` (capital) never collided,
+  matplotlib's defaults are lowercase-only.
+- **Diagnostic stderr logging added** on every marker send/receive and on ignored
+  Set/Stop presses (`[accel_live] sent SET marker...`, `[accel_live] board confirms
+  SET marker: ...`, `[accel_live] 'Stop' ignored - recording=... awaiting_dump=...`).
+  This was what actually resolved a "markers aren't showing up in the CSV" report
+  that looked like a bug from the file alone - the log showed commands were sent,
+  confirmed by the board, and the dump was simply still in transit (a few thousand
+  CSV rows over serial can take a few real seconds) when the user checked/re-pressed
+  Stop. Not a bug; the dump just needs to be given time to finish. Keep this logging
+  in place - it's the fast way to tell "not sent" vs "sent but board didn't confirm"
+  vs "sent, confirmed, just still transferring" apart, instead of guessing from a
+  possibly-incomplete file afterward.
+- 5 buttons now: On your marks (o) / Set (s) / Go (g) / Stop+Save (S) / Snapshot (p).
+
+### New: `Tools/verify_rate.py`
+
+CLI-only (no matplotlib), for when the graph doesn't matter and you just want a
+pass/fail on rate + integrity. Arms a recording, waits a fixed window, stops it,
+reports achieved Hz vs. target, row-count-matches-expected, gap count, and basic
+value sanity (resting ~1g, nothing pinned at the clip rail). This is what caught the
+232 Hz ceiling and later confirmed the fix (977.5 Hz, exact row count match, zero
+gaps) before any GUI tool was involved.
+
+### New: `Tools/detect_pushoff.py` — the actual detection-algorithm prototype
+
+Explicitly a **starting point for the three of you to tune, not a validated
+detector** - built so the algorithm can be developed entirely offline against
+recorded CSVs (no hardware needed), which was the original ask this tool answers.
+`PushOffDetector` is written **causally** (`update()` sees only the current sample
+plus a short rolling history, never a future sample, never the whole file at once) -
+deliberately, so that whatever gets tuned here can be ported to C++ on the real
+device later without changing the logic, only the language. The one place this
+isn't quite true yet is the confirm window (see below).
+
+Algorithm: horizontal-plane deviation from a slow-adapting baseline
+(`horiz = |(two non-gravity axes) - baseline|`), fed into a fast/slow moving-average
+pair (STA/LTA) on `horiz²`; a candidate opens when `horiz` crosses an absolute floor
+*and* the STA/LTA ratio crosses a threshold, must then stay above a lower confirm
+floor for `confirm_ms` to be accepted (rejects single-sample noise blips), and the
+reported timestamp is backdated to the first raw sample that crossed the floor - not
+the (later) confirmation instant. Defaults (`sta_ms=15, lta_ms=800, ratio=6,
+floor_mg=20, confirm_ms=15`) are the same ballpark numbers discussed while designing
+this, unchanged since - **not yet tuned against real block data**, that's the actual
+next step.
+
+Three real bugs found and fixed by testing against real captures, not by inspection
+alone - worth knowing about if the constants or the class get touched:
+
+1. **LTA starts near zero**, so STA/LTA is meaningless (spuriously huge) for the
+   first fraction of a second of any file until LTA has converged on real background
+   noise. Without a warmup gate this made every file's very first few samples look
+   like an infinite-ratio "event". Fixed with `warmup_n` (defaults to one full LTA
+   time constant) gating candidate detection, not the EMA updates themselves.
+2. **Gravity axis was hardcoded to "exclude Z"**, on the assumption Z is always
+   vertical. Wrong: three different real captures on 2026-09-07 had gravity on Z, X,
+   and Y respectively (mounting/handling orientation isn't fixed). Fixed with
+   auto-detection - the first ~20 ms of each file is averaged and whichever axis is
+   largest in magnitude is excluded (`gravity_axis="auto"`, overridable). Verified
+   against real files with gravity on each of the three different axes.
+3. **The plotted `|a|` (raw 3-axis magnitude) is not the signal the detector
+   decides on, and looks visually flat right where the detector correctly fires.**
+   Confirmed with real numbers: at a reported event, `|a|` crept from 1.00g to 0.93g
+   over ~13ms (invisible on a 0-4g axis) while `horiz` (gravity-axis excluded,
+   baseline-subtracted - the actual decision signal) was already rising cleanly
+   through the 20mg floor at the same samples. This produced a "the marker looks like
+   it's placed before the real push" impression that was investigated and traced to
+   plotting the wrong signal, not a placement bug. **Fix: `--plot` now adds `horiz`
+   itself as its own panel (with the floor line drawn on it), both full-recording and
+   zoomed**, so a placement can be checked against the actual decision signal instead
+   of an unrelated (if visually intuitive) proxy. Use this panel, not the `|a|` one,
+   when sanity-checking where a marker landed.
+
+Also added: `--after-go` (ignore any movement before the file's own go marker, for
+isolating a real push-off from pre-go handling/fidgeting when checking one bench
+file) and `--zoom-ms` (width of the zoomed, individual-samples-marked panel).
+**`--after-go` is a diagnostic convenience only** - a real false-start detector must
+NOT do this, since catching movement before "go" is the entire point of a
+false-start check. Confirmed directly on real data: run unrestricted, one capture's
+detector caught a small pre-go handling blip instead of the real push (reaction time
+came out negative, -114 ms and -2045 ms in two different files) - `--after-go`
+isolated the real push-off in those same files (75 ms and 198 ms respectively) to
+confirm the rest of the pipeline was sound, but the underlying question - how to
+tell "settling into position" apart from "an actual false start" - is unresolved and
+needs real on-block data, not bench data, to answer.
+
+### End-to-end validation on real hardware
+
+Multiple real captures on 2026-09-07 with the `o`/`s`/`g`/`S` protocol, checked with
+`detect_pushoff.py`: rate 977.5-978.5 Hz every time, zero gaps, zero dropped/
+duplicate timestamps. Two captures had "go" cleanly separated in time from the
+actual push (no overlap, no pre-go movement crossing threshold) and gave plausible,
+mutually consistent reaction times - **266.2 ms and 313.4 ms** - with the unrestricted
+and `--after-go` detector runs agreeing exactly on both. One capture had the "go"
+marker and the push overlapping in time (looks like a solo test where marking "go"
+and starting to move weren't cleanly separated) and produced nonsensical negative
+reaction times either way - not a pipeline bug, a test-protocol issue (mark clearly
+before moving, or use two people: one marking, one reacting).
+
+### Where this leaves things
+
+- Firmware, `accel_live.py`, and the three `Tools/` scripts are all committed and
+  pushed as of this write-up - see `git log` for the actual commit if this doc and
+  the tree ever disagree.
+- **Rate: settled at ~977 Hz for now**, deliberately not pursuing 1660 Hz via FIFO
+  unless someone decides the extra precision is actually needed (see point 3 above)
+  - it already beats the sensor evaluation's own 833 Hz bar.
+- **Detection algorithm: prototyped and causally correct, not yet tuned against real
+  on-block data.** The bench captures validate the *mechanism* (rate, markers,
+  sample-level placement, gravity-axis handling) but not the *thresholds* - the open
+  question (pre-go fidgeting vs. a real false start) needs a real block session to
+  answer, not more bench testing.
+- Whoever picks this up next: read `Tools/detect_pushoff.py`'s module docstring and
+  the `--after-go`/gravity-axis notes above before changing the algorithm's
+  constants, and use `--plot`'s `horiz` panel (not `|a|`) to sanity-check any
+  placement.
+
+## READ THIS THIRD — README.md rewritten, new architecture direction, unresolved discrepancy
 
 Later on 2026-09-04, after the repo reorganization described in the section
 below, `README.md` was rewritten from scratch and `BUILD.md` was added.
@@ -42,7 +265,7 @@ table, and "Open Risks" section were updated to state the WiFi-fallback
 nuance explicitly, so the image and the prose now agree. Nothing further to
 reconcile here.
 
-## READ THIS FIRST — repo reorganized 2026-09-04, BLEtest.ino removed
+## READ THIS SECOND — repo reorganized 2026-09-04, BLEtest.ino removed
 
 Everything below this section (up to **State of the tree**) describes work from
 2026-08-29 and earlier, centered on a firmware called `BLEtest.ino` that no
@@ -420,3 +643,10 @@ time you're reading this.
 
 Hashes changed in the 2026-08-29 history rewrite; anything referencing the old
 `37060b5` means `de65ad6`.
+
+The 2026-09-07 session (see **READ THIS FIRST** at the top of this document) added
+one more commit on top of all the above: `AccelStream.ino` burst-I2C-read + 1660Hz
+config (~977Hz achieved) + buffer-then-dump protocol + o/s/g/S ground-truth markers,
+`accel_live.py` rewritten to match (+ matplotlib keymap fix, diagnostic logging),
+and two new scripts, `Tools/verify_rate.py` and `Tools/detect_pushoff.py`. Check
+`git log` for the exact hash rather than assuming one here.

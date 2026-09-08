@@ -2,17 +2,28 @@
 """
 Live viewer + recorder for Arduino/AccelStream/AccelStream.ino.
 
-Clean rewrite paired with the simplified no-BLE firmware: reads
-"t_us,x_g,y_g,z_g" CSV lines over serial, plots them live, and records to
-CSV + a PNG overview on request. t_us is a real per-sample micros() reading
-taken on the board, not a nominal index * period.
+Paired with AccelStream.ino v2: the board streams a decimated live-preview
+CSV ("t_us,x_g,y_g,z_g") continuously at idle, and records at full ODR into
+an on-device RAM buffer while armed. "Set" sends 's', which both marks the
+"set" instant and arms recording; "Stop+Save" sends 'S' and waits for the
+board to dump the whole buffer (DUMP_START/DUMP_END framed) before saving
+CSV + a PNG overview. t_us is a real per-sample micros() reading taken on
+the board, not a nominal index * period.
+
+Bench ground-truth markers: whoever is running the test presses On/Set/Go
+and says the word out loud at the same instant. Each press is timestamped
+by the firmware's own clock (not the PC's), and lands in the saved CSV as
+"# on_t_s" / "# set_t_s" / "# go_t_s" comment lines - directly comparable
+to the t_s column (e.g. reaction_time = go_t_s - set_t_s), and read
+automatically by Tools/detect_pushoff.py if present.
 
 Usage:
     python3 Tools/accel_live.py                    # autodetect the port
     python3 Tools/accel_live.py --port /dev/cu.usbmodem1101
     python3 Tools/accel_live.py --simulate          # no hardware, UI only
 
-Controls: on-screen buttons, or keys r (record), s (stop), p (snapshot PNG).
+Controls: on-screen buttons, or keys o (on your marks), s (set - also
+starts recording), g (go), S (stop + save), p (snapshot PNG).
 
 Requires: pyserial, matplotlib, numpy.
 """
@@ -31,8 +42,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
-CMD_START = b"r"
-CMD_STOP = b"s"
+CMD_ON = b"o"     # "on your marks" - clears any leftover set/go markers
+CMD_SET = b"s"    # "set" - also arms full-rate recording on the firmware
+CMD_GO = b"g"     # "go" - the reference marker for the push-off
+CMD_STOP = b"S"   # stop + dump the buffered recording (uppercase - lowercase 's' means "set")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUTDIR = os.path.join(REPO_ROOT, "Data")
@@ -64,7 +77,13 @@ class SerialSource:
             raise last_exc
         self._tail = ""
         self._ser.reset_input_buffer()
-        self._ser.write(CMD_START)
+        # No start command here: the firmware streams a decimated live
+        # preview on its own from boot. 'r'/'s' now mean "arm/stop a
+        # full-rate buffered recording", sent explicitly from
+        # start_recording()/stop_recording() instead.
+
+    def send(self, cmd):
+        self._ser.write(cmd)
 
     def read_lines(self):
         n = self._ser.in_waiting
@@ -125,6 +144,9 @@ class SimulatedSource:
             self._emitted += 1
         return out
 
+    def send(self, cmd):
+        pass  # no on-device buffer to arm/dump - see stop_recording()
+
     def close(self):
         pass
 
@@ -137,6 +159,7 @@ class LiveApp:
     def __init__(self, args):
         self.args = args
         self.odr = args.odr
+        self.stream_decimate = args.stream_decimate
         self.accel_range = args.range
         self.window_s = args.window
 
@@ -153,6 +176,13 @@ class LiveApp:
         self.status = "starting..."
 
         self.recording = False
+        self.awaiting_dump = False
+        self.in_dump = False
+        self.dump_expected = None
+        self.dump_complete = False
+        self.dump_on_t_us = None
+        self.dump_set_t_us = None
+        self.dump_go_t_us = None
         self.csv_file = None
         self.csv_path = None
         self.rec_t0_us = None
@@ -209,6 +239,32 @@ class LiveApp:
     def _handle_line(self, line):
         if not line:
             return
+        if line.startswith("DUMP_START"):
+            parts = line.split(",")
+            self.dump_expected = (
+                int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else None
+            )
+            self.in_dump = True
+            self.status = "receiving buffered recording..."
+            return
+        if line.startswith("ON,") or line.startswith("SET,") or line.startswith("GO,"):
+            name, val = line.split(",", 1)
+            val = val.strip()
+            t_us = int(val) if val.isdigit() and val != "0" else None
+            print("[accel_live] board confirms %s marker: %s" % (name, t_us if t_us else "not captured"),
+                  file=sys.stderr)
+            if name == "ON":
+                self.dump_on_t_us = t_us
+            elif name == "SET":
+                self.dump_set_t_us = t_us
+            else:
+                self.dump_go_t_us = t_us
+            return
+        if line == "DUMP_END":
+            self.in_dump = False
+            with self.lock:
+                self.dump_complete = True
+            return
         parts = line.split(",")
         if len(parts) != 4:
             self.status = line  # firmware banner/diagnostic text
@@ -224,10 +280,14 @@ class LiveApp:
         host_iso = datetime.now(timezone.utc).isoformat()
 
         if self.last_t_us is not None:
-            # A gap much larger than the nominal period means missed
-            # samples - the firmware doesn't buffer them (no FIFO here), so
-            # a slow host read can genuinely lose data between samples.
-            if (t_us - self.last_t_us) > 3 * (1e6 / self.odr):
+            # A gap much larger than expected means missed samples. The
+            # relevant "expected" spacing depends on whether this line came
+            # from the decimated idle preview (~odr/stream_decimate) or a
+            # full-rate buffer dump (~odr, much tighter) - using the idle
+            # spacing as the threshold catches real idle-stream gaps while
+            # never falsely firing on the (much denser) dump rows.
+            expected_dt_us = 1e6 * self.stream_decimate / self.odr
+            if (t_us - self.last_t_us) > 3 * expected_dt_us:
                 self.gap_count += 1
         self.last_t_us = t_us
         self.total_samples += 1
@@ -258,8 +318,33 @@ class LiveApp:
 
     # -- recording --------------------------------------------------------
 
+    def mark_on(self, _event=None):
+        """'On your marks' - say it out loud at the same instant. Doesn't
+        touch recording state; just relays the marker to the firmware."""
+        try:
+            self.source.send(CMD_ON)
+            print("[accel_live] sent ON marker ('o')", file=sys.stderr)
+        except Exception as exc:
+            print("[accel_live] FAILED to send ON marker: %s" % exc, file=sys.stderr)
+        self.status = "marked: on your marks"
+
+    def mark_go(self, _event=None):
+        """'Go' - the reference marker for the push-off. Say it out loud at
+        the same instant. Doesn't touch recording state."""
+        try:
+            self.source.send(CMD_GO)
+            print("[accel_live] sent GO marker ('g')", file=sys.stderr)
+        except Exception as exc:
+            print("[accel_live] FAILED to send GO marker: %s" % exc, file=sys.stderr)
+        self.status = "marked: go"
+
     def start_recording(self, _event=None):
-        if self.recording:
+        """Triggered by the 'Set' button/key: sends the 'set' marker, which
+        also arms full-rate recording on the firmware side - no separate
+        arm command needed."""
+        if self.recording or self.awaiting_dump:
+            print("[accel_live] 'Set' ignored - already recording=%s awaiting_dump=%s"
+                  % (self.recording, self.awaiting_dump), file=sys.stderr)
             return
         os.makedirs(self.args.outdir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -270,6 +355,8 @@ class LiveApp:
         f.write("# source: %s\n" % (self.source.port if self.source else "?"))
         f.write("# odr_hz_nominal: %d\n" % self.odr)
         f.write("# accel_range_g: %d\n" % self.accel_range)
+        f.write("# full ODR, undecimated - captured via the board's on-device\n")
+        f.write("# RAM buffer and dumped after stop, not streamed live.\n")
         f.write("# t_s is relative to the first sample of this recording;\n")
         f.write("# t_us is the board's raw micros() reading for that sample.\n")
         f.write("# host_iso is host arrival time, for cross-reference only.\n")
@@ -282,8 +369,19 @@ class LiveApp:
             self.rec_peak = 0.0
             self.rec_clipped = 0
             self.rec_data = []
+            self.dump_complete = False
+            self.dump_on_t_us = None
+            self.dump_set_t_us = None
+            self.dump_go_t_us = None
             self.recording = True
-        self.status = "recording -> %s" % os.path.basename(self.csv_path)
+        self.in_dump = False
+        try:
+            self.source.send(CMD_SET)
+            print("[accel_live] sent SET marker ('s') -> %s" % os.path.basename(self.csv_path),
+                  file=sys.stderr)
+        except Exception as exc:
+            print("[accel_live] FAILED to send SET marker: %s" % exc, file=sys.stderr)
+        self.status = "set - recording (buffering on-device, full rate)..."
 
         # Make the recording state impossible to miss: the button itself
         # turns red and its label changes, instead of relying on the small
@@ -298,14 +396,48 @@ class LiveApp:
         self.fig.canvas.draw_idle()
 
     def stop_recording(self, _event=None):
-        if not self.recording:
+        if not self.recording or self.awaiting_dump:
+            print("[accel_live] 'Stop' ignored - recording=%s awaiting_dump=%s"
+                  % (self.recording, self.awaiting_dump), file=sys.stderr)
             return
+        self.awaiting_dump = True
+        try:
+            self.source.send(CMD_STOP)
+            print("[accel_live] sent STOP ('S')", file=sys.stderr)
+        except Exception as exc:
+            print("[accel_live] FAILED to send STOP: %s" % exc, file=sys.stderr)
+        self.status = "stopping - waiting for on-device buffer dump..."
+        self.record_btn.label.set_text("Receiving...")
+        self.record_btn.color = self.RECORDING_COLOR
+        self.record_btn.hovercolor = self.RECORDING_HOVER
+        self.record_btn.ax.set_facecolor(self.RECORDING_COLOR)
+        self.fig.canvas.draw_idle()
+
+        if self.args.simulate:
+            # SimulatedSource has no on-device buffer to dump from - finish
+            # immediately, same as the old always-streaming behavior.
+            self._finalize_recording()
+
+    def _finalize_recording(self):
         with self.lock:
             self.recording = False
+            self.awaiting_dump = False
             f, self.csv_file = self.csv_file, None
             rows, path = self.rec_rows, self.csv_path
             data = list(self.rec_data)
+            on_t_us = self.dump_on_t_us
+            set_t_us = self.dump_set_t_us
+            go_t_us = self.dump_go_t_us
+            t0_us = self.rec_t0_us
         if f is not None:
+            # Same t_us clock as every sample in this file, so each is
+            # directly comparable to the t_s column - e.g.
+            # reaction_time = go_t_s - set_t_s (or go_t_s alone if that's
+            # all you need).
+            for name, t_us in (("on", on_t_us), ("set", set_t_us), ("go", go_t_us)):
+                if t_us is not None and t0_us is not None:
+                    f.write("# %s_t_us: %d\n" % (name, t_us))
+                    f.write("# %s_t_s: %.6f\n" % (name, (t_us - t0_us) / 1e6))
             f.close()
 
         png = None
@@ -326,7 +458,7 @@ class LiveApp:
         self.fig.canvas.draw_idle()
 
         def _revert():
-            self.record_btn.label.set_text("Record (r)")
+            self.record_btn.label.set_text("Set (s)")
             self.record_btn.color = self.IDLE_COLOR
             self.record_btn.hovercolor = self.IDLE_HOVER
             self.record_btn.ax.set_facecolor(self.IDLE_COLOR)
@@ -400,6 +532,18 @@ class LiveApp:
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self):
+        # Matplotlib binds several single letters to built-in figure actions
+        # by default - o=zoom-rect tool, s=save-figure dialog, g=toggle
+        # grid, p=pan tool - exactly the letters this app uses for markers.
+        # Without this, pressing 's' pops matplotlib's save dialog instead
+        # of (or as well as) sending the "set" marker. Strip just those
+        # letters from the relevant keymaps so only this app's handler
+        # responds; 'S' (stop) is untouched since matplotlib's defaults are
+        # lowercase-only.
+        for keymap_name, key in (("keymap.zoom", "o"), ("keymap.save", "s"),
+                                  ("keymap.grid", "g"), ("keymap.pan", "p")):
+            plt.rcParams[keymap_name] = [k for k in plt.rcParams[keymap_name] if k != key]
+
         self.fig, (self.ax_accel, self.ax_mag) = plt.subplots(
             2, 1, figsize=(12, 7.5), sharex=True)
         self.fig.canvas.manager.set_window_title("accel_live")
@@ -431,29 +575,41 @@ class LiveApp:
 
         self.buttons = []
         specs = [
-            ("Record (r)", self.start_recording),
-            ("Stop (s)", self.stop_recording),
+            ("On your marks (o)", self.mark_on),
+            ("Set (s)", self.start_recording),
+            ("Go (g)", self.mark_go),
+            ("Stop+Save (S)", self.stop_recording),
             ("Snapshot PNG (p)", self.snapshot),
         ]
         for i, (label, cb) in enumerate(specs):
-            axb = self.fig.add_axes([0.012 + i * 0.155, 0.03, 0.145, 0.055])
+            axb = self.fig.add_axes([0.012 + i * 0.152, 0.03, 0.14, 0.055])
             b = Button(axb, label, color=self.IDLE_COLOR, hovercolor=self.IDLE_HOVER)
             b.on_clicked(cb)
             self.buttons.append(b)
-        self.record_btn, self.stop_btn, self.snapshot_btn = self.buttons
+        self.on_btn, self.record_btn, self.go_btn, self.stop_btn, self.snapshot_btn = self.buttons
 
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         self.fig.canvas.mpl_connect("close_event", lambda _e: self.shutdown())
 
     def _on_key(self, event):
-        if event.key == "r":
-            self.start_recording()
+        if event.key == "o":
+            self.mark_on()
         elif event.key == "s":
+            self.start_recording()
+        elif event.key == "g":
+            self.mark_go()
+        elif event.key == "S":
             self.stop_recording()
         elif event.key == "p":
             self.snapshot()
 
     def _refresh(self):
+        with self.lock:
+            dump_done = self.dump_complete
+            self.dump_complete = False
+        if dump_done:
+            self._finalize_recording()
+
         with self.lock:
             if not self.t_buf:
                 return
@@ -493,8 +649,10 @@ class LiveApp:
                  % (self.total_samples, board_rate, host_rate, self.gap_count,
                     self.accel_range))
         if recording:
-            stats += "\n              rows %-9d  peak %6.3f g  clipped %d" % (
-                rec_rows, rec_peak, rec_clipped)
+            expected = self.dump_expected
+            rows_label = ("%d/%d" % (rec_rows, expected)) if expected else str(rec_rows)
+            stats += "\n              rows %-9s  peak %6.3f g  clipped %d" % (
+                rows_label, rec_peak, rec_clipped)
         if rec_clipped:
             stats += "   <<< CLIPPING: raise the range"
         self.txt_stats.set_text(stats)
@@ -541,8 +699,11 @@ def main(argv=None):
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial port (default: autodetected)")
     ap.add_argument("--baud", type=int, default=921600, help="must match the firmware")
-    ap.add_argument("--odr", type=int, default=416, help="nominal accelerometer ODR")
-    ap.add_argument("--range", type=int, default=8,
+    ap.add_argument("--odr", type=int, default=1660,
+                     help="firmware accelerometer ODR (full rate; recorded CSVs are undecimated)")
+    ap.add_argument("--stream-decimate", type=int, default=5,
+                     help="idle live-preview print decimation; must match the firmware's STREAM_DECIMATE")
+    ap.add_argument("--range", type=int, default=16,
                      help="full-scale range in g; must match the firmware")
     ap.add_argument("--window", type=float, default=3.0, help="seconds visible on screen")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="where CSV/PNG files go")
