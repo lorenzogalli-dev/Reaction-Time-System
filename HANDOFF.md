@@ -488,6 +488,15 @@ consider adding a minimal BLE characteristic to `AccelStream.ino`'s simple
 polling loop instead, one piece at a time, testing after each addition (that
 incremental approach is exactly what would have caught this bug early).
 
+**One exception to the "everything below is historical" rule:** the
+**[XBee link range test](#xbee-link-range-test)** section near the bottom is
+*current*, not historical. It was developed on a branch in parallel with this
+reorganization and merged in afterwards, which is why it sits below this
+banner. Its paths are up to date (`Arduino/Xbee_RangeTest/`,
+`Arduino/Xbee_Passthrough/`, `Tools/xbee_range_*.py`, `playground_xbee/`), and
+it is the tooling for the "Zigbee start↔finish link — in progress" risk in
+`README.md`. Compile-checked only; not yet run on hardware.
+
 ---
 
 ## Goal (part 1)
@@ -632,7 +641,22 @@ Steps 3–5 of the original list are now answered by a real capture (see the
 sensor evaluation below). What remains:
 
 1. **Flash `Arduino/BLEtest/BLEtest.ino`** and watch the Serial Monitor for `IMU OK`. If it prints `IMU error - live data disabled`, BLE still works and reaction time is unaffected — but the live view will be dead. The sketch sets `PIN_LSM6DS3TR_C_POWER` high inside an `#ifdef` (the XIAO Sense IMU has a dedicated power pin; if it stays low `begin()` fails even with I2C wired correctly). If the macro is missing from the installed core, that guard compiles it away and the pin is never driven — check the variant header.
-2. **The sketch has never been compiled by an agent.** No `arduino-cli` on this machine. It has since been flashed successfully by hand, so this is largely moot — but no automated check exists.
+2. **`arduino-cli` is now installed and all sketches compile clean** (the
+   range test in both roles).
+   Toolchain: `arduino-cli` 1.5.1 (Homebrew), cores `Seeeduino:mbed` 2.9.3 and
+   `Seeeduino:nrf52` 1.1.13, libs `ArduinoBLE` 2.1.0, `Adafruit GFX` /
+   `Adafruit ST7735`, plus the vendored `Seeed_Arduino_LSM6DS3`. `I2C_Scanner`,
+   `Reaction_HardwareTest`, `Xbee_Passthrough` and `Xbee_RangeTest` each have a
+   `sketch.yaml` pinning `default_fqbn: Seeeduino:mbed:xiaonRF52840Sense`, so a
+   bare `arduino-cli compile` works from the sketch dir; `AccelStream` and
+   `SerialEchoTest` (added 2026-09-04) do not have one yet. The first two also
+   pin `default_port: /dev/cu.usbmodem101`; the two XBee sketches deliberately
+   do **not**, because the range test uses two identical boards at once and a
+   pinned port would be wrong for one of them — pass `-p` (see `arduino-cli
+   board list`). **The FQBN matters:** ArduinoBLE fails to link on the `Seeeduino:nrf52`
+   (Adafruit) core with `undefined reference to HCITransport` — it must be built
+   with the `mbed` core. A XIAO nRF52840 Sense is currently attached at
+   `/dev/cu.usbmodem101`, so upload and serial capture are available too.
 3. **Act on the firmware changes** the evaluation calls for (ODR, detector, audio-latency calibration) — listed under *What the evaluation implies for the firmware*.
 4. **Resolve the board question.** The system diagram shows an **ESP32-WROOM-32U with an external IMU**; the README's "Hardware direction under evaluation" note right below it argues for the **Arduino Nano 33 IoT** precisely because it avoids an external IMU. One of the two is stale. Nothing else can be finalised until this is settled.
 5. **Verify the CSV export on iPad.** It works on iPhone (the capture in `playground_IMU/` came out of it). On iPad the share sheet is a popover needing an anchor rect; `_export` in `live_data_screen.dart` derives one from the summary card's `RenderBox`, still unexercised. "Save to Files" is the save-to-device path.
@@ -738,6 +762,52 @@ mounted where it will actually live.
 
 The photo-finish clock-synchronization figures in `playground_IMU/README.md`
 are estimates from known BLE/WiFi behaviour, **not measured on this hardware**.
+
+## XBee link range test
+
+The start box <-> finish box link is **XBee / XBee-PRO S2C** (`XB24CZ7PIT-004`,
+2.4 GHz Zigbee, PCB antenna). Tooling to validate its range is in place; the
+walk test itself has **not been run** (no XBee hardware attached when this was
+written, and the sketch has been compile-checked only, per convention 2).
+
+- `Arduino/Xbee_Passthrough/Xbee_Passthrough.ino` — flash this **first**. Our
+  adapter (Parallax 32403) has no USB chip, so XCTU cannot reach the module;
+  this sketch bridges USB <-> `Serial1` verbatim so the XIAO *is* the serial
+  adapter. Configure the modules one at a time, then reflash the range test.
+- `Arduino/Xbee_RangeTest/Xbee_RangeTest.ino` — one sketch, two roles chosen by
+  the `RANGE_TEST_ROLE` `#define` at the top (override it with
+  `--build-property "compiler.cpp.extra_flags=-DRANGE_TEST_ROLE=1"` for the
+  receiver rather than editing the file between boards; arduino-cli 1.5.1
+  ignores `build_properties` inside a `sketch.yaml` profile, so profiles are
+  not an option here). The link runs at **115200 (`BD=7`)**, not the 9600
+  factory default: one ping is four UART transactions, ~135 ms at 9600, which
+  exceeds the 100 ms ping period and would measure the UART rather than the
+  radio. Set `BD` on both modules *before* changing `XBEE_BAUD`.
+  SENDER pings at 10 Hz; RECEIVER
+  echoes each ping and queries `ATDB` for RSSI. **API mode** (`AP=1`,
+  unescaped), because that is the only way to get the `0x8B` transmit-status
+  frame (delivery result + MAC retry count) and per-node RSSI. Production
+  `Prostart_*` firmware still uses transparent mode — this does not change that.
+  Peer discovery is automatic: the first pings go out broadcast, the SENDER
+  latches the RECEIVER's 64-bit address from the first echo, then unicasts.
+- USB-serial output is one CSV row per packet (`S,...` / `R,...`); `#` lines
+  are diagnostics. `'r'` resets the on-board counters at each new distance,
+  `'t'` prints a summary.
+- `Tools/xbee_range_log.py` — tether either board, transcribes rows to
+  `Data/xbee_range_*.csv` with a host timestamp and a distance tag you set with
+  `d <metres>` (which also resets the board). Live PDR/RSSI/RTT readout.
+- `Tools/xbee_range_plot.py` — PDR / RSSI / RTT vs distance, plus the max
+  distance meeting the criterion and, if short of 200 m, which upgrade that
+  implies.
+- Full method, XCTU parameters, wiring and the results table:
+  `playground_xbee/README.md`.
+
+Pass criterion: PDR >= 95% at the target distance (retries/ACK allowed). Log
+the full RTT distribution and retry count per point, not just PDR — rising
+min-RTT / jitter is the leading indicator for clock-sync degradation, which
+matters more than raw PDR here since reaction time comes from synced on-device
+clocks, not radio latency. "Doesn't clear 200 m" is a valid result that names
+the needed upgrade (wire-whip antenna, then XBee-PRO), not a blocked task.
 
 ## Conventions
 

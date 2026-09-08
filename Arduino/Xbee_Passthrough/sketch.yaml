@@ -1,0 +1,5 @@
+default_fqbn: Seeeduino:mbed:xiaonRF52840Sense
+# No default_port on purpose: it differs per machine, and this project has two
+# identical boards, so a hardcoded port would be wrong for at least one of them.
+# Pass it explicitly:  arduino-cli upload -p /dev/cu.usbmodemXXXX Arduino/Xbee_Passthrough
+# (`arduino-cli board list` prints the ports that are actually present.)

@@ -193,13 +193,54 @@ install` afterward. Full story in `HANDOFF.md`.
 
 ---
 
-## 4. What's not buildable yet
+## 4. XBee link range test — `Arduino/Xbee_RangeTest/`, `Arduino/Xbee_Passthrough/`
 
-- The **Zigbee firmware** for the start↔finish link, and the finish unit's
-  **BLE bridge** to the phone (both described in the root `README.md`) are
-  not implemented. They'll likely need Nordic's own nRF Connect SDK / Zephyr
-  for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain
-  Arduino IDE toolchain used for `AccelStream.ino` above. Tracked on the
+Bring-up/characterisation tooling for the start↔finish hop, using **external
+Digi XBee S2C modules** on the XIAO's `Serial1` (D6/D7). Plain Arduino
+toolchain — same core and CLI as section 1, no Nordic SDK involved. **Compile-
+checked in both roles; not yet run on hardware.**
+
+Extra hardware: 2 × XBee S2C (`XB24CZ7PIT-004`), a 2 mm breakout (ours is a
+passive Parallax 32403), and Digi **XCTU** for module configuration.
+
+**Build & upload** — `Xbee_RangeTest` needs a *different* role per board, so
+don't hand-edit the `.ino` between them:
+```bash
+arduino-cli compile -u -p <sender-port> Arduino/Xbee_RangeTest
+arduino-cli compile -u -p <receiver-port> \
+  --build-property "compiler.cpp.extra_flags=-DRANGE_TEST_ROLE=1" \
+  Arduino/Xbee_RangeTest
+```
+Confirm each board's `# role:` boot banner before walking away from the start
+line. `Xbee_Passthrough` builds plainly (`arduino-cli compile -u -p <port>
+Arduino/Xbee_Passthrough`) and exists only so XCTU can reach a module through
+the XIAO — our breakout has no USB chip of its own.
+
+**Host tools** (`pyserial`, plus `numpy`/`matplotlib` from section 2):
+```bash
+python3 Tools/xbee_range_log.py --distance 0        # walk-test logger -> Data/
+python3 Tools/xbee_range_plot.py Data/xbee_range_*.csv
+```
+
+Full method, XCTU parameters (note `BD=7`, not the 9600 default), wiring and
+the results table: `playground_xbee/README.md`.
+
+---
+
+## 5. What's not buildable yet
+
+- The **finish unit's BLE bridge** to the phone (described in the root
+  `README.md`) is not implemented.
+- **How the start↔finish Zigbee hop is actually built is still open**, and the
+  two answers need different toolchains:
+  - **External XBee modules over UART** — what section 4 above builds today.
+    Plain Arduino; the radio stack lives on the XBee, not on the nRF52840.
+  - **The nRF52840's own 802.15.4 radio** — no extra module, but it would
+    likely need Nordic's nRF Connect SDK / Zephyr rather than the Arduino
+    toolchain used everywhere else here.
+
+  The range test in section 4 measures the first option. Nothing has been
+  decided between them yet — tracked on the
   [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
 - `Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`,
   `tools/kinestart_live.py`, and `playground_IMU/` were all deleted on

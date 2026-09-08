@@ -174,14 +174,19 @@ Reaction-Time-System/
 │   ├── SerialEchoTest/          # minimal hardware/cable sanity check
 │   ├── I2C_Scanner/             # I2C bus debug sketch
 │   ├── Reaction_HardwareTest/   # TFT/buzzer/XBee hardware bring-up test
+│   ├── Xbee_Passthrough/        # USB<->Serial1 bridge: makes the XIAO XCTU's serial adapter
+│   ├── Xbee_RangeTest/          # start<->finish link range & reliability test (API mode)
 │   └── libraries/               # vendored board libraries (Seeed LSM6DS3)
 ├── Flutter App/
 │   └── prostart/                # Flutter companion app
 ├── Tools/                       # Python capture/analysis scripts
 │   ├── accel_live.py            # live view + record, pairs with AccelStream.ino
-│   └── csv_plot.py              # offline CSV viewer
+│   ├── csv_plot.py              # offline CSV viewer
+│   ├── xbee_range_log.py        # walk-test logger for Xbee_RangeTest
+│   └── xbee_range_plot.py       # PDR / RSSI / RTT vs distance
 ├── Data/                        # recorded CSV captures and their plots
 ├── Docs/                        # diagrams and figures
+├── playground_xbee/             # XBee range-test method + findings
 ├── BUILD.md                     # exact versions and how to run every component
 ├── HANDOFF.md                   # working notes for an agent picking this up
 └── README.md
@@ -196,6 +201,11 @@ Reaction-Time-System/
 2. Add your board's package URL under **Preferences → Additional Board Manager URLs**
 3. Install the board package via **Tools → Board → Boards Manager**
 4. Open a sketch from `Arduino/`, select the correct board & port, and **Upload**
+
+### Radios
+2 × XBee / XBee-PRO **S2C** (`XB24CZ7PIT-004`, 2.4 GHz Zigbee, PCB antenna). In Digi **XCTU**, flash the **XB24C (Z7) — Zigbee** firmware (*not* XBee3): one module as *Coordinator API*, the other as *Router API*. Both need the same `ID` (PAN ID) and `AP=1`, and `BD=7` (115200) to match the firmware's `XBEE_BAUD` — the 9600 default is too slow for the range test, where one ping costs four UART transactions. Set `BD=7` on **both** modules first, *then* change `XBEE_BAUD` and reflash; the other order leaves a 115200 board talking to a 9600 module. XBee is 3.3 V — wired straight to the XIAO (`DOUT→D7`, `DIN→D6`), no level shifter.
+
+Our XBee adapter (Parallax 32403) is a passive breakout with no USB chip, so XCTU cannot see the module directly: flash `Arduino/Xbee_Passthrough/` to a XIAO to use it as the USB-to-serial adapter, configure one module at a time, then reflash. `Arduino/Xbee_RangeTest/` uses API mode to collect delivery-status and RSSI for the range test — full method in [`playground_xbee/`](./playground_xbee/).
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)
@@ -212,7 +222,7 @@ What we're actually seeing right now, not a wishlist:
 
 - ❌ **Wi-Fi as the primary phone link is out.** Ruled out on UX grounds (see [How the System Works](#️-how-the-system-works)) — a direct SoftAP link to the phone is not being pursued. WiFi Direct (SoftAP) still exists as a narrower fallback purely for the start↔finish hop, only if Zigbee proves unreliable there.
 - 📏 **BLE range measured at ~25 m max**, confirmed in real testing — this is what forced the two-hop Zigbee + BLE design instead of a single BLE link end-to-end.
-- 🔄 **Zigbee start↔finish link — in progress.** We're now building and testing the two-XIAO link; the open question is whether the two boards' independent clocks can be synchronized tightly enough over Zigbee for reaction-time-grade precision. Not yet validated.
+- 🔄 **Zigbee start↔finish link — in progress.** We're now building and testing the two-XIAO link; the open question is whether the two boards' independent clocks can be synchronized tightly enough over Zigbee for reaction-time-grade precision. Not yet validated. Range/reliability tooling is in place and compile-checked but **not yet run on hardware** — `Arduino/Xbee_RangeTest/` + `Tools/xbee_range_*.py`, method and results table in [`playground_xbee/`](./playground_xbee/).
 - 🔊 **Speaker audibility** on an active, noisy track, at range.
 - 🔋 **Battery life** under real, extended use, for both units.
 - 🛠️ **Firmware reliability.** An earlier firmware combining BLE, a hardware FIFO, and a software PLL for timestamping turned out to hang or crash-loop unpredictably on two separate boards; the root cause was never isolated, so it was replaced with a deliberately minimal, no-BLE accelerometer firmware (`Arduino/AccelStream/AccelStream.ino`) that's now verified working on real hardware. Full write-up in `HANDOFF.md`. The lesson for the Zigbee work ahead: add complexity one piece at a time, testing after each addition, rather than integrating everything at once.
