@@ -110,8 +110,23 @@ static_assert(ACCEL_ODR_HZ == 13 || ACCEL_ODR_HZ == 26 || ACCEL_ODR_HZ == 52 ||
 static const uint32_t SAMPLE_PERIOD_US = 1000000UL / ACCEL_ODR_HZ;
 
 // The IMU's data-ready line has to reach a GPIO for any of this to work.
+//
+// Which header carries that pin number depends on the core, not on the board:
+// Seeeduino:nrf52 (1.1.13) pulls it in through Arduino.h/variant.h, so the
+// macro is already visible here, while Seeeduino:mbed (2.9.3 - the "No
+// Updates" board entries) puts it in a pins_arduino.h that Arduino.h does not
+// include for us. Same board, same pin 18 - just not declared yet. So pull it
+// in when it is missing rather than rejecting a perfectly capable board.
+// Note this also governs PIN_LSM6DS3TR_C_POWER used in setup(): without it
+// the IMU is never powered up and begin() fails on that core.
+#if !defined(PIN_LSM6DS3TR_C_INT1) && defined(__has_include)
+#if __has_include("pins_arduino.h")
+#include "pins_arduino.h"
+#endif
+#endif
+
 #ifndef PIN_LSM6DS3TR_C_INT1
-#error "AccelStream needs the IMU data-ready line on a GPIO (PIN_LSM6DS3TR_C_INT1) - select a XIAO nRF52840 Sense board."
+#error "AccelStream needs the IMU's data-ready line (PIN_LSM6DS3TR_C_INT1). Select a XIAO nRF52840 *Sense* - the plain XIAO has no onboard IMU - or define the pin by hand if you wired an external one."
 #endif
 
 // DRDY is level-latched: it goes high when a sample is ready and only drops
