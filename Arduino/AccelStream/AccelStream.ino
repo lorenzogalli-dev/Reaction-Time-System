@@ -220,7 +220,12 @@ static const uint32_t TAIL_AFTER_GO_MS = 1000;
 #define D1 1
 #endif
 static const int BUTTON_PIN = D0;   // momentary button to GND, INPUT_PULLUP
-static const int BUZZER_PIN = D1;   // ACTIVE buzzer (+); (-) to GND
+// PASSIVE buzzer, driven with tone()/noTone() - no internal oscillator, so a
+// steady digitalWrite() level (what this used to be) produces at most one
+// click and then silence. tone()'s latency and its effect on sample timing
+// are UNVERIFIED on this core - see the comment on beep() below.
+static const int BUZZER_PIN = D1;   // (+) here; (-) to GND
+static const unsigned int BEEP_FREQ_HZ = 3000;
 
 static const uint32_t BUTTON_DEBOUNCE_MS = 30;
 static const uint32_t BEEP_MS = 100;
@@ -229,7 +234,7 @@ static const uint32_t BEEP_MS = 100;
 // is that an anticipated "go" is exactly what a reaction time must not
 // measure. Arduino's random(a, b) is inclusive of a, exclusive of b.
 static const long MARKS_DELAY_MIN_MS = 2000,  MARKS_DELAY_MAX_MS = 3001;
-static const long SET_DELAY_MIN_MS   = 20000, SET_DELAY_MAX_MS   = 25001;
+static const long SET_DELAY_MIN_MS   = 10000, SET_DELAY_MAX_MS   = 15001;
 // set -> go raised from 1-2 s to 2.2-3 s on 2026-09-08. An athlete needs about
 // a second to rise into the set position after the command, and that rise is a
 // real movement of several hundred mg. At 1-2 s the "go" could fire while they
@@ -527,14 +532,20 @@ static void serviceSampling() {
 }
 
 // Drives the buzzer and stamps the marker in one place. The timestamp is
-// taken immediately AFTER the pin goes high, so it marks the electrical
-// instant the transducer was driven. What separates that from the first
-// pressure wave reaching the athlete is the buzzer's own latency: 5-20 ms,
-// but constant and one-directional, so it is a calibration constant rather
-// than an error. Measure it once (GPIO + microphone on one time base) and
-// subtract it; re-measure only if the buzzer changes.
+// taken immediately AFTER tone() starts the drive signal, so it marks the
+// electrical instant the transducer was driven. What separates that from the
+// first pressure wave reaching the athlete is the buzzer's own latency - for
+// an active buzzer this was a fixed 5-20 ms acoustic startup, constant and
+// one-directional, hence a calibration constant rather than an error. With
+// tone() driving a passive buzzer, that number has NOT been remeasured, and
+// tone()'s own call latency and its effect on the DRDY-interrupt sample
+// timing are UNVERIFIED on this core - check verify_rate.py / CLOCKSTEP /
+// DROPPED across a real beep before trusting a reaction time from this build.
+// Measure the acoustic latency the same way as before (GPIO + microphone on
+// one time base) and subtract it; re-measure if the buzzer or BEEP_FREQ_HZ
+// changes.
 static void beep(uint32_t* markerOut, bool* capturedOut) {
-  digitalWrite(BUZZER_PIN, HIGH);
+  tone(BUZZER_PIN, BEEP_FREQ_HZ);
   uint32_t t = micros();
   buzzerOn = true;
   buzzerOffUs = t + BEEP_MS * 1000UL;
@@ -549,7 +560,7 @@ static void beep(uint32_t* markerOut, bool* capturedOut) {
 // a micros() deadline checked from loop(), never a delay.
 static void serviceBuzzer() {
   if (buzzerOn && (int32_t)(micros() - buzzerOffUs) >= 0) {
-    digitalWrite(BUZZER_PIN, LOW);
+    noTone(BUZZER_PIN);
     buzzerOn = false;
   }
 }
@@ -575,7 +586,7 @@ static void startSequence() {
 static void abortSequence(const char* why) {
   if (seqState == SEQ_IDLE) return;
   seqState = SEQ_IDLE;
-  digitalWrite(BUZZER_PIN, LOW);
+  noTone(BUZZER_PIN);
   buzzerOn = false;
   Serial.print("SEQ,abort,");
   Serial.println(why);

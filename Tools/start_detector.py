@@ -591,8 +591,37 @@ def run_gui(initial=None):
             paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
             paned.pack(fill=tk.BOTH, expand=True)
 
-            left = ttk.Frame(paned, padding=8)
-            paned.add(left, weight=0)
+            # The left panel's content (14 parameter rows + a 10-row table) can
+            # exceed the window's height depending on screen size/DPI scaling,
+            # and a plain packed Frame has no scrolling - content past the
+            # bottom was silently clipped, with no way to reach it. Wrap it in
+            # a Canvas+Scrollbar instead.
+            left_outer = ttk.Frame(paned)
+            paned.add(left_outer, weight=0)
+
+            left_canvas = tk.Canvas(left_outer, highlightthickness=0)
+            left_vsb = ttk.Scrollbar(left_outer, orient=tk.VERTICAL, command=left_canvas.yview)
+            left_canvas.configure(yscrollcommand=left_vsb.set)
+            left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            left_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+            left = ttk.Frame(left_canvas, padding=8)
+            left_win = left_canvas.create_window((0, 0), window=left, anchor="nw")
+            left.bind("<Configure>",
+                      lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+            left_canvas.bind("<Configure>",
+                              lambda e: left_canvas.itemconfig(left_win, width=e.width))
+
+            # Mouse wheel scrolls the left panel only while the cursor is over
+            # it, so it doesn't hijack scroll events meant for the plot on the
+            # right. macOS reports small per-notch deltas (unlike Windows'
+            # multiples of 120), so no /120 scaling here.
+            def _on_mousewheel(event):
+                left_canvas.yview_scroll(int(-1 * event.delta), "units")
+            left_canvas.bind("<Enter>",
+                              lambda e: left_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+            left_canvas.bind("<Leave>",
+                              lambda e: left_canvas.unbind_all("<MouseWheel>"))
 
             box_file = ttk.LabelFrame(left, text="Capture", padding=8)
             box_file.pack(fill=tk.X, pady=(0, 6))
