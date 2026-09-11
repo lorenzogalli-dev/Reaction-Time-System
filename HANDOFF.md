@@ -1,7 +1,151 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-08 (evening). Written for an agent starting with no prior context.
+Last updated: 2026-09-11. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-09-11: the beep was too quiet to use, and that was a measurement bug, not a comfort one
+
+The system was about to go to the track with a beep that could barely be heard.
+Fixing it turned out to be free — no new parts — and the reason it mattered is
+not the one it looks like.
+
+### It is a piezo at 4 kHz, and the firmware was driving it at 3 kHz
+
+`Arduino/BuzzerSweep/BuzzerSweep.ino` was written to stop guessing: no IMU, no
+sequence, a square wave from a busy-loop (so what you hear is the part and not
+the driver), sweeping 1.5-6.0 kHz in 100 Hz steps. Measured on the bench:
+
+| | |
+|---|---|
+| loudest | **4000 Hz**, clearly; weaker secondary modes at 1600 and 4700 |
+| nRF52840 high drive (5 mA vs 0.5 mA) | **no audible change** |
+
+The second row is the diagnosis, not a footnote. A magnetic buzzer is a ~16 ohm
+coil and is current-driven, so raising the pad's drive strength would have been
+plainly audible. Nothing happened, so the part is a **piezo**: capacitive,
+voltage-driven, and — being a high-Q resonator — enormously sensitive to being
+driven off its resonance. `BEEP_FREQ_HZ` was 3000, which is not a measurement,
+it is a round number. That alone was most of the missing volume.
+
+**If the buzzer is ever replaced, re-run the sweep.** Resonance is a property of
+the part, and a Q of ~20 makes the peak only a couple of hundred Hz wide.
+
+### Antiphase drive: +6 dB for one GPIO and no components
+
+The second half of the fix. The element used to see 3.3 Vpp (one pin against
+GND). Driving both terminals in opposite phase gives it 6.6 Vpp.
+
+**This is safe *because* it is a piezo.** A piezo is a capacitor and passes no
+DC, so neither pad ever sources steady current. Do **not** wire a magnetic
+buzzer this way — it would double a current the pad already cannot supply.
+
+```
+WIRING, current:   buzzer (+) -> D1      buzzer (-) -> D2
+                   there is NO connection to GND
+```
+
+This supersedes the v4 wiring table below, which says active buzzer, `(-)` to
+GND. Both halves of that are now wrong.
+
+### tone() had to go, and the reasons are about timing, not volume
+
+`tone()` drives one pin, so it cannot do antiphase — but that is the least of
+it. The mbed core's implementation (`cores/arduino/Tone.cpp`) is wrong for this
+application in two further ways, both of which land on the single instant the
+whole measurement is referenced to:
+
+- It does `new Tone` **and** `new DigitalOut` on every call — a heap allocation
+  at the exact microsecond that defines the reaction time's zero. `malloc` is
+  not constant-time, and on a fragmented heap it is not even bounded.
+- It leaks. `Tone::stop()` sets its `DigitalOut*` to null instead of deleting
+  it, so the destructor then deletes a null pointer and the object is lost.
+  Three beeps per run, forever, on a board with ~70 KB free.
+
+Replaced with the nRF52840's **PWM peripheral** (PWM2 — the mbed core hands out
+instances from 0 upwards for `analogWrite`/`PwmOut`, so taking the far end
+costs nothing and keeps it clear). Two channels, same compare value, opposite
+polarity bit, which is exact antiphase. Starting it is two register writes, the
+first edge follows within one 16 MHz tick, and it then runs from its own
+hardware with **no CPU and no interrupts** — which matters because the `go`
+beep overlaps the 100 ms in which the push-off is being sampled, and a software
+ticker would have been firing 8000 times a second right through it.
+
+RAM after the change: **69% (166 064 used, 71 504 free)** — unchanged from v4.
+
+### The part that matters more than the error budget
+
+A louder stimulus does not merely reduce measurement error — it changes the
+quantity being measured. Human reaction time falls with stimulus intensity
+(Piéron's law), and for auditory stimuli the difference between near-threshold
+and clearly audible is **tens of milliseconds**, with much more variance too.
+
+With the old beep, a field session would have produced reaction times that were
+inflated and unstable for a reason having nothing to do with the electronics,
+and **nothing in the data would have shown it**. That is the same failure shape
+as the `micros()` resolution bug of 2026-09-08: confident, physically sensible,
+wrong numbers. Worth remembering when judging whether a "cosmetic" complaint is
+cosmetic.
+
+### Error budget now
+
+The detection side is untouched and still ~1-2 ms. What changed is that two
+*unquantified* risks were removed — `tone()`'s allocation jitter and the
+ticker's interrupt load in the measurement window — rather than any measured
+term getting smaller.
+
+**The acoustic latency remains the dominant term and is still unmeasured**, but
+it is no longer the number the older sections quote. A piezo at resonance rings
+up over roughly Q/π cycles; at 4 kHz that is on the order of 1-2 ms, plausibly
+*better* than the 5-20 ms assumed for an active buzzer. Plausibly. Not measured.
+
+**The cheapest way to close it needs nothing new:** the IMU is on the same
+breadboard as the buzzer, so the buzzer's mechanical onset reaches the
+accelerometer stamped with the *same* `micros()` that stamps the beep — which
+removes the cross-clock sync problem that made this measurement awkward in the
+first place. Run a sequence with the board still and untouched, then measure
+`go` to the start of the vibration. At 833 Hz that resolves to ~1.2 ms, ample to
+tell 2 ms from 20 ms. Only the air path is left over, and that is 2.9 ms/m
+computed from geometry rather than measured.
+
+### Also fixed today
+
+- `SET_DELAY` (`on your marks` -> `set`) is back to **20-25 s**, the original v4
+  value. It had been shortened to 10-15 s on 09-09 to make bench iteration less
+  tedious. It costs nothing: the sample ring fills continuously in every state,
+  and the dump window is measured backwards from `set`.
+- The **button was miswired**, not broken. A 4-pin tactile switch has its pins
+  paired internally, so it must straddle the breadboard's centre channel or its
+  two node rows are permanently shorted. This is documented in the v4 section
+  below and it still happened. A temporary `k` command that printed D0's raw
+  level separated "wiring" from "firmware" in under a minute; it has been
+  removed, but that is the shape of the fix to reach for again.
+
+### Untested on hardware, and hardening for the field
+
+The three-beep sequence has been exercised; **no reaction time has been taken
+through the new drive**. Also note the whole build is still on a breadboard, and
+a friction contact is what failed today. Before the track, either solder the
+four connections (D1, D2, D0, GND) onto perfboard or strain-relieve each wire
+with hot glue. Do not use tape as a *mount*: it creeps under load, which changes
+the mechanical compliance the accelerometer sees, so a calibration taken today
+would not survive to the next session. And never cover the buzzer's sound hole.
+
+---
+
+## The gap: 2026-09-09, never written up
+
+This file jumped from the evening of 09-08 to today. The session in between is
+recorded only in commits `78b89dc`, `a3c5e04` and `6032f19`:
+
+- The buzzer was found to be **passive**, not active, and `beep()` moved from
+  `digitalWrite` to `tone()` at 3000 Hz. That is what today's section replaces.
+- `SET_DELAY` shortened 20-25 s -> 10-15 s (reverted today).
+- `start_detector.py`'s left parameter panel became scrollable
+  (Canvas + Scrollbar) instead of being clipped.
+- 19 captures from 09-09 were added and the 09-08 ones removed. **None of those
+  captures has been analysed**, and they were all taken through the 3 kHz
+  off-resonance beep, so any reaction time in them carries an unknown stimulus
+  intensity.
 
 ## READ THIS FIRST — 2026-09-08 (evening): firmware v4, the board now runs the start
 
@@ -91,9 +235,13 @@ can interleave with a run or with the dump that follows it.
 
 ### Wiring — required reading before anything is soldered
 
+> **SUPERSEDED 2026-09-11 for the buzzer** — the part is a passive piezo, it is
+> driven antiphase from **D1 and D2** with no GND connection, and it must not be
+> an active one. See the top section. The button row below is still correct.
+
 | Part | Wiring |
 |---|---|
-| **Active** buzzer (has its own oscillator) | `+` → **D1**, `−` → **GND** |
+| ~~**Active** buzzer (has its own oscillator)~~ | ~~`+` → **D1**, `−` → **GND**~~ |
 | Momentary button | one leg → **D0**, the **diagonally opposite** leg → **GND** |
 
 No resistors: `D0` is `INPUT_PULLUP` and the button pulls it to ground. On a
@@ -101,10 +249,11 @@ No resistors: `D0` is `INPUT_PULLUP` and the button pulls it to ground. On a
 side are a permanently closed circuit — take them diagonally opposite. D0/D1 are
 clear of the IMU's I2C and of the UART on D6/D7.
 
-**The buzzer must be an active one.** A passive buzzer needs a driven waveform
-(`tone()`/PWM), which puts an unmeasured delay on the very instant that defines
-the reaction time's zero — and `tone()`'s behaviour on the mbed core is one more
-thing that would need verifying.
+~~**The buzzer must be an active one.**~~ **Wrong, and resolved on 2026-09-11.**
+The part on the bench is passive, and it is now driven by the PWM peripheral
+rather than `tone()` — which is deterministic, costs no interrupts, and allows
+the antiphase drive. The worry the original sentence expressed was right; the
+conclusion it drew from it was not. See the top section.
 
 **Everything works with neither part attached.** Send `b` instead of pressing
 the button; `D0` reads a stable HIGH through its pull-up and never triggers

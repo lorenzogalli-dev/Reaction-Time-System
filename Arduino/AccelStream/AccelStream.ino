@@ -220,12 +220,35 @@ static const uint32_t TAIL_AFTER_GO_MS = 1000;
 #define D1 1
 #endif
 static const int BUTTON_PIN = D0;   // momentary button to GND, INPUT_PULLUP
-// PASSIVE buzzer, driven with tone()/noTone() - no internal oscillator, so a
-// steady digitalWrite() level (what this used to be) produces at most one
-// click and then silence. tone()'s latency and its effect on sample timing
-// are UNVERIFIED on this core - see the comment on beep() below.
-static const int BUZZER_PIN = D1;   // (+) here; (-) to GND
-static const unsigned int BEEP_FREQ_HZ = 3000;
+// PASSIVE PIEZO buzzer, driven ANTIPHASE from two pins by the nRF52840's PWM
+// peripheral. Both halves of that sentence are deliberate:
+//
+//   passive  - no internal oscillator, so a steady digitalWrite() level (what
+//              this used to be) produces one click and then silence.
+//   antiphase - the two pins swing in opposite directions, so the element sees
+//              6.6 Vpp instead of the 3.3 Vpp a single pin against GND can
+//              give it. That is +6 dB for the cost of one GPIO and no
+//              components, and it is safe *because* the part is a piezo: a
+//              piezo is a capacitor and passes no DC, so neither pad ever
+//              sources steady current. Do NOT wire a magnetic buzzer (a
+//              ~16 ohm coil) this way - it would double a current the pad
+//              already cannot supply.
+//   PWM      - not tone(). See beep() for why that matters to the measurement.
+//
+// WIRING: buzzer (+) -> D1, buzzer (-) -> D2. There is no connection to GND.
+static const int BUZZER_PIN   = D1;   // (+)
+static const int BUZZER_PIN_B = D2;   // (-)  - antiphase, NOT ground
+// 4000 Hz is this buzzer's measured resonance, not a round number. A frequency
+// sweep on 2026-09-11 (Arduino/BuzzerSweep) found a clear peak at 4000 Hz with
+// weaker secondary modes at 1600 and 4700; the previous 3000 Hz sat off the
+// peak, which is most of why the beep was too quiet to use at the track. The
+// same sweep identified the part as a PIEZO - toggling the nRF52840 pad to
+// high drive (5 mA) changed the level not at all, so it is voltage-driven and
+// capacitive, not a current-driven magnetic coil.
+//
+// Re-run the sweep if the buzzer is ever replaced: resonance is a property of
+// the part, and a Q of ~20 makes the peak only a couple of hundred Hz wide.
+static const unsigned int BEEP_FREQ_HZ = 4000;
 
 static const uint32_t BUTTON_DEBOUNCE_MS = 30;
 static const uint32_t BEEP_MS = 100;
@@ -234,7 +257,13 @@ static const uint32_t BEEP_MS = 100;
 // is that an anticipated "go" is exactly what a reaction time must not
 // measure. Arduino's random(a, b) is inclusive of a, exclusive of b.
 static const long MARKS_DELAY_MIN_MS = 2000,  MARKS_DELAY_MAX_MS = 3001;
-static const long SET_DELAY_MIN_MS   = 10000, SET_DELAY_MAX_MS   = 15001;
+// Back to 20-25 s on 2026-09-11, the original v4 value (it had been shortened
+// to 10-15 s to make bench iteration less tedious). This is the realistic
+// "on your marks" hold, and it costs nothing: the sample ring fills
+// continuously in every state, so a pause that overwrites it several times
+// over is expected - the dump window is measured backwards from "set", not
+// forwards from here.
+static const long SET_DELAY_MIN_MS   = 20000, SET_DELAY_MAX_MS   = 25001;
 // set -> go raised from 1-2 s to 2.2-3 s on 2026-09-08. An athlete needs about
 // a second to rise into the set position after the command, and that rise is a
 // real movement of several hundred mg. At 1-2 s the "go" could fire while they
@@ -334,7 +363,10 @@ void setup() {
   while (!Serial && millis() - waitStart < 3000) delay(10);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN_B, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN_B, LOW);
+  buzzerInit();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef PIN_LSM6DS3TR_C_POWER
@@ -394,8 +426,13 @@ void setup() {
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
   Serial.print("Start sequence: press the button on D");
   Serial.print(BUTTON_PIN);
-  Serial.print(" (or send 'b'); buzzer on D");
-  Serial.println(BUZZER_PIN);
+  Serial.print(" (or send 'b'); buzzer antiphase on D");
+  Serial.print(BUZZER_PIN);
+  Serial.print("/D");
+  Serial.print(BUZZER_PIN_B);
+  Serial.print(" at ");
+  Serial.print(BEEP_FREQ_HZ);
+  Serial.println(" Hz");
   Serial.println("  button -> 2-3s -> MARKS -> 20-25s -> SET -> 2.2-3s -> GO -> 1s -> dump");
   Serial.println("  'a' or a second press aborts. 'd' dumps the ring as-is.");
 }
@@ -531,21 +568,110 @@ static void serviceSampling() {
   }
 }
 
+// --- buzzer drive ----------------------------------------------------------
+//
+// Two complementary square waves from the PWM peripheral, replacing tone().
+// tone() was wrong here for three separate reasons, all of which land on the
+// one instant the whole measurement is referenced to:
+//
+//  1. It drives ONE pin, so it cannot do the antiphase that buys the +6 dB.
+//  2. The mbed core's tone() does `new Tone` and `new DigitalOut` on every
+//     call - a heap allocation at the exact microsecond that defines the
+//     reaction time's zero. malloc is not constant-time, and on a fragmented
+//     heap it is not even bounded.
+//  3. That same implementation leaks: Tone::stop() nulls its DigitalOut*
+//     instead of deleting it, so every beep loses the object. Three beeps a
+//     run, forever, on a board with ~70 KB free.
+//
+// The PWM peripheral has none of these. Starting it is two register writes,
+// the first edge follows within one 16 MHz tick, and it then runs from its own
+// hardware with no CPU and no interrupts - which matters because the "go" beep
+// overlaps the 100 ms in which the athlete's push-off is being sampled, and a
+// software ticker would be firing 8000 times a second right through it.
+//
+// PWM2 is used rather than PWM0 because the mbed core hands out PWM instances
+// from 0 upwards for analogWrite()/PwmOut. This sketch calls neither today,
+// but taking the far end of the range costs nothing and keeps it that way.
+static uint16_t buzzerPwmSeq[4];   // read by EasyDMA: must be RAM, must persist
+static NRF_PWM_Type* const BUZZER_PWM = NRF_PWM2;
+
+static void buzzerInit() {
+  // COUNTERTOP at the 16 MHz prescaler; 4000 Hz -> 4000 counts, well inside
+  // the 15-bit field. A 50% duty is COUNTERTOP/2.
+  const uint16_t half = (uint16_t)((16000000UL / BEEP_FREQ_HZ) / 2);
+
+  // Bit 15 of a sequence value is the channel's polarity: 0 means the output
+  // starts the period HIGH and falls at the compare, 1 means it starts LOW and
+  // rises there. Same compare, opposite polarity = exact antiphase.
+  buzzerPwmSeq[0] = half;             // D1
+  buzzerPwmSeq[1] = half | 0x8000u;   // D2, inverted
+  buzzerPwmSeq[2] = 0;                // channels 2 and 3 are unconnected, but
+  buzzerPwmSeq[3] = 0;                // Individual load still consumes 4 words
+
+  BUZZER_PWM->PSEL.OUT[0] = (uint32_t)digitalPinToPinName(BUZZER_PIN);
+  BUZZER_PWM->PSEL.OUT[1] = (uint32_t)digitalPinToPinName(BUZZER_PIN_B);
+  BUZZER_PWM->PSEL.OUT[2] = 0xFFFFFFFFUL;   // CONNECT = Disconnected
+  BUZZER_PWM->PSEL.OUT[3] = 0xFFFFFFFFUL;
+
+  BUZZER_PWM->MODE       = PWM_MODE_UPDOWN_Up;
+  BUZZER_PWM->PRESCALER  = PWM_PRESCALER_PRESCALER_DIV_1;
+  BUZZER_PWM->COUNTERTOP = 16000000UL / BEEP_FREQ_HZ;
+  BUZZER_PWM->DECODER    = (PWM_DECODER_LOAD_Individual    << PWM_DECODER_LOAD_Pos) |
+                           (PWM_DECODER_MODE_RefreshCount  << PWM_DECODER_MODE_Pos);
+
+  BUZZER_PWM->SEQ[0].PTR      = (uint32_t)buzzerPwmSeq;
+  BUZZER_PWM->SEQ[0].CNT      = 4;
+  BUZZER_PWM->SEQ[0].REFRESH  = 0;
+  BUZZER_PWM->SEQ[0].ENDDELAY = 0;
+
+  // One loop plus LOOPSDONE->SEQSTART0 is the peripheral's idiom for "repeat
+  // until stopped"; without it the sequence would play once and fall silent.
+  BUZZER_PWM->LOOP   = 1;
+  BUZZER_PWM->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+}
+
+static void buzzerDriveOn() {
+  BUZZER_PWM->ENABLE = 1;
+  BUZZER_PWM->TASKS_SEQSTART[0] = 1;
+}
+
+static void buzzerDriveOff() {
+  // Clear the short first, or the restart it schedules can outlive the stop.
+  BUZZER_PWM->SHORTS = 0;
+  BUZZER_PWM->EVENTS_STOPPED = 0;
+  BUZZER_PWM->TASKS_STOP = 1;
+  while (BUZZER_PWM->EVENTS_STOPPED == 0) { }
+  BUZZER_PWM->ENABLE = 0;
+
+  // Disabling the peripheral hands the pads back to the GPIO block holding
+  // whatever level they stopped on. Left apart, that is a DC bias across the
+  // element; tie both low so it rests unstressed and silent.
+  pinMode(BUZZER_PIN,   OUTPUT);
+  pinMode(BUZZER_PIN_B, OUTPUT);
+  digitalWrite(BUZZER_PIN,   LOW);
+  digitalWrite(BUZZER_PIN_B, LOW);
+
+  BUZZER_PWM->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+}
+
 // Drives the buzzer and stamps the marker in one place. The timestamp is
 // taken immediately AFTER tone() starts the drive signal, so it marks the
 // electrical instant the transducer was driven. What separates that from the
 // first pressure wave reaching the athlete is the buzzer's own latency - for
 // an active buzzer this was a fixed 5-20 ms acoustic startup, constant and
-// one-directional, hence a calibration constant rather than an error. With
-// tone() driving a passive buzzer, that number has NOT been remeasured, and
-// tone()'s own call latency and its effect on the DRDY-interrupt sample
-// timing are UNVERIFIED on this core - check verify_rate.py / CLOCKSTEP /
-// DROPPED across a real beep before trusting a reaction time from this build.
-// Measure the acoustic latency the same way as before (GPIO + microphone on
-// one time base) and subtract it; re-measure if the buzzer or BEEP_FREQ_HZ
-// changes.
+// one-directional, hence a calibration constant rather than an error.
+//
+// That constant has NEVER been measured on this project, and it is now the
+// dominant term in the whole error budget (detection is ~1-2 ms). It is also
+// no longer the number the old handover notes describe: the part is a piezo
+// at resonance driven antiphase, not an active buzzer, and a high-Q resonator
+// rings up over roughly Q/pi cycles - at 4 kHz that is on the order of a
+// millisecond or two, likely *better* than the 5-20 ms previously assumed,
+// but assumed is exactly the problem. Measure it once with a GPIO edge and a
+// microphone on one time base and subtract it. Re-measure if the buzzer,
+// BEEP_FREQ_HZ or the antiphase wiring changes - all three move it.
 static void beep(uint32_t* markerOut, bool* capturedOut) {
-  tone(BUZZER_PIN, BEEP_FREQ_HZ);
+  buzzerDriveOn();
   uint32_t t = micros();
   buzzerOn = true;
   buzzerOffUs = t + BEEP_MS * 1000UL;
@@ -560,7 +686,7 @@ static void beep(uint32_t* markerOut, bool* capturedOut) {
 // a micros() deadline checked from loop(), never a delay.
 static void serviceBuzzer() {
   if (buzzerOn && (int32_t)(micros() - buzzerOffUs) >= 0) {
-    noTone(BUZZER_PIN);
+    buzzerDriveOff();
     buzzerOn = false;
   }
 }
@@ -586,7 +712,7 @@ static void startSequence() {
 static void abortSequence(const char* why) {
   if (seqState == SEQ_IDLE) return;
   seqState = SEQ_IDLE;
-  noTone(BUZZER_PIN);
+  buzzerDriveOff();
   buzzerOn = false;
   Serial.print("SEQ,abort,");
   Serial.println(why);
