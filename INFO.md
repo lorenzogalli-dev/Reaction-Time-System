@@ -1,6 +1,6 @@
 # How the start detector works
 
-A guide to `Tools/start_detector.py` — what it measures, how, and why it ended
+A guide to `start_detector.py` — what it measures, how, and why it ended
 up different from the version it grew out of.
 
 Written for someone who knows the project but not this code. No signal

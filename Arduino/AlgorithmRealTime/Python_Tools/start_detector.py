@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-start_detector.py - movement-onset / false-start detector for AccelStream
+start_detector.py - movement-onset / false-start detector for AlgorithmRealTime
 captures. GUI by default, CLI with --cli.
 
 Usage:
-    python3 Tools/start_detector.py                    # GUI, pick a file in it
-    python3 Tools/start_detector.py Data/x.csv         # GUI, preloaded
-    python3 Tools/start_detector.py Data/x.csv --cli   # terminal only
-    python3 Tools/start_detector.py "Data/*.csv" --cli # batch
+    python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py                    # GUI, pick a file in it
+    python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py Data/x.csv         # GUI, preloaded
+    python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py Data/x.csv --cli   # terminal only
+    python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py "Data/*.csv" --cli # batch
 
 WHAT IT DECIDES ON, AND WHY
 ---------------------------
@@ -105,7 +105,14 @@ DEF = dict(
     baseline_tau_s=1.0,
     rest_ms=300.0,
     false_start_ms=100.0,
-    blank_ms=1000.0,
+    # The arming gate, mirroring StartDetector.h. blank_ms is now the FLOOR of
+    # the arming wait, not a fixed blanking: nothing may arm before it, but
+    # arming then waits for quiet_hold_ms of continuous sub-settled_mg signal.
+    # Measured on 27 block starts: settling after "set" varies 1.0-3.3 s
+    # between attempts, so a fixed blanking cannot know when it is over.
+    blank_ms=800.0,
+    quiet_hold_ms=200.0,
+    arm_cap_ms=4000.0,
     settled_mg=15.0,
     aic_pre_ms=150.0,
     aic_post_ms=50.0,
@@ -128,7 +135,9 @@ class StartDetector:
                  floor_mg=DEF["floor_mg"], confirm_ms=DEF["confirm_ms"],
                  confirm_floor_mg=DEF["confirm_floor_mg"],
                  baseline_tau_s=DEF["baseline_tau_s"], rest_ms=DEF["rest_ms"],
-                 warmup_s=None):
+                 warmup_s=None, set_t=None, blank_ms=DEF["blank_ms"],
+                 quiet_hold_ms=DEF["quiet_hold_ms"], arm_cap_ms=DEF["arm_cap_ms"],
+                 settled_mg=DEF["settled_mg"]):
         self.odr_hz = float(odr_hz)
         dt = 1.0 / self.odr_hz
         # EMA coefficients from time constants, so the tuning stays in
@@ -159,6 +168,25 @@ class StartDetector:
         self._n = 0
         self._hist = []      # (t, horiz), long enough to backdate through
         self._hist_max = self.confirm_n + 5
+        # --- the arming gate, mirroring StartDetector.h -------------------
+        # Nothing is judged until the athlete has been MEASURED still. set_t is
+        # None when the caller has no "set" marker (a free capture), and then
+        # the gate is open from the start and this reduces to the old
+        # behaviour.
+        self.set_t = set_t
+        self.min_blank_s = blank_ms / 1000.0
+        self.quiet_hold_s = quiet_hold_ms / 1000.0
+        self.arm_cap_s = arm_cap_ms / 1000.0
+        self.settled = settled_mg / 1000.0
+        self.gate_open = set_t is None
+        self.gate_t = None
+        self.gate_capped = False
+        self.gate_peak_mg = 0.0
+        self._quiet_t0 = None
+        self._quiet_peak = 0.0
+        self.forced_arm_t = None   # set by analyse() when the CSV carries ARM
+        self.forced_arm_peak_mg = None
+
         self.armed = True         # ratio has fallen back; a new event may open
         self.candidate = False
         self.confirm_count = 0
@@ -167,6 +195,59 @@ class StartDetector:
         # Per-sample traces, for plotting only - the decision never reads them.
         self.tr_t, self.tr_horiz, self.tr_vert, self.tr_ratio = [], [], [], []
         self.events = []     # (t_s, horiz_g, ratio)
+
+    def _track_arming(self, t_s, horiz):
+        """Open the judged window on measured stillness, or on the cap.
+
+        This is what replaced the fixed blanking, and the reason is in the
+        data: at the "set" command the athlete rises into position - several
+        hundred mg, lasting up to 2.65 s - and a clock cannot know when that is
+        over. A signal can. The firmware then fires "go" a random interval
+        after this instant, the way a starter holds the gun until the field is
+        steady, so the judged window is trustworthy by construction.
+        """
+        if self.gate_open:
+            return
+        # The board already decided. Open at its instant, not ours.
+        if self.forced_arm_t is not None:
+            if t_s >= self.forced_arm_t:
+                peak = (self.forced_arm_peak_mg if self.forced_arm_peak_mg is not None
+                        else horiz * 1000.0)
+                self._open_gate(t_s, peak, False)
+            return
+        if self.set_t is None:
+            return
+        if t_s < self.set_t + self.min_blank_s:
+            return                       # the rise into position
+
+        if horiz < self.settled:
+            if self._quiet_t0 is None:
+                self._quiet_t0, self._quiet_peak = t_s, horiz
+            else:
+                self._quiet_peak = max(self._quiet_peak, horiz)
+            if t_s - self._quiet_t0 >= self.quiet_hold_s:
+                self._open_gate(t_s, self._quiet_peak * 1000.0, False)
+                return
+        else:
+            self._quiet_t0 = None        # a lull, not a hold
+
+        # An athlete who never settles because they are already starting would
+        # otherwise never arm, and the mechanism would disable itself in
+        # exactly the case it exists to catch.
+        if t_s >= self.set_t + self.arm_cap_s:
+            self._open_gate(t_s, horiz * 1000.0, True)
+
+    def _open_gate(self, t_s, peak_mg, capped):
+        self.gate_open = True
+        self.gate_t = t_s
+        self.gate_capped = capped
+        self.gate_peak_mg = peak_mg
+        # Ready immediately: the hold that just opened the gate is itself proof
+        # the ratio has fallen back, so there is nothing to wait for.
+        self.armed = True
+        self.candidate = False
+        self.confirm_count = 0
+        self.baseline_frozen = False
 
     def update(self, t_s, x, y, z):
         a = np.array((x, y, z), dtype=float)
@@ -211,6 +292,12 @@ class StartDetector:
             self._hist.pop(0)
 
         if self._n <= self.warmup_n:
+            return None
+
+        self._track_arming(t_s, horiz)
+        # The EMAs above keep running throughout, so the detector is warm the
+        # instant the gate opens.
+        if not self.gate_open:
             return None
 
         if not self.candidate:
@@ -345,7 +432,11 @@ def read_markers(path):
                 continue
             key, _, val = line[1:].partition(":")
             key, val = key.strip(), val.strip()
-            if key in ("on_t_s", "set_t_s", "go_t_s", "clockstep_us",
+            if key == "board_verdict":
+                out[key] = val
+                continue
+            if key in ("on_t_s", "set_t_s", "go_t_s", "arm_t_s", "arm_peak_mg",
+                       "arm_capped", "board_reaction_ms", "clockstep_us",
                        "dropped", "truncated", "preroll_samples"):
                 try:
                     out[key] = float(val)
@@ -384,9 +475,12 @@ def analyse(path, **kw):
     false_start_ms = kw.pop("false_start_ms", DEF["false_start_ms"])
     blank_ms = kw.pop("blank_ms", DEF["blank_ms"])
     settled_mg = kw.pop("settled_mg", DEF["settled_mg"])
+    quiet_hold_ms = kw.pop("quiet_hold_ms", DEF["quiet_hold_ms"])
+    arm_cap_ms = kw.pop("arm_cap_ms", DEF["arm_cap_ms"])
     aic_pre_ms = kw.pop("aic_pre_ms", DEF["aic_pre_ms"])
     aic_post_ms = kw.pop("aic_post_ms", DEF["aic_post_ms"])
     use_aic = kw.pop("use_aic", True)
+    force_rearm = kw.pop("force_rearm", False)
     t, x, y, z, markers = load_csv(path)
     if len(t) < 50:
         raise ValueError(f"{path}: only {len(t)} rows")
@@ -399,12 +493,40 @@ def analyse(path, **kw):
         raise ValueError(f"{path}: timestamps are not increasing")
     odr = 1.0 / dt
 
-    det = StartDetector(odr_hz=odr, **kw)
+    go = markers.get("go_t_s")
+    set_ = markers.get("set_t_s")
+
+    # set_t goes INTO the detector, not just into the classification: the
+    # arming gate is causal and decides, sample by sample, when the judged
+    # window opens. A capture with no "set" marker arms immediately.
+    # If the board wrote down when it armed, USE IT rather than re-deriving it.
+    # Re-deriving is not guaranteed to reach the same instant - the board works
+    # in float32 and numpy in float64, and on a capture where the signal hovers
+    # at the stillness limit a 0.3 mg gap moved the arming by 1.5 s - and more
+    # to the point, the board's arming is what actually happened: it is when
+    # the gun was scheduled from. Recomputing it would be second-guessing a
+    # decision that has already been taken, the same mistake as recomputing
+    # "go" instead of reading its timestamp.
+    #
+    # force_rearm=True re-derives anyway. That is what tuning needs: change a
+    # threshold in the panel and see where the gate WOULD have opened.
+    board_arm = markers.get("arm_t_s")
+    if board_arm is not None and not force_rearm:
+        det = StartDetector(odr_hz=odr, set_t=None, **kw)
+        det.gate_open = False
+        det.set_t = set_
+        det.forced_arm_t = board_arm
+        # The stillness the BOARD measured when it armed, not this sample's
+        # value. Reading the instant but recomputing the number beside it would
+        # report two different things about one decision.
+        det.forced_arm_peak_mg = markers.get("arm_peak_mg")
+    else:
+        det = StartDetector(odr_hz=odr, set_t=set_, blank_ms=blank_ms,
+                            quiet_hold_ms=quiet_hold_ms, arm_cap_ms=arm_cap_ms,
+                            settled_mg=settled_mg, **kw)
     for i in range(len(t)):
         det.update(t[i], x[i], y[i], z[i])
 
-    go = markers.get("go_t_s")
-    set_ = markers.get("set_t_s")
     events = []
     prev_t = None
     for ev_t, ev_h, ratio in det.events:
@@ -414,94 +536,55 @@ def analyse(path, **kw):
             ev_t, moved, refined = refine_onset(det, ev_t, aic_pre_ms,
                                                 aic_post_ms, not_before=prev_t)
         prev_t = ev_t
-        verdict, rt = classify(ev_t, set_, go, false_start_ms, blank_ms)
+        verdict, rt = classify(ev_t, go)
         events.append(dict(t=ev_t, trigger_t=trig_t, aic_moved_ms=moved,
                            aic_ok=refined, horiz_mg=ev_h * 1000.0, ratio=ratio,
                            verdict=verdict, reaction_ms=rt))
-    settled = check_settled(det, set_, blank_ms, settled_mg)
     return dict(path=path, odr=odr, t=t, x=x, y=y, z=z, markers=markers,
                 det=det, events=events, false_start_ms=false_start_ms,
-                blank_ms=blank_ms, settled=settled, use_aic=use_aic,
-                summary=summarise(events, go, set_, settled))
+                blank_ms=blank_ms, use_aic=use_aic,
+                armed=dict(t=det.gate_t, capped=bool(markers.get("arm_capped"))
+                                                 if board_arm is not None and not force_rearm
+                                                 else det.gate_capped,
+                           source="board" if (board_arm is not None and not force_rearm)
+                                          else "recomputed",
+                           peak_mg=det.gate_peak_mg, limit_mg=settled_mg,
+                           after_set_ms=None if (det.gate_t is None or set_ is None)
+                                        else (det.gate_t - set_) * 1000.0),
+                summary=summarise(events, go, det))
 
 
-def check_settled(det, set_t, blank_ms, settled_mg):
-    """Was the athlete actually still by the time the blanking ended?
+def classify(ev_t, go_t):
+    """THE VERDICT. One rule, one outcome, a reaction time always reported.
 
-    If not, the attempt is not judgeable: the blanking has expired but the
-    movement it was meant to cover has not finished, so anything the detector
-    reports after it is as likely to be the tail of the rise as a false start.
-    Saying so is the honest outcome - better than calling such an attempt
-    either clean or a false start on a coin flip.
-    """
-    if set_t is None or not det.tr_t:
-        return None
-    t = np.asarray(det.tr_t)
-    h = np.asarray(det.tr_horiz) * 1000.0
-    # The last 200 ms of the blanking window: by then the rise should be over.
-    lo = set_t + blank_ms / 1000.0 - 0.2
-    hi = set_t + blank_ms / 1000.0
-    m = (t >= lo) & (t < hi)
-    if m.sum() < 5:
-        return None
-    return dict(ok=bool(h[m].max() <= settled_mg), peak_mg=float(h[m].max()),
-                limit_mg=settled_mg)
+    The "pre-set (settling)" and "rise into set (not judged)" cases this used to
+    carry are gone, and not because they stopped mattering: the arming gate
+    means no event can exist before the athlete has been measured still, so
+    there is nothing left for them to describe. What used to be a verdict is
+    now a precondition.
 
-
-def classify(ev_t, set_t, go_t, false_start_ms, blank_ms):
-    """What one detected event means. This is the product rule, not a
-    diagnostic convenience.
-
-    The blanking window is the part that is easy to get wrong. At the "set"
-    command an athlete RAISES THE HIPS into the set position - a real movement
-    of several hundred mg lasting about a second. A rule that says "any
-    movement between set and go is a false start" therefore flags, every single
-    time, exactly the movement the "set" command just ordered.
-
-    So the first blank_ms after "set" is not judged. Note it is still
-    ANALYSED - events there are reported and labelled, not discarded. If an
-    athlete really did start during their rise, that shows up in the table for
-    a human to look at, rather than being silently swallowed.
-
-    Why a fixed blanking and not "wait until the athlete is still": an athlete
-    who never settles because they are already starting would never satisfy a
-    stillness gate, so the detector would never arm - the mechanism would
-    disarm itself in precisely the case it exists to catch. A clock always
-    runs out.
+    The two false-start cases are one comparison. Moving before the gun and
+    reacting in under 100 ms are the same fault - a start that cannot have been
+    a response to the gun - and World Athletics treats them as one.
     """
     if go_t is None:
-        return "movement", None
-    if set_t is not None and ev_t < set_t:
-        # Before "set" the athlete is still getting into the blocks. Nothing
-        # is being judged yet.
-        return "pre-set (settling)", None
-    if set_t is not None and ev_t < set_t + blank_ms / 1000.0:
-        return "rise into set (not judged)", None
-    if ev_t < go_t:
-        return "FALSE START (moved before go)", (ev_t - go_t) * 1000.0
+        return "movement (no go marker)", None
     rt = (ev_t - go_t) * 1000.0
-    if rt < false_start_ms:
-        return f"FALSE START (reacted in {rt:.0f} ms)", rt
-    return "valid start", rt
+    return ("FALSE START" if rt < DEF["false_start_ms"] else "valid start"), rt
 
 
-def summarise(events, go_t, set_t, settled=None):
-    if settled is not None and not settled["ok"]:
-        return ("NOT JUDGEABLE - still moving at the end of the blanking window "
-                f"({settled['peak_mg']:.0f} mg against a {settled['limit_mg']:.0f} mg "
-                "limit): the athlete had not settled, so nothing after it can be "
-                "told apart from the tail of the rise.")
+def summarise(events, go_t, det):
+    note = ""
+    if getattr(det, "gate_capped", False):
+        note = ("  |  NOTE: armed on the cap, the athlete never settled - "
+                "the verdict stands but is worth reviewing")
     if not events:
-        return "No movement detected."
-    judged = [e for e in events
-              if not e["verdict"].startswith(("pre-set", "rise into set"))]
-    if not judged:
-        return (f"{len(events)} event(s), none in the judged window - "
-                "settling and rise only.")
-    first = judged[0]
-    if first["reaction_ms"] is None:
-        return f"Movement at t={first['t']:.4f}s - no 'go' marker in this file, so no reaction time."
-    return f"{first['verdict']}  |  t={first['t']:.4f}s  |  reaction {first['reaction_ms']:.1f} ms"
+        return "No movement in the judged window." + note
+    e = events[0]
+    if e["reaction_ms"] is None:
+        return f"Movement at t={e['t']:.4f}s - no 'go' marker, so no reaction time.{note}"
+    return (f"{e['verdict']}  |  t={e['t']:.4f}s  |  reaction {e['reaction_ms']:.1f} ms"
+            f"  |  armed at {det.gate_peak_mg:.1f} mg{note}")
 
 
 # --- CLI ------------------------------------------------------------------
@@ -564,8 +647,10 @@ def run_gui(initial=None):
         ("Baseline tau (s)", "baseline_tau_s"),
         ("Rest window (ms)", "rest_ms"),
         ("False start under (ms)", "false_start_ms"),
-        ("Blank after set (ms)", "blank_ms"),
-        ("Settled under (mg)", "settled_mg"),
+        ("Arm: min blank (ms)", "blank_ms"),
+        ("Arm: still under (mg)", "settled_mg"),
+        ("Arm: hold for (ms)", "quiet_hold_ms"),
+        ("Arm: give up after (ms)", "arm_cap_ms"),
         ("AIC window before (ms)", "aic_pre_ms"),
         ("AIC window after (ms)", "aic_post_ms"),
     ]
@@ -720,9 +805,11 @@ def run_gui(initial=None):
                 warn.append(f"!! {m['dropped']:.0f} watchdog-recovered samples")
             if m.get("truncated"):
                 warn.append("!! short pre-roll")
-            if r["settled"] is not None and not r["settled"]["ok"]:
-                warn.append(f"!! not settled at end of blanking "
-                            f"({r['settled']['peak_mg']:.0f} mg)")
+            if r["armed"]["capped"]:
+                warn.append("!! armed on the cap: the athlete never settled")
+            elif r["armed"]["after_set_ms"] is not None:
+                warn.append(f"armed {r['armed']['after_set_ms']:.0f} ms after set "
+                            f"at {r['armed']['peak_mg']:.1f} mg")
             self.status.set(f"{r['summary']}\n{r['odr']:.1f} Hz, {len(r['t'])} rows"
                             + ("\n" + "  ".join(warn) if warn else ""))
 
@@ -760,15 +847,20 @@ def run_gui(initial=None):
             ax2.set_xlabel("t (s)")
             ax2.set_yscale("log")
 
-            # Two shades, because they mean opposite things: grey is the rise
-            # into the set position, which is NOT judged, red is the window in
-            # which movement is a false start.
+            # Two shades, because they mean opposite things: grey is the wait
+            # for the athlete to settle, which is NOT judged, red is the window
+            # in which movement is a false start. The boundary between them is
+            # the arming instant, measured from the signal rather than assumed
+            # - so where it falls is itself worth looking at.
             set_t, go_t = m.get("set_t_s"), m.get("go_t_s")
+            arm_t = r["armed"]["t"]
             if set_t is not None and go_t is not None:
-                blank_end = min(set_t + r["blank_ms"] / 1000.0, go_t)
+                edge = min(arm_t if arm_t is not None else go_t, go_t)
                 for ax in self.axes:
-                    ax.axvspan(set_t, blank_end, color="tab:gray", alpha=0.10)
-                    ax.axvspan(blank_end, go_t, color="tab:red", alpha=0.10)
+                    ax.axvspan(set_t, edge, color="tab:gray", alpha=0.10)
+                    ax.axvspan(edge, go_t, color="tab:red", alpha=0.10)
+                    if arm_t is not None:
+                        ax.axvline(arm_t, color="tab:orange", lw=1.2, ls="--")
             for name, colour in (("on_t_s", "tab:gray"), ("set_t_s", "tab:blue"),
                                  ("go_t_s", "tab:green")):
                 if name in m:
@@ -809,6 +901,7 @@ def main():
                        ("--baseline-tau-s", "baseline_tau_s"),
                        ("--rest-ms", "rest_ms"), ("--false-start-ms", "false_start_ms"),
                        ("--blank-ms", "blank_ms"), ("--settled-mg", "settled_mg"),
+                       ("--quiet-hold-ms", "quiet_hold_ms"), ("--arm-cap-ms", "arm_cap_ms"),
                        ("--aic-pre-ms", "aic_pre_ms"), ("--aic-post-ms", "aic_post_ms")]:
         ap.add_argument(label, type=float, default=DEF[key], dest=key)
     args = ap.parse_args()

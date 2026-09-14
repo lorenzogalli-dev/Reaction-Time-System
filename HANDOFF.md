@@ -1,7 +1,617 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-11. Written for an agent starting with no prior context.
+Last updated: 2026-09-13. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-09-14 (hardware): the arming gate has now RUN ON THE BOARD, and the board and the bench agree to 0.000 ms
+
+Flashed over the **mbed** core (`arduino-cli` autodetects `Seeeduino:nrf52`,
+which is the one that silently degrades `micros()` to ~977 us - force
+`Seeeduino:mbed:xiaonRF52840Sense`). Flash 13%, RAM 72%.
+
+`verify_rate.py`: **PASS**. `micros()` 8 us, 0 watchdog recoveries, 865.1 Hz,
+0 gaps, 12000/12000 rows.
+
+### Three bench runs, and the first real end-to-end check
+
+On a table, not an athlete - `Data/bench_140926/`. The gate armed at 1000,
+1001 and 1002 ms after "set", at 9.3, 6.0 and 5.9 mg. **1000 ms is the floor**
+(`DET_MIN_BLANK_MS` 800 + `DET_QUIET_HOLD_MS` 200): a still board has nothing to
+wait for. Moving the board delayed it, confirmed by hand. `set -> go` came out
+at 2.12 s, and `go - arm` at 1.122 s, inside the 0.5-1.2 s window.
+
+The check that was never possible before:
+
+| capture | board says | Python says | gap |
+|---|---|---|---|
+| `142426` | no movement | no movement | - |
+| `142506` | valid start, 300.6 ms | valid start, 300.6 ms | **+0.000 ms** |
+| `142558` | no movement | no movement | - |
+
+with the Python READING the board's arming instant (`armed source: board`)
+rather than re-deriving it.
+
+### Two things fixed on the bench, neither of them in the detector
+
+1. **`verify_rate.py` failed a healthy board.** First run: 8734 rows of 12000,
+   `ROW COUNT MISMATCH`. The `d` command dumps the whole 12 000-sample ring -
+   ~540 KB of ASCII - and the nRF52840's USB CDC moves it at roughly 20 KB/s
+   whatever the nominal baud, so it needs ~27 s. The script waited 20 s total
+   and cut it off at the same place every time. Worse, a timed-out attempt
+   leaves the board still transmitting, so the NEXT run reads that dump's
+   `DUMP_END` and reports `0 rows`. Replaced the stopwatch with an idle
+   timeout - stop when the data stops - plus a drain before asking. Now
+   12000/12000, PASS. Note the shape: a plausible wrong number with a
+   ready-made hardware explanation. Fourth time in this project.
+2. **`SEQ,armed` meant two different things.** The sequence-start message and
+   the new arming-gate message shared a token, so a reader matching on the
+   prefix would conflate them. The gate is now **`SEQ,gate,<ms>,<mg>,<how>`**,
+   `<how>` being `still` or `cap`.
+
+### Timing widened after the bench runs, and the layout settled
+
+`go` now fires **700-1500 ms** after arming, not 500-1200. With the athlete
+settling at set+1.0 s (the 09-11 figure) the old window put `set -> go` at a
+median of 1.87 s and as low as 1.50 s, and a real starter holds "set" for about
+1.5-2.0 s. The new one gives a 2.12 s median with a 1.70 s floor, and widens
+the unpredictability budget from 700 ms to 800 ms. Above ~1000 ms of minimum
+the ceiling starts being hit often enough to matter (19% against 8%).
+
+The `set -> go` ceiling is now **randomised, 3.4-3.6 s**, drawn once at "set".
+A fixed ceiling fired `go` at exactly set+3.5 s every time it clamped, handing
+the athlete a perfectly predictable instant in precisely the case where they
+were slow to settle - and that case is common enough to be learnable.
+
+The Python tooling moved to `Arduino/AlgorithmRealTime/Python_Tools/`. It stays
+inside the sketch folder on purpose - it is the same algorithm in the other
+language and the two must not drift - and the IDE and `arduino-cli` ignore any
+subfolder that is not `src/`, so it never reaches the firmware. Verified: still
+compiles to 13% / 72%.
+
+### What has still never been done
+
+No reaction time from an athlete on blocks through this firmware. The bench
+runs prove the mechanism, not the measurement. And the buzzer's acoustic
+latency remains unmeasured and remains the dominant term.
+
+---
+
+## READ THIS FIRST — 2026-09-14 (latest): arming on measured stillness is implemented, and the harness found that float32 vs float64 changes a verdict
+
+The design agreed in the section below is now in both implementations. The
+fixed 1000 ms blanking is gone; `go` is fired from the arming instant.
+
+```
+set -> min 800 ms (the rise into position, judged by nothing)
+    -> wait: horiz < 15 mg for 200 ms continuous       (cap: 4 s)
+    -> ARMED - random(0.5-1.2 s), capped at set+3.5 s -> GO
+    -> first onset < go+100 ms -> FALSE START | >= go+100 ms -> valid start
+```
+
+One verdict, a reaction time always reported, no re-arm, and `NOT JUDGEABLE`
+is gone from the normal path. The cap annotates rather than refuses.
+Firmware: flash 13%, RAM **72% (172 992 used, 64 576 free)**, up from 71%.
+
+### The 8 captures of 09-11 were added, and they are the first through the loud beep
+
+`Data/` is now split: `block_starts_090926/` (19) and `block_starts_110926/`
+(8), plus the pre-v4 archive. See `Data/README.md`. Both sets are the same
+athlete on blocks, board on the back of the block.
+
+The 09-11 set is the first recorded through the 4 kHz antiphase drive, and it
+shows what 09-11 predicted it would:
+
+| | median RT | range | holding set, p95 |
+|---|---|---|---|
+| `090926`, 3 kHz off-resonance | 178 ms | 127-299 | 7.0 mg |
+| `110926`, 4 kHz at resonance | **159 ms** | 132-169 | 4.8 mg |
+
+19 ms faster and the spread collapses from 172 ms to 37 ms. That is Piéron's
+law, and it is the evidence that no number from `090926` may be used to tune
+anything.
+
+Arming holds on both sets: 18/18 and 8/8 armed, **0 early, 0 capped**. On
+09-11 arming lands at the floor (set+1.00 s) in 7 of 8 - settled instantly.
+
+### The replay harness has been REMOVED, after it did its job
+
+`Arduino/AlgorithmRealTime/replay/` (a host build of the firmware headers plus
+a C++/Python comparison script) existed for one day. It found the three things
+below, two of them real bugs, and was then deleted on request as testing
+scaffolding. It is in git history if it is ever wanted back.
+
+What it removed from the firmware when it went: `forceArmAt()`, a diagnostic
+`last_horiz` field, and the `#ifndef` guard around `DET_SETTLED_MG` - none of
+which the board ever used. The two AIC corrections it found are permanent.
+
+### What it caught, which is why it was worth building
+
+Three real disagreements. Two were genuine C++ bugs against the Python
+reference, both fixed, both invisible without this harness:
+
+1. `AicPicker.h` swept `k <= n - 5`; the Python's `np.arange(5, n - 5)` stops
+   at `n - 6`. One split too many.
+2. Its variance guard was `v > 1e-9`; the Python's is `v > 0`. On a quiet
+   capture - 09-11 holds set at ~5 mg - the segment variances are small enough
+   for that floor to discard splits the reference accepts.
+
+Neither crashes. Both move the onset by one sample, on some captures only.
+
+### The third is not a bug, and it is the one that matters
+
+On `accel_20260909_123532.csv` the C++ says FALSE START and the Python says no
+movement. Traced to a single sample:
+
+```
+set+1709.697 ms    C++  14.8795 mg  -> under 15 -> quiet run continues -> arms at set+1812.7 ms
+                Python  15.1760 mg  -> over  15 -> quiet run breaks    -> arms at set+3285.1 ms
+```
+
+**0.30 mg - 2% - decides 1.5 s of arming and the verdict.** The offset is
+systematic across every sample, not noise on the last one: it is the baseline
+`b_h`, an EMA accumulated over thousands of samples in `float` on the board and
+`float64` in numpy. `horiz` is the norm of a difference between two nearly
+equal vectors, so cancellation amplifies the gap.
+
+So the two implementations **cannot agree on borderline captures while their
+arithmetic differs**, and a threshold comparison turns a 2% numeric gap into a
+different answer. This is not academic: it changed a verdict.
+
+**Update, same day:** two of the three turned out not to need a fix at all.
+The 09-11 pair differ by 1.137 and 1.179 ms, and the measured sample period is
+1.156 ms - they are one sample apart, which is the resolution floor, not a
+drift. And `123532` is an arming difference on a capture recorded by the OLD
+firmware: with `go` now fired from the arming instant, the situation it
+describes (armed at one time, gun already scheduled for another) cannot occur.
+
+What DID need fixing was who owns the arming decision, and that is done: the
+firmware now writes `ARM,<t_us>`, `ARMMG`, `ARMCAP` and its own
+`VERDICT`/`RTMS`/`ONSET` into the dump; `capture.py` stores them in the CSV
+header; and `start_detector.py` READS the arming instant instead of
+re-deriving it (`force_rearm=True` re-derives, which is what tuning wants).
+That also closes the older gap where the board's verdict survived only in the
+terminal - a capture now carries what the board decided on the day.
+
+The float32/float64 gap itself was left alone. Three ways out if it ever
+matters again:
+
+- **Widen the C++ state to double** (`b_h`, `sta`, `lta`, `horiz`). ~30 bytes,
+  and the nRF52840's FPU is single-precision so doubles are emulated - about
+  30 us per sample against a 1200 us period, affordable. Fixes the cancellation
+  on the board too, not just the comparison.
+- **Narrow the Python to float32**, making the reference match the target
+  exactly. Free, but the bench tool then inherits the board's numerics.
+- **Accept it** and have compare.py flag borderline captures rather than fail
+  them. Cheapest, and wrong: it means the device and the bench can disagree
+  about a false start and nobody is told.
+
+Recommendation is the first. Not done.
+
+### Also still open
+
+`accel_20260909_133119.csv` still disagrees for the old reason - it straddles
+the `micros()` wrap and the Python reads a `t_s` column that arrives already
+broken from `capture.py`. Reported as WRAP, not FAIL. Unfixed.
+
+---
+
+## READ THIS FIRST — 2026-09-14 (late): the 19 captures are an athlete on blocks, and that overturns the standing open item
+
+**Correction to this file.** The 09-13 section says of the 19 captures in
+`Data/`: *"those are bench runs with the board being handled, not an athlete on
+blocks, so the figure says nothing about the real case."* That is wrong. They
+are Lorenzo himself on starting blocks, all nineteen.
+
+It matters because that sentence was load-bearing. It is the whole reason
+"measure how much a real athlete moves in the set position" has been the
+standing most-useful-number-missing since 09-13. **The measurement was already
+in the repo.**
+
+### What an athlete holding set actually reads
+
+Horizontal magnitude, the detector's own signal, over the half second before
+`go`:
+
+| | mg |
+|---|---|
+| median across captures | **3.1** |
+| p95 | **7.0** |
+| quietest 200 ms window reached, every capture | 5.2 - 7.3 |
+| push-off peak after `go` | 1000 - 3600 |
+
+So the athlete is still to within a few mg, and the push is ~300x that. The one
+capture that breaks the pattern - `123532`, median 175 mg and p95 1068 mg in
+that window - is exactly the one the detector calls a false start at -443 ms.
+The data is self-consistent.
+
+**`DET_SETTLED_MG` = 15 mg is therefore fine.** It is about 2x the observed p95.
+It was a guess, and it happens to be a good one.
+
+### The real defect is WHEN the check runs, not its value
+
+The stillness check sits in the last 200 ms of a fixed 1000 ms blanking. But
+settling into the set position is not over by then: the last movement above
+30 mg lands **up to 2.65 s after `set`**, and in 7 of 18 captures there is less
+than 1 s of quiet before `go`. So the check measures the rise into position, not
+the hold - which is why 16 of 19 captures report `NOT JUDGEABLE` while every one
+of them contains a perfectly good reaction time.
+
+Two further consequences of the fixed blanking, both measured:
+
+- The check is made 1.2-2.0 s before `go` and then vetoes the reaction measured
+  after it. By the time `go` sounds the athlete is quiet in 16 of 19 captures
+  (median 9 mg), and only 3 are still moving - which are precisely the three the
+  detector calls false starts. The current rule vetoes on a condition observed
+  two seconds earlier.
+- `go` fires at `set + random(2.2-3.0 s)` without ever looking at the athlete. A
+  real starter holds the gun until the field is steady and only then fires.
+
+### The design this points to, and the parameters the data supports
+
+Arm on measured stillness rather than on a clock, and fire `go` from the arming
+instant:
+
+```
+set -> [min 800 ms, the rise into position, judged by nothing]
+    -> wait: horiz < 15 mg for 300 ms continuous
+    -> ARMED - random(1.0-2.0 s) -> GO
+    -> first onset < go+100 ms -> FALSE START   |   >= go+100 ms -> VALID
+```
+
+Swept over the 18 usable captures:
+
+| quiet | hold | min blank | armed | hit the cap | armed too early |
+|---|---|---|---|---|---|
+| 15 mg | 200 ms | 500 ms | 18 | 0 | **2** |
+| 15 mg | 300 ms | **800 ms** | **18** | **0** | **0** |
+| 15 mg | 500 ms | 800 ms | 17 | 1 | 0 |
+| 15 mg | 600 ms | 800 ms | 14 | 4 | 0 |
+
+800 ms of minimum blanking is what removes the early arming: with 500 ms the
+detector latches onto a momentary lull *during* the settling and then reports a
+"false start" one to two seconds before `go`. Above 400 ms of required quiet the
+cap starts being hit, so 300 ms is the middle of the usable band, not an edge of
+it.
+
+A hard cap (4 s) must stay: an athlete who never settles because they are
+already starting would otherwise never arm, and the mechanism would disable
+itself in exactly the case it exists to catch. On the cap, fire anyway and
+annotate the verdict - do not refuse it.
+
+This also removes `NOT JUDGEABLE` from the normal path. It was a patch over an
+arming rule that never looked at the athlete.
+
+### Not yet done, and one thing still unknown
+
+Nothing above is implemented - it is a design agreed in discussion, not code.
+The board was mounted **on the back of the starting block**, not on the athlete
+- so 3.1 mg is what the block transmits while a sprinter holds set, not body
+tremor. That is the product's intended mounting, so the numbers carry; move the
+fixing point and they must be measured again.
+
+---
+
+## READ THIS FIRST — 2026-09-14: three sketches became one, and the Python moved in beside it
+
+Housekeeping, no behaviour change. The layout below is what everything after
+this section describes under older names — the older sections are left as they
+were written, so read their paths as history.
+
+### What happened
+
+`diff` settled the first question: `Arduino/AccelStream/` and
+`Arduino/AlgorithmRealTime/` were **byte-identical**, headers included, except
+for one line — `SET_DELAY` at 20-25 s against 8-10 s. And
+`AlgorithmRealTime/start_detector.py` was a byte-identical copy of the one in
+`Tools/`. So there were never three algorithms, there were two: the original
+port and the corrected one.
+
+```
+Arduino/AlgorithmRealTime/        <- was AlgorithmRealTimeFixed/
+  AlgorithmRealTime.ino           <- was AccelStream.ino
+  StartDetector.h  AicPicker.h
+  capture.py  start_detector.py  verify_rate.py    <- were Tools/
+```
+
+`Arduino/AccelStream/`, the old `Arduino/AlgorithmRealTime/` and `Tools/` are
+gone; everything in them is in git history. `Tools/.vscode/settings.json` (the
+conda IDE config that 09-13 flagged as probably-shouldn't-be-committed) went
+with `Tools/` and was not carried over.
+
+### The one thing that was merged rather than dropped
+
+`AlgorithmRealTime/capture.py` was not a duplicate: it had **Windows COM-port
+autodetection** that `Tools/capture.py` lacked. That function is now in the
+surviving `capture.py`, so Windows and macOS run the same file. Its comments
+were translated to English to match the rest; the logic is unchanged.
+
+### Why the Python lives inside the sketch folder now
+
+Because it is not a separate product, it is the same algorithm in the other
+language, and the two **must not diverge** — which is exactly the failure this
+project has now hit three times. Keeping `start_detector.py` next to
+`StartDetector.h` means a change to one is in the same directory listing as the
+file that has to follow it. The Arduino IDE ignores non-source files in a
+sketch folder; `arduino-cli` compiles it unchanged, verified below.
+
+Their roles have not changed and neither has become redundant: the firmware
+**decides in real time**, the Python **tunes and explains**. `DET_SETTLED_MG`
+still has to be measured on an athlete, and the only place you can move a
+threshold and see its effect on all 19 captures at once is the GUI.
+
+### Verified after the move
+
+- `arduino-cli compile --fqbn Seeeduino:mbed:xiaonRF52840Sense --libraries Arduino/libraries Arduino/AlgorithmRealTime`
+  → flash **13%** (106 720 B), RAM **71%** (170 920 used, 66 648 free). Identical
+  to the figures 09-13 recorded for `Fixed`.
+- All three scripts byte-compile, and
+  `start_detector.py Data/accel_20260909_121238.csv --cli` still reports the
+  299.3 ms of the 09-13 section and still returns `NOT JUDGEABLE`.
+- `BUILD.md`, `README.md` and `INFO.md` updated to the new paths.
+
+The `# AccelStream v4 capture` header line that `capture.py` writes into every
+CSV was **left alone deliberately**: all 19 files in `Data/` carry it, and
+changing it would split the corpus for no gain.
+
+### The replay harness is now in the repo — `Arduino/AlgorithmRealTime/replay/`
+
+09-13 validated the port against the Python with a scratch harness and then
+threw it away, noting it was "worth re-creating for any future detector
+change". It has been re-created and committed instead.
+
+```bash
+python3 Arduino/AlgorithmRealTime/replay/compare.py --settled-mg 1000
+```
+
+It compiles `StartDetector.h` and `AicPicker.h` — the real headers, not copies
+— against a 25-line `Arduino.h` shim, replays each capture following the
+firmware's exact sequence (calibrate from the pre-roll, replay it, then run on
+to the end of the file), then compares onset, reaction time and verdict against
+`start_detector.py`. Exit code 1 on a real disagreement.
+
+**Run it with `--settled-mg 1000`, not only bare, and the reason is the
+interesting part.** A bare run reports 19/19 agreement — and that number is
+nearly worthless, because at the shipped 15 mg limit sixteen captures stop at
+`NOT JUDGEABLE` before an onset is ever computed. The check passes by not
+running. Raising the limit on both sides carries every file through:
+
+| | agreement |
+|---|---|
+| default, 15 mg | 19/19, but only 3 files actually compare an onset |
+| `--settled-mg 1000` | **18/19 to 0.000 ms**, every file compared |
+
+which reproduces 09-13's figure exactly, and identifies the nineteenth as
+`accel_20260909_133119.csv` — the `micros()` wrap capture. It is reported as
+`WRAP`, not `FAIL`.
+
+To make that flag possible, `DET_SETTLED_MG` in `StartDetector.h` is now
+wrapped in `#ifndef` so the harness can override it from the compiler command
+line. Nothing defines it on the board, so 15 mg still stands there, and the
+firmware compiles to the same 13% / 71% as before.
+
+Two things worth keeping in mind about this harness:
+
+- `replay.cpp` has to restate a few constants that live in the `.ino` rather
+  than in the headers (`ACCEL_ODR_HZ`, `ACCEL_RANGE_G`, `MAX_REC_SAMPLES`). A
+  stale copy would not fail to build, it would silently compare the wrong
+  thing, so `compare.py` greps them back out of the `.ino` and refuses to run
+  if they have drifted.
+- Writing the `Arduino.h` shim produced a live example of the failure mode this
+  project keeps hitting. The obvious spelling of `max()`,
+  `auto max(T a, U b) -> decltype(a > b ? a : b)`, deduces a **reference** and
+  returns one to its own parameter. It compiled, it ran, and it reported
+  "pre-roll too short for the gravity estimate" on every capture — a confident,
+  plausible, entirely wrong answer from a five-line file. `-Wall` named it
+  immediately, which is why the harness builds with `-Wall -Werror`.
+
+### Still true, and still the next things to do
+
+Nothing above touches any of it. `Fixed` — now just the firmware — has still
+never run on hardware, the buzzer's acoustic latency is still unmeasured and
+still dominant, and `DET_SETTLED_MG` at 15 mg would still refuse 16 of the 19
+captures.
+
+---
+
+## READ THIS FIRST — 2026-09-13: the algorithm now runs on the board, and three of the "obvious" fixes to it were decided by measurement (one of them against me)
+
+A second person is working on this repo now. `chambel6` pushed `da47893`
+("added algorithm and updated python tools") on 2026-09-12: a C++ port of
+`Tools/start_detector.py` that runs the detection **on the board**, so the
+firmware prints a verdict and a reaction time before it dumps the CSV.
+
+### The merge was trivial; the divergence it left was not
+
+Nothing conflicted — he worked entirely inside a new `Arduino/AlgorithmRealTime/`
+while the 09-11 buzzer work touched `Arduino/AccelStream/`, `BuzzerSweep/` and
+this file. `git pull --rebase` was clean.
+
+But he had **copied** the old firmware into his folder as a starting point, so
+his copy carried the 3 kHz `tone()` buzzer that 09-11 had just removed. That is
+worth stating plainly because of what it would have done: flashing it to take a
+reaction time would have measured a real human response to a stimulus half the
+voltage and off resonance, and **nothing in the resulting data would have shown
+it** — the same failure shape as the `micros()` bug of 09-08 and the quiet beep
+of 09-11. Three for three now. Assume the next one has the same shape.
+
+There are now three sketches. They are not redundant; keep them distinct:
+
+| Sketch | What it is |
+|---|---|
+| `AccelStream/` | the reference pipeline: 09-11 buzzer + his detector hooks |
+| `AlgorithmRealTime/` | his, unchanged in substance. `SET_DELAY` 8-10 s for bench iteration |
+| `AlgorithmRealTimeFixed/` | `AccelStream` plus the five corrections below |
+
+All three compile at 13% flash. RAM: 71% for the first two (168 712 used, 68 856 free),
+71% for Fixed (170 920 used, 66 648 free).
+
+His `.ino` was named `AccelStream.ino` inside `AlgorithmRealTime/`, which the
+Arduino IDE cannot open — the sketch file must carry the folder's name. Renamed.
+His `capture.py` fork adds Windows COM-port autodetection and is **kept**: he
+works on Windows. His `start_detector.py` is a byte-identical copy of the one in
+`Tools/` and is pure duplication.
+
+### "How does it fit in so few lines" — it doesn't
+
+The `.ino` diff is only ~84 lines because that is just the wiring: instantiate,
+feed each sample, seed at `set`, report at `tail`. The algorithm is in the two
+headers he added.
+
+| | lines |
+|---|---|
+| `StartDetector.h` + `AicPicker.h` | **309** |
+| `start_detector.py`, algorithmic parts only | **302** |
+| `start_detector.py`, whole file | 829 |
+
+The other 527 Python lines are Tkinter, the matplotlib panels, CSV loading,
+marker parsing and the CLI. None of it belongs on a microcontroller. The only
+real compression is numpy vectorising the AIC variance sweep into a `for` loop.
+
+### Three things were measured instead of argued. One of them overturned the review.
+
+The review of his port produced five candidate defects. Before "fixing" them,
+the two that would have changed numbers were tested over the 19 captures in
+`Data/` — which also got them analysed for the first time.
+
+**1. The AIC input signal — REVIEWED AS WRONG, MEASURED AS FINE, LEFT ALONE.**
+He recomputes the horizontal magnitude from the raw ring using the baseline
+frozen at the event; the Python runs on the detector's own live trace, whose
+baseline is still adapting through the pre-window. The Python's own docstring
+says it does this so "the two stages never disagree about what the signal is",
+so this looked like a clear divergence to remove.
+
+Measured over 64 comparisons — 16 captures x absolute floors of 10/20/30/50 mg —
+the two agree to **0.000000 ms**. Not closely. Identically. And there is an
+argument the frozen reference is the *better* input, since AIC's model is two
+stationary segments and a baseline chasing the onset flattens the very
+transition being looked for. Changing it would have cost ~9 KB of stored trace
+to buy nothing. **His version stands; the review item was withdrawn.**
+
+**2. Sub-sample interpolation — TRIED, REJECTED.** Fitting a parabola to
+`AIC(k-1..k+1)` and taking its vertex is the standard way to beat sample
+quantisation (1.2 ms at 833 Hz). On paper it should have helped.
+
+| across floors 10-50 mg | mean spread | worst |
+|---|---|---|
+| plain pick at the sample | **0.000 ms** | 0.000 ms |
+| parabolic sub-sample | 0.060 ms | 0.253 ms |
+
+It made stability *worse*: the window shifts with the trigger and drags the
+vertex with it, so an exactly floor-independent answer became a slightly
+floor-dependent one. Not adopted. **Do not re-add it without new evidence.**
+
+The conclusion that matters: **the remaining onset uncertainty is no longer in
+the estimator.** AIC is already exactly threshold-independent. What is left is
+the sample period (1.2 ms) and the timestamp jitter (334 us) — properties of the
+sampling, not of the algorithm. The only lever that moves them is a higher ODR,
+and both sit far below the still-unmeasured buzzer latency.
+
+**3. The backdating history — CONFIRMED, and worse than the review estimated.**
+He used a fixed 32-slot buffer; the Python sizes it `confirm_n + 5` (18 at
+833 Hz). The buffer is scanned on confirmation for the first sample above the
+floor, and that is its whole job: undo the latency the confirmation just cost,
+nothing more. A longer one lets the backdate reach past the confirmation into an
+unrelated earlier excursion — above the floor but below `ratio_on`, such as a
+settling wobble.
+
+On `Data/accel_20260909_121238.csv` that is a **115 ms** error (183.79 ms
+reported instead of 299.28 ms), in the direction that turns a valid start into a
+false one. `confirm_n + 5` is not a magic number, it is a principled bound.
+
+### The five corrections in `AlgorithmRealTimeFixed/`
+
+1. `hist_cap = confirm_n + 5` instead of 32 — the 115 ms one above.
+2. **`NOT JUDGEABLE` was missing entirely.** The Python's third outcome —
+   signal still above `settled_mg` in the last 200 ms of the blanking, so the
+   rise into set had not finished and nothing after it can be told from its
+   tail. Ported, tracked causally, and it outranks every other verdict.
+3. **No more silent failure.** Both early returns in `setupDetectorFromPreroll`
+   produced no output, leaving `g_hat = {0,0,0}` — which does not disable the
+   detector, it removes the projection, so `horiz` quietly becomes a high-pass
+   of the full `|a|` and the horizontal/vertical split the algorithm rests on is
+   gone. Now reported as `UNUSABLE` with the measured `|a|`.
+4. **Wrap-safe comparisons** in `classifyEvent`, matching the rest of the
+   firmware. See below — this one is not theoretical.
+5. The `float[300]` stack copies (3.6 KB) and the silent `min(rest_n, 300)` and
+   `MAX_AIC` truncations are gone; `MAX_EVENTS` overflow is now reported.
+
+### Validated against the Python on the host, not just compiled
+
+The same C++ was built with `clang++` against a small `Arduino.h` shim and
+replayed over all 19 captures, following the firmware's exact sequence
+(calibrate from the pre-roll, replay it, then feed live samples from `set`).
+Scratch harness, not in the repo — worth re-creating for any future detector
+change, since it checks the port against the Python without flashing anything.
+
+| | vs `Tools/start_detector.py` |
+|---|---|
+| **Fixed** | **18/19 identical to 0.00 ms**; `NOT JUDGEABLE` agrees 19/19 |
+| his | two disagreements: **-115.49 ms** and -15.03 ms |
+
+### The 19th capture: `micros()` wrapped, and only the fixed version survived it
+
+`Data/accel_20260909_133119.csv` straddles the ~71 minute wrap:
+
+```
+set_t_us = 4294112776      (854 ms below UINT32_MAX)
+go_t_us  =    1598118      (already past zero)
+(go - set) mod 2^32 = 2.452638 s     <- squarely in the 2.2-3.0 s GO_DELAY range
+```
+
+The fixed firmware puts the event at `go + 175.59 ms`, which signed arithmetic
+confirms exactly (175 591 us). The Python and his C++ both conclude "everything
+is pre-set" and judge nothing — the Python because it compares `t_s` in float
+seconds, his because he compares `t_us` with unsigned `<`.
+
+So the wrap is **not** a 71-minute curiosity to be handled someday: it is
+already in the data, one capture in nineteen.
+
+### Before this goes to the track: `settled_mg` will refuse almost everything
+
+With the Python default of 15 mg, **16 of the 19 captures would report
+`NOT JUDGEABLE`** — peak movement in the checked window runs 7.1 to 711 mg,
+median 66. Those are bench runs with the board being handled, not an athlete on
+blocks, so the figure says nothing about the real case.
+**[WRONG — corrected 2026-09-14: they ARE an athlete on blocks, all nineteen.
+The measurement this section calls missing was already in them: a held set reads
+3.1 mg median, 7.0 mg p95. The defect is when the check runs, not its value.
+See the top section.]**
+What it does say is that
+flashing this untouched would very likely produce a device that declines to
+judge nearly every attempt.
+
+This is the same number HANDOFF has been calling the most useful one still
+missing: **how much a real athlete actually moves while holding the set
+position.** It is a single constant, `DET_SETTLED_MG` in `StartDetector.h`, with
+the reasoning written above it. Measure it on one athlete before the first
+session.
+
+### Open, and new since 09-11
+
+- **`Tools/start_detector.py` mis-reads any capture spanning the `micros()`
+  wrap.** The fault is upstream of the detector: the `t_s` column arrives
+  already broken (it reaches -4288 s on `133119`), because whatever emits it
+  subtracts without wrap handling. Every offline analysis therefore has a blind
+  spot that opens once every 71 minutes of uptime. Not yet fixed.
+- The 19 captures of 09-09 are now analysed: reaction times of 126-299 ms plus
+  two pre-`go` events. **They were all taken through the 3 kHz off-resonance
+  beep**, so the stimulus intensity behind them is unknown and none of these
+  numbers may be used to tune anything.
+- Still nothing on hardware: the on-device detector has never run on the board,
+  and no reaction time has been taken through the 4 kHz antiphase drive.
+- The buzzer's acoustic latency is still unmeasured and still dominates.
+- `Tools/.vscode/settings.json` (his conda IDE config) is committed; probably
+  should not be.
+
+### State of the tree
+
+`main` is one commit ahead of `origin/main` — `e362727` (the 09-11 buzzer work,
+rebased onto his `da47893`) — and **not pushed**. On top of that, uncommitted:
+`AccelStream/` carries his detector hooks plus the two headers,
+`AlgorithmRealTime/` has the rename and its 8-10 s `SET_DELAY`, and
+`AlgorithmRealTimeFixed/` is entirely new. Held deliberately, by request.
+
+---
 
 ## READ THIS FIRST — 2026-09-11: the beep was too quiet to use, and that was a measurement bug, not a comfort one
 

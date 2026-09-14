@@ -1,7 +1,7 @@
-// Sketch minimo di diagnostica: nessun IMU, nessun BLE, nessuna FIFO.
-// Serve a isolare se il problema e' nella board/cavo/porta o nel resto del
-// firmware. Stampa un heartbeat ogni secondo e rimanda indietro ogni byte
-// ricevuto, cosi' e' impossibile confonderlo con un blocco silenzioso.
+// Minimal diagnostic sketch: no IMU, no BLE, no FIFO. It exists to separate
+// "the board, cable or port is at fault" from "the rest of the firmware is".
+// It prints a heartbeat every second and echoes back every byte it receives,
+// so it cannot be mistaken for a silent hang.
 
 unsigned long lastBeat = 0;
 

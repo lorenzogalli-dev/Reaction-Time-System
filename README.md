@@ -102,10 +102,10 @@ Both units are the same board family, which keeps the bill of materials simple a
 
 ## 💻 Software Stack
 
-- **Firmware (implemented today):** Arduino IDE (C/C++), the vendored Seeed `LSM6DS3` library, `Wire.h` (I2C) — see `Arduino/AccelStream/AccelStream.ino`, the current no-BLE accelerometer capture firmware used for on-block validation.
+- **Firmware (implemented today):** Arduino IDE (C/C++), the vendored Seeed `LSM6DS3` library, `Wire.h` (I2C) — see `Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`, the current no-BLE accelerometer capture firmware used for on-block validation.
 - **Firmware (not yet implemented):** the Zigbee start↔finish link and the finish-unit's BLE bridge to the phone described above don't exist in this repo yet — likely to need Nordic's own SDK/Zephyr for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain `ArduinoBLE` library. Tracked on the [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
 - **Companion app:** Flutter (Dart) — `flutter_blue_plus` for BLE.
-- **Capture/analysis tooling:** Python (`Tools/capture.py`, `Tools/start_detector.py`) — see [BUILD.md](./BUILD.md) for exact versions and setup.
+- **Capture/analysis tooling:** Python (`capture.py`, `start_detector.py`) — see [BUILD.md](./BUILD.md) for exact versions and setup.
 - **Photo-finish AI pipeline:** computer-vision torso-crossing detection + sub-frame interpolation *(premium tier, planned)*.
 
 ---
@@ -170,19 +170,25 @@ This is a back-of-the-envelope model to size the opportunity, not a forecast —
 ```
 Reaction-Time-System/
 ├── Arduino/                     # Arduino sketches (.ino), one folder per sketch
-│   ├── AccelStream/             # current firmware: start sequence + capture
+│   ├── AlgorithmRealTime/       # current firmware + its Python bench tooling
+│   │   ├── AlgorithmRealTime.ino   # start sequence, capture, on-device detector
+│   │   ├── StartDetector.h         # causal STA/LTA stage
+│   │   ├── AicPicker.h             # AIC onset refinement + the verdict rule
+│   │   └── Python_Tools/           # bench tooling, never runs on the board
+│   │       ├── capture.py          # writes the board's dumps to CSV; no logic
+│   │       ├── start_detector.py   # the same algorithm offline (GUI/CLI): tuning
+│   │       │                       #   and the reference the C++ is checked against
+│   │       └── verify_rate.py      # pass/fail check on rate, clock and integrity
+│   ├── BuzzerSweep/             # diagnostic: finds the buzzer's resonance
 │   ├── ClockCheck/              # diagnostic: measures real micros() resolution
 │   ├── SerialEchoTest/          # minimal hardware/cable sanity check
 │   ├── I2C_Scanner/             # I2C bus debug sketch
 │   └── libraries/               # vendored board libraries (Seeed LSM6DS3)
 ├── Flutter App/
 │   └── prostart/                # Flutter companion app
-├── Tools/                       # Python capture/analysis scripts
-│   ├── capture.py               # writes the board's dumps to CSV; no logic
-│   ├── start_detector.py        # STA/LTA onset + false-start detector (GUI/CLI)
-│   └── verify_rate.py           # pass/fail check on rate, clock and integrity
 ├── Data/                        # recorded CSV captures and their plots
 ├── Docs/                        # diagrams and figures
+├── RUN.md                       # what each file is and the command to run it
 ├── INFO.md                      # how the detection algorithm works, and why
 ├── BUILD.md                     # exact versions and how to run every component
 ├── HANDOFF.md                   # working notes for an agent picking this up
@@ -217,7 +223,7 @@ What we're actually seeing right now, not a wishlist:
 - 🔄 **Zigbee start↔finish link — in progress.** We're now building and testing the two-XIAO link; the open question is whether the two boards' independent clocks can be synchronized tightly enough over Zigbee for reaction-time-grade precision. Not yet validated.
 - 🔊 **Speaker audibility** on an active, noisy track, at range.
 - 🔋 **Battery life** under real, extended use, for both units.
-- 🛠️ **Firmware reliability.** An earlier firmware combining BLE, a hardware FIFO, and a software PLL for timestamping turned out to hang or crash-loop unpredictably on two separate boards; the root cause was never isolated, so it was replaced with a deliberately minimal, no-BLE accelerometer firmware (`Arduino/AccelStream/AccelStream.ino`) that's now verified working on real hardware. Full write-up in `HANDOFF.md`. The lesson for the Zigbee work ahead: add complexity one piece at a time, testing after each addition, rather than integrating everything at once.
+- 🛠️ **Firmware reliability.** An earlier firmware combining BLE, a hardware FIFO, and a software PLL for timestamping turned out to hang or crash-loop unpredictably on two separate boards; the root cause was never isolated, so it was replaced with a deliberately minimal, no-BLE accelerometer firmware (`Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`) that's now verified working on real hardware. Full write-up in `HANDOFF.md`. The lesson for the Zigbee work ahead: add complexity one piece at a time, testing after each addition, rather than integrating everything at once.
 
 ---
 

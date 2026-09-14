@@ -2,11 +2,10 @@
 
 void setup() {
   Serial.begin(115200);
-  // Stesso motivo spiegato in Arduino/BLEtest/BLEtest.ino: sul XIAO nRF52840
-  // la USB e' nativa e `Serial` diventa true solo quando un host apre la porta
-  // CDC, quindi un `while (!Serial)` senza limite blocca setup() per sempre se
-  // la board non e' collegata a un Serial Monitor. Aspetta al massimo 3
-  // secondi, poi procedi comunque.
+  // On the XIAO nRF52840 the USB is native, so `Serial` only becomes true once
+  // a host opens the CDC port. An unbounded `while (!Serial)` therefore blocks
+  // setup() forever whenever the board is not attached to a Serial Monitor.
+  // Wait at most 3 seconds, then carry on regardless.
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) delay(10);
 

@@ -4,9 +4,11 @@
 #include "AicPicker.h"
 
 static StartDetector detector;
+
 // ---------------------------------------------------------------------------
-// AccelStream - no-BLE accelerometer streamer + full-rate buffered recorder,
-// XIAO nRF52840 Sense.
+// AlgorithmRealTime - no-BLE accelerometer streamer + full-rate buffered
+// recorder with the start detector running on the board, XIAO nRF52840 Sense.
+// Named AccelStream through v4; the version history below uses that name.
 //
 // v2: the first version polled the IMU with three separate
 // readFloatAccelX/Y/Z() calls (six I2C transactions/sample - each has fixed
@@ -62,7 +64,13 @@ static StartDetector detector;
 //   t_us,x_g,y_g,z_g
 // The button (BUTTON_PIN to GND) starts a sequence; pressing it again during
 // one aborts. Nothing is printed during a sequence except its progress lines
-// SEQ,armed / SEQ,marks / SEQ,set / SEQ,go / SEQ,abort,<why>.
+// SEQ,armed / SEQ,marks / SEQ,set / SEQ,gate,<ms>,<mg>,<how> / SEQ,go /
+// SEQ,abort,<why>.
+//   SEQ,armed  the button was pressed; a sequence is starting.
+//   SEQ,gate   the athlete has been measured still and the judged window is
+//              open - <ms> after "set", at <mg> of movement, <how> being
+//              "still" (measured) or "cap" (gave up waiting, see
+//              DET_ARM_CAP_MS). "go" is scheduled from this instant.
 // 'b' does exactly what the button does - so the whole sequence can be
 //     exercised with no button wired yet.
 // 'a' aborts a running sequence.
@@ -154,7 +162,7 @@ static const uint32_t SAMPLE_PERIOD_US = 1000000UL / ACCEL_ODR_HZ;
 #endif
 
 #ifndef PIN_LSM6DS3TR_C_INT1
-#error "AccelStream needs the IMU's data-ready line (PIN_LSM6DS3TR_C_INT1). Select a XIAO nRF52840 *Sense* - the plain XIAO has no onboard IMU - or define the pin by hand if you wired an external one."
+#error "AlgorithmRealTime needs the IMU's data-ready line (PIN_LSM6DS3TR_C_INT1). Select a XIAO nRF52840 *Sense* - the plain XIAO has no onboard IMU - or define the pin by hand if you wired an external one."
 #endif
 
 // DRDY is level-latched: it goes high when a sample is ready and only drops
@@ -223,12 +231,35 @@ static const uint32_t TAIL_AFTER_GO_MS = 1000;
 #define D1 1
 #endif
 static const int BUTTON_PIN = D0;   // momentary button to GND, INPUT_PULLUP
-// PASSIVE buzzer, driven with tone()/noTone() - no internal oscillator, so a
-// steady digitalWrite() level (what this used to be) produces at most one
-// click and then silence. tone()'s latency and its effect on sample timing
-// are UNVERIFIED on this core - see the comment on beep() below.
-static const int BUZZER_PIN = D1;   // (+) here; (-) to GND
-static const unsigned int BEEP_FREQ_HZ = 3000;
+// PASSIVE PIEZO buzzer, driven ANTIPHASE from two pins by the nRF52840's PWM
+// peripheral. Both halves of that sentence are deliberate:
+//
+//   passive  - no internal oscillator, so a steady digitalWrite() level (what
+//              this used to be) produces one click and then silence.
+//   antiphase - the two pins swing in opposite directions, so the element sees
+//              6.6 Vpp instead of the 3.3 Vpp a single pin against GND can
+//              give it. That is +6 dB for the cost of one GPIO and no
+//              components, and it is safe *because* the part is a piezo: a
+//              piezo is a capacitor and passes no DC, so neither pad ever
+//              sources steady current. Do NOT wire a magnetic buzzer (a
+//              ~16 ohm coil) this way - it would double a current the pad
+//              already cannot supply.
+//   PWM      - not tone(). See beep() for why that matters to the measurement.
+//
+// WIRING: buzzer (+) -> D1, buzzer (-) -> D2. There is no connection to GND.
+static const int BUZZER_PIN   = D1;   // (+)
+static const int BUZZER_PIN_B = D2;   // (-)  - antiphase, NOT ground
+// 4000 Hz is this buzzer's measured resonance, not a round number. A frequency
+// sweep on 2026-09-11 (Arduino/BuzzerSweep) found a clear peak at 4000 Hz with
+// weaker secondary modes at 1600 and 4700; the previous 3000 Hz sat off the
+// peak, which is most of why the beep was too quiet to use at the track. The
+// same sweep identified the part as a PIEZO - toggling the nRF52840 pad to
+// high drive (5 mA) changed the level not at all, so it is voltage-driven and
+// capacitive, not a current-driven magnetic coil.
+//
+// Re-run the sweep if the buzzer is ever replaced: resonance is a property of
+// the part, and a Q of ~20 makes the peak only a couple of hundred Hz wide.
+static const unsigned int BEEP_FREQ_HZ = 4000;
 
 static const uint32_t BUTTON_DEBOUNCE_MS = 30;
 static const uint32_t BEEP_MS = 100;
@@ -237,21 +268,49 @@ static const uint32_t BEEP_MS = 100;
 // is that an anticipated "go" is exactly what a reaction time must not
 // measure. Arduino's random(a, b) is inclusive of a, exclusive of b.
 static const long MARKS_DELAY_MIN_MS = 2000,  MARKS_DELAY_MAX_MS = 3001;
-static const long SET_DELAY_MIN_MS   = 8000, SET_DELAY_MAX_MS   = 10001;
-// set -> go raised from 1-2 s to 2.2-3 s on 2026-09-08. An athlete needs about
-// a second to rise into the set position after the command, and that rise is a
-// real movement of several hundred mg. At 1-2 s the "go" could fire while they
-// were still settling, which makes the reaction time meaningless, and left
-// almost no judged window after the rise. The detector blanks the first second
-// after "set" to match (blank_ms in start_detector.py); these two numbers are
-// a pair - change one and revisit the other.
-static const long GO_DELAY_MIN_MS    = 2200,  GO_DELAY_MAX_MS    = 3001;
+// Back to 20-25 s on 2026-09-11, the original v4 value (it had been shortened
+// to 10-15 s to make bench iteration less tedious). This is the realistic
+// "on your marks" hold, and it costs nothing: the sample ring fills
+// continuously in every state, so a pause that overwrites it several times
+// over is expected - the dump window is measured backwards from "set", not
+// forwards from here.
+static const long SET_DELAY_MIN_MS   = 20000, SET_DELAY_MAX_MS   = 25001;
+// set -> go is no longer a blind random from "set". The firmware now waits for
+// the athlete to be measured still (StartDetector's arming gate) and fires this
+// long AFTER that instant, the way a starter holds the gun until the field is
+// steady. What the athlete can anticipate is therefore this window, not the
+// time since "set" - which is why it, and not the old 2.2-3.0 s, is the
+// unpredictability budget. 700 ms of spread, chosen against the measured
+// set->go it produces (median 2.29 s, 17% over 3 s) rather than in the
+// abstract; widen it if athletes start anticipating, at a cost in waiting.
+//
+// Raised from 500-1200 on 2026-09-14. With the athlete settling at set+1.0 s -
+// which is what the 09-11 captures show - the old window put set->go at a
+// median of 1.87 s and as low as 1.50 s. A real starter holds "set" for about
+// 1.5-2.0 s, so that was at the short end of it. 700-1500 moves the median to
+// 2.12 s with a 1.70 s floor, and widens the unpredictability budget from
+// 700 ms to 800 ms. Above ~1000 ms of minimum the ceiling below starts being
+// hit often enough to matter (19% on the 09-09 captures against 8% here).
+static const long GO_AFTER_ARM_MIN_MS = 700,  GO_AFTER_ARM_MAX_MS = 1501;
+
+// Hard ceiling on set -> go however late the arming lands. Without it a slow
+// settle plus the random could reach 4.5 s, and a sprinter held that long in
+// the set position is a worse measurement, not a safer one.
+//
+// RANDOMISED, and that is not decoration. A fixed ceiling fires "go" at
+// exactly set + 3.5 s every time it clamps, which hands the athlete a
+// perfectly predictable instant in precisely the case where they were slow to
+// settle - and being slow to settle is common enough (8% of attempts at the
+// current window, and rising with it) for that to be learnable. A ceiling that
+// is itself unpredictable cannot be counted on.
+static const long SET_TO_GO_CAP_MIN_MS = 3400, SET_TO_GO_CAP_MAX_MS = 3601;
 
 enum SeqState {
   SEQ_IDLE,        // nothing running; idle preview streams
   SEQ_WAIT_MARKS,  // button pressed, waiting to sound "on your marks"
   SEQ_WAIT_SET,    // "on your marks" sounded, waiting to sound "set"
-  SEQ_WAIT_GO,     // "set" sounded - this is the false-start window
+  SEQ_WAIT_ARM,    // "set" sounded - waiting for the athlete to go still
+  SEQ_WAIT_GO,     // armed - the judged window is open, "go" is scheduled
   SEQ_TAIL         // "go" sounded, capturing TAIL_AFTER_GO_MS more
 };
 static SeqState seqState = SEQ_IDLE;
@@ -263,6 +322,18 @@ static bool randomSeeded = false;
 // Value of recWritten at the instant "set" sounded - the boundary the dump
 // window is measured from, in both directions.
 static uint32_t setSampleIdx = 0;
+
+// What the board decided, kept so dumpRecording() can write it into the CSV.
+// The verdict is a property of THIS run, taken by the firmware at the instant
+// it had the data - not something a host should have to re-derive later. See
+// the note on ARM in dumpRecording().
+// Drawn once per attempt, at "set": the ceiling has to be a single instant for
+// the whole run, not re-rolled on every poll of the arming gate.
+static uint32_t goCapUs = 0;
+
+static const char* lastVerdict = nullptr;
+static float lastReactionMs = 0.0f;
+static uint32_t lastOnsetUs = 0;
 
 static bool imuReady = false;
 static uint32_t idleSampleIndex = 0;
@@ -337,7 +408,10 @@ void setup() {
   while (!Serial && millis() - waitStart < 3000) delay(10);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN_B, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN_B, LOW);
+  buzzerInit();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef PIN_LSM6DS3TR_C_POWER
@@ -397,8 +471,13 @@ void setup() {
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
   Serial.print("Start sequence: press the button on D");
   Serial.print(BUTTON_PIN);
-  Serial.print(" (or send 'b'); buzzer on D");
-  Serial.println(BUZZER_PIN);
+  Serial.print(" (or send 'b'); buzzer antiphase on D");
+  Serial.print(BUZZER_PIN);
+  Serial.print("/D");
+  Serial.print(BUZZER_PIN_B);
+  Serial.print(" at ");
+  Serial.print(BEEP_FREQ_HZ);
+  Serial.println(" Hz");
   Serial.println("  button -> 2-3s -> MARKS -> 20-25s -> SET -> 2.2-3s -> GO -> 1s -> dump");
   Serial.println("  'a' or a second press aborts. 'd' dumps the ring as-is.");
 }
@@ -474,6 +553,28 @@ static void dumpRecording(bool wholeRing) {
   // fact, instead of trusting that whoever recorded it used the right core.
   Serial.print("CLOCKSTEP,");
   Serial.println(clockStepUs);
+  // ARM is a marker in exactly the sense ON/SET/GO are: an instant the board
+  // decided, on the board's own clock. It is written down rather than left to
+  // be recomputed because re-deriving it from the samples is not guaranteed to
+  // land on the same instant - the board works in float32 and numpy in
+  // float64, and on a capture where the signal hovers at the stillness limit a
+  // 0.3 mg difference moved the arming by 1.5 s. Reading the decision beats
+  // reconstructing it, for the same reason the "go" beep is timestamped rather
+  // than inferred.
+  if (detector.gate_open) {
+    Serial.print("ARM,");     Serial.println(detector.gate_t_us);
+    Serial.print("ARMMG,");   Serial.println(detector.gate_peak_mg, 2);
+    Serial.print("ARMCAP,");  Serial.println(detector.gate_capped ? 1 : 0);
+  }
+  // And the verdict itself. Without this the board's answer lives only in the
+  // terminal: reopen the capture tomorrow and there is nothing to compare the
+  // offline analysis against, which is precisely the comparison that catches a
+  // firmware and a bench tool drifting apart.
+  if (lastVerdict != nullptr) {
+    Serial.print("VERDICT,");  Serial.println(lastVerdict);
+    Serial.print("RTMS,");     Serial.println(lastReactionMs, 3);
+    Serial.print("ONSET,");    Serial.println(lastOnsetUs);
+  }
   for (uint32_t i = from; i < recWritten; i++) {
     uint32_t slot = i % MAX_REC_SAMPLES;
     printCsvRow(recT[slot], recX[slot], recY[slot], recZ[slot]);
@@ -518,10 +619,13 @@ static void serviceSampling() {
   recZ[slot] = rawZ;
   recWritten++;
 
-  // Deteção causal em tempo real após a ordem de "SET"
-  if (seqState == SEQ_WAIT_GO || seqState == SEQ_TAIL) {
+  // Causal, real-time detection once the "set" command has been given. Fed the
+  // same samples the ring stores, so the on-device verdict and the dumped CSV
+  // can never disagree about what the detector saw.
+  if (seqState == SEQ_WAIT_ARM || seqState == SEQ_WAIT_GO || seqState == SEQ_TAIL) {
     detector.update(t, rawToG(rawX), rawToG(rawY), rawToG(rawZ));
   }
+
   // Preview only while no sequence is running: during a start, serial stays
   // silent apart from the SEQ lines, so nothing can interleave with the run
   // or with the dump that follows it.
@@ -538,21 +642,110 @@ static void serviceSampling() {
   }
 }
 
+// --- buzzer drive ----------------------------------------------------------
+//
+// Two complementary square waves from the PWM peripheral, replacing tone().
+// tone() was wrong here for three separate reasons, all of which land on the
+// one instant the whole measurement is referenced to:
+//
+//  1. It drives ONE pin, so it cannot do the antiphase that buys the +6 dB.
+//  2. The mbed core's tone() does `new Tone` and `new DigitalOut` on every
+//     call - a heap allocation at the exact microsecond that defines the
+//     reaction time's zero. malloc is not constant-time, and on a fragmented
+//     heap it is not even bounded.
+//  3. That same implementation leaks: Tone::stop() nulls its DigitalOut*
+//     instead of deleting it, so every beep loses the object. Three beeps a
+//     run, forever, on a board with ~70 KB free.
+//
+// The PWM peripheral has none of these. Starting it is two register writes,
+// the first edge follows within one 16 MHz tick, and it then runs from its own
+// hardware with no CPU and no interrupts - which matters because the "go" beep
+// overlaps the 100 ms in which the athlete's push-off is being sampled, and a
+// software ticker would be firing 8000 times a second right through it.
+//
+// PWM2 is used rather than PWM0 because the mbed core hands out PWM instances
+// from 0 upwards for analogWrite()/PwmOut. This sketch calls neither today,
+// but taking the far end of the range costs nothing and keeps it that way.
+static uint16_t buzzerPwmSeq[4];   // read by EasyDMA: must be RAM, must persist
+static NRF_PWM_Type* const BUZZER_PWM = NRF_PWM2;
+
+static void buzzerInit() {
+  // COUNTERTOP at the 16 MHz prescaler; 4000 Hz -> 4000 counts, well inside
+  // the 15-bit field. A 50% duty is COUNTERTOP/2.
+  const uint16_t half = (uint16_t)((16000000UL / BEEP_FREQ_HZ) / 2);
+
+  // Bit 15 of a sequence value is the channel's polarity: 0 means the output
+  // starts the period HIGH and falls at the compare, 1 means it starts LOW and
+  // rises there. Same compare, opposite polarity = exact antiphase.
+  buzzerPwmSeq[0] = half;             // D1
+  buzzerPwmSeq[1] = half | 0x8000u;   // D2, inverted
+  buzzerPwmSeq[2] = 0;                // channels 2 and 3 are unconnected, but
+  buzzerPwmSeq[3] = 0;                // Individual load still consumes 4 words
+
+  BUZZER_PWM->PSEL.OUT[0] = (uint32_t)digitalPinToPinName(BUZZER_PIN);
+  BUZZER_PWM->PSEL.OUT[1] = (uint32_t)digitalPinToPinName(BUZZER_PIN_B);
+  BUZZER_PWM->PSEL.OUT[2] = 0xFFFFFFFFUL;   // CONNECT = Disconnected
+  BUZZER_PWM->PSEL.OUT[3] = 0xFFFFFFFFUL;
+
+  BUZZER_PWM->MODE       = PWM_MODE_UPDOWN_Up;
+  BUZZER_PWM->PRESCALER  = PWM_PRESCALER_PRESCALER_DIV_1;
+  BUZZER_PWM->COUNTERTOP = 16000000UL / BEEP_FREQ_HZ;
+  BUZZER_PWM->DECODER    = (PWM_DECODER_LOAD_Individual    << PWM_DECODER_LOAD_Pos) |
+                           (PWM_DECODER_MODE_RefreshCount  << PWM_DECODER_MODE_Pos);
+
+  BUZZER_PWM->SEQ[0].PTR      = (uint32_t)buzzerPwmSeq;
+  BUZZER_PWM->SEQ[0].CNT      = 4;
+  BUZZER_PWM->SEQ[0].REFRESH  = 0;
+  BUZZER_PWM->SEQ[0].ENDDELAY = 0;
+
+  // One loop plus LOOPSDONE->SEQSTART0 is the peripheral's idiom for "repeat
+  // until stopped"; without it the sequence would play once and fall silent.
+  BUZZER_PWM->LOOP   = 1;
+  BUZZER_PWM->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+}
+
+static void buzzerDriveOn() {
+  BUZZER_PWM->ENABLE = 1;
+  BUZZER_PWM->TASKS_SEQSTART[0] = 1;
+}
+
+static void buzzerDriveOff() {
+  // Clear the short first, or the restart it schedules can outlive the stop.
+  BUZZER_PWM->SHORTS = 0;
+  BUZZER_PWM->EVENTS_STOPPED = 0;
+  BUZZER_PWM->TASKS_STOP = 1;
+  while (BUZZER_PWM->EVENTS_STOPPED == 0) { }
+  BUZZER_PWM->ENABLE = 0;
+
+  // Disabling the peripheral hands the pads back to the GPIO block holding
+  // whatever level they stopped on. Left apart, that is a DC bias across the
+  // element; tie both low so it rests unstressed and silent.
+  pinMode(BUZZER_PIN,   OUTPUT);
+  pinMode(BUZZER_PIN_B, OUTPUT);
+  digitalWrite(BUZZER_PIN,   LOW);
+  digitalWrite(BUZZER_PIN_B, LOW);
+
+  BUZZER_PWM->SHORTS = PWM_SHORTS_LOOPSDONE_SEQSTART0_Msk;
+}
+
 // Drives the buzzer and stamps the marker in one place. The timestamp is
 // taken immediately AFTER tone() starts the drive signal, so it marks the
 // electrical instant the transducer was driven. What separates that from the
 // first pressure wave reaching the athlete is the buzzer's own latency - for
 // an active buzzer this was a fixed 5-20 ms acoustic startup, constant and
-// one-directional, hence a calibration constant rather than an error. With
-// tone() driving a passive buzzer, that number has NOT been remeasured, and
-// tone()'s own call latency and its effect on the DRDY-interrupt sample
-// timing are UNVERIFIED on this core - check verify_rate.py / CLOCKSTEP /
-// DROPPED across a real beep before trusting a reaction time from this build.
-// Measure the acoustic latency the same way as before (GPIO + microphone on
-// one time base) and subtract it; re-measure if the buzzer or BEEP_FREQ_HZ
-// changes.
+// one-directional, hence a calibration constant rather than an error.
+//
+// That constant has NEVER been measured on this project, and it is now the
+// dominant term in the whole error budget (detection is ~1-2 ms). It is also
+// no longer the number the old handover notes describe: the part is a piezo
+// at resonance driven antiphase, not an active buzzer, and a high-Q resonator
+// rings up over roughly Q/pi cycles - at 4 kHz that is on the order of a
+// millisecond or two, likely *better* than the 5-20 ms previously assumed,
+// but assumed is exactly the problem. Measure it once with a GPIO edge and a
+// microphone on one time base and subtract it. Re-measure if the buzzer,
+// BEEP_FREQ_HZ or the antiphase wiring changes - all three move it.
 static void beep(uint32_t* markerOut, bool* capturedOut) {
-  tone(BUZZER_PIN, BEEP_FREQ_HZ);
+  buzzerDriveOn();
   uint32_t t = micros();
   buzzerOn = true;
   buzzerOffUs = t + BEEP_MS * 1000UL;
@@ -567,34 +760,46 @@ static void beep(uint32_t* markerOut, bool* capturedOut) {
 // a micros() deadline checked from loop(), never a delay.
 static void serviceBuzzer() {
   if (buzzerOn && (int32_t)(micros() - buzzerOffUs) >= 0) {
-    noTone(BUZZER_PIN);
+    buzzerDriveOff();
     buzzerOn = false;
   }
 }
 
+// ===========================================================================
+// On-device STA/LTA + AIC
+// ===========================================================================
 
-// ===========================================================================
-// STA/LTA + AIC Logic
-// ===========================================================================
+// Seeds the detector from the pre-roll that is already in the ring: estimates
+// gravity from the resting window, then replays the remaining pre-roll samples
+// so the LTA is warm by the time "set" opens the judged window. Without this
+// the detector would be blind for one LTA time constant (~800 ms) starting at
+// exactly the moment a false start becomes possible.
+//
+// The gravity sum is accumulated over the ring in place. The original copied
+// the resting window into three float[300] locals - a 3.6 KB stack frame and a
+// silent min(rest_n, 300) cap that is invisible at 833 Hz and shortens the
+// calibration window at any higher ODR.
 static void setupDetectorFromPreroll() {
-  detector.begin((float)ACCEL_ODR_HZ);
+  detector.begin((float)ACCEL_ODR_HZ, setT);
 
   uint32_t oldest = (recWritten > MAX_REC_SAMPLES) ? (recWritten - MAX_REC_SAMPLES) : 0;
   uint32_t from = (setSampleIdx > PREROLL_SAMPLES) ? (setSampleIdx - PREROLL_SAMPLES) : 0;
   if (from < oldest) from = oldest;
 
-  uint32_t count = recWritten - from;
-  if (count < detector.rest_n) return;
+  uint32_t rn = detector.rest_n;
+  if (recWritten - from < rn) {
+    detector.calibrateGravity(0.0f, 0.0f, 0.0f, recWritten - from);  // records the fault
+    return;
+  }
 
-  float restX[300], restY[300], restZ[300];
-  uint32_t rn = min((uint32_t)detector.rest_n, 300UL);
+  float sx = 0.0f, sy = 0.0f, sz = 0.0f;
   for (uint32_t i = 0; i < rn; i++) {
     uint32_t slot = (from + i) % MAX_REC_SAMPLES;
-    restX[i] = rawToG(recX[slot]);
-    restY[i] = rawToG(recY[slot]);
-    restZ[i] = rawToG(recZ[slot]);
+    sx += rawToG(recX[slot]);
+    sy += rawToG(recY[slot]);
+    sz += rawToG(recZ[slot]);
   }
-  if (!detector.calibrateGravity(restX, restY, restZ, rn)) return;
+  if (!detector.calibrateGravity(sx, sy, sz, rn)) return;
 
   for (uint32_t i = from + rn; i < recWritten; i++) {
     uint32_t slot = i % MAX_REC_SAMPLES;
@@ -602,49 +807,84 @@ static void setupDetectorFromPreroll() {
   }
 }
 
+// Second stage, once the tail has elapsed: AIC refines each trigger's onset,
+// then the product rule turns it into a verdict. Both are non-causal (AIC
+// reads samples after the trigger), which is why they run here and not in
+// update() - on device that only delays the report, never the timestamp.
 static void evaluateAndReportResults() {
-  uint32_t prev_t = 0;
+  lastVerdict = nullptr;
+  lastReactionMs = 0.0f;
+  lastOnsetUs = 0;
   for (int i = 0; i < detector.num_events; i++) {
     uint32_t ref_t = detector.events[i].t_us;
     float moved = 0.0f;
+    const char* why = nullptr;
+    uint32_t prev_t = (i > 0) ? detector.events[i - 1].t_us : 0;
     bool ok = refineOnsetAIC(detector.events[i].trigger_t_us, prev_t,
                              recT, recX, recY, recZ, recWritten, MAX_REC_SAMPLES,
                              ACCEL_SCALE_G_PER_LSB, detector.g_hat, detector.events[i].b_h,
-                             &ref_t, &moved);
+                             &ref_t, &moved, &why);
     if (ok) {
       detector.events[i].t_us = ref_t;
       detector.events[i].aic_ok = true;
       detector.events[i].aic_moved_ms = moved;
     }
-    prev_t = detector.events[i].t_us;
     classifyEvent(&detector.events[i], setT, goT);
   }
 
-  DetectedEvent* primary = nullptr;
-  for (int i = 0; i < detector.num_events; i++) {
-    if (strcmp(detector.events[i].verdict, "pre-set (settling)") != 0 &&
-        strcmp(detector.events[i].verdict, "rise into set (not judged)") != 0) {
-      primary = &detector.events[i];
-      break;
-    }
-  }
-
-  Serial.println("\n================================================");
+  Serial.println();
+  Serial.println("================================================");
   Serial.println(">> ON-DEVICE DETECTION RESULT <<");
-  if (primary != nullptr) {
-    Serial.print("VERDICT       : "); Serial.println(primary->verdict);
-    Serial.print("Reaction Time : "); Serial.print(primary->reaction_ms, 1); Serial.println(" ms");
-    Serial.print("STA/LTA Trig  : "); Serial.print(primary->trigger_t_us); Serial.println(" us");
-    Serial.print("AIC Refined   : "); Serial.print(primary->t_us);
-    Serial.print(" us (shift: "); Serial.print(primary->aic_moved_ms, 1);
-    Serial.println(primary->aic_ok ? " ms, AIC OK)" : " ms, KEPT THRESHOLD)");
-    Serial.print("Horiz Energy  : "); Serial.print(primary->horiz_mg, 1); Serial.println(" mg");
-  } else {
-    Serial.println("No movement detected in the judged window.");
-  }
-  Serial.println("================================================\n");
-}
 
+  // A fault outranks everything: without a gravity estimate the projection is
+  // not the horizontal component and nothing below would mean what it says.
+  if (detector.fault != nullptr) {
+    lastVerdict = "UNUSABLE";
+    Serial.print("UNUSABLE      : "); Serial.println(detector.fault);
+    Serial.print("measured      : "); Serial.println(detector.fault_value, 3);
+    Serial.println("================================================");
+    Serial.println();
+    return;
+  }
+
+  // One verdict. The arming gate means the first event after it IS the answer:
+  // there is no settling to skip past and no second candidate to prefer.
+  if (detector.num_events > 0) {
+    DetectedEvent* ev = &detector.events[0];
+    lastVerdict = ev->verdict;
+    lastReactionMs = ev->reaction_ms;
+    lastOnsetUs = ev->t_us;
+    Serial.print("VERDICT       : "); Serial.println(ev->verdict);
+    Serial.print("Reaction Time : "); Serial.print(ev->reaction_ms, 1); Serial.println(" ms");
+    Serial.print("STA/LTA Trig  : "); Serial.print(ev->trigger_t_us); Serial.println(" us");
+    Serial.print("AIC Refined   : "); Serial.print(ev->t_us);
+    Serial.print(" us (shift: "); Serial.print(ev->aic_moved_ms, 1);
+    Serial.println(ev->aic_ok ? " ms, AIC OK)" : " ms, KEPT THRESHOLD)");
+    Serial.print("Horiz Energy  : "); Serial.print(ev->horiz_mg, 1); Serial.println(" mg");
+  } else {
+    lastVerdict = "no movement";
+    Serial.println("VERDICT       : no movement in the judged window");
+  }
+
+  // The evidence behind the arming decision, printed with every verdict.
+  Serial.print("Armed         : ");
+  Serial.print((int32_t)(detector.gate_t_us - setT) / 1000);
+  Serial.print(" ms after set, at "); Serial.print(detector.gate_peak_mg, 1);
+  Serial.print(" mg (limit "); Serial.print(DET_SETTLED_MG, 0); Serial.println(" mg)");
+
+  // Never a refusal - an annotation. The athlete never went still inside the
+  // cap, so the verdict above stands but a human should look at it.
+  if (detector.gate_capped) {
+    Serial.println("NOTE          : armed on the cap, athlete never settled -");
+    Serial.println("                verdict stands but is worth reviewing");
+  }
+  if (detector.events_dropped > 0) {
+    Serial.print("NOTE          : "); Serial.print(detector.events_dropped);
+    Serial.println(" further event(s) past MAX_EVENTS were not recorded");
+  }
+  Serial.println("================================================");
+  Serial.println();
+}
 
 static void startSequence() {
   if (seqState != SEQ_IDLE) return;
@@ -667,7 +907,7 @@ static void startSequence() {
 static void abortSequence(const char* why) {
   if (seqState == SEQ_IDLE) return;
   seqState = SEQ_IDLE;
-  noTone(BUZZER_PIN);
+  buzzerDriveOff();
   buzzerOn = false;
   Serial.print("SEQ,abort,");
   Serial.println(why);
@@ -678,6 +918,37 @@ static void abortSequence(const char* why) {
 static void serviceSequence() {
   serviceBuzzer();
   if (seqState == SEQ_IDLE) return;
+
+  // Polled, not deadline-driven: this is the one transition the athlete
+  // decides rather than the clock.
+  if (seqState == SEQ_WAIT_ARM) {
+    // Belt and braces. The detector opens its own gate on DET_ARM_CAP_MS, but
+    // that only runs while it is being fed - a failed gravity estimate makes
+    // update() return immediately and the gate would never open at all. The
+    // sequence must always reach "go", so it carries its own fallback.
+    bool stuck = (int32_t)(micros() - goCapUs) >= 0;
+    if (!detector.gate_open && !stuck) return;
+
+    uint32_t arm_us = detector.gate_open ? detector.gate_t_us : micros();
+    uint32_t go_at  = arm_us + (uint32_t)random(GO_AFTER_ARM_MIN_MS, GO_AFTER_ARM_MAX_MS) * 1000UL;
+    uint32_t hard   = goCapUs;
+    if ((int32_t)(go_at - hard) > 0) go_at = hard;
+
+    seqState = SEQ_WAIT_GO;
+    seqDeadlineUs = go_at;
+    // NOT "SEQ,armed" - that one already means "the button was pressed and a
+    // sequence is starting". Two different events must not share a token: a
+    // reader matching on the prefix would take them for the same thing.
+    Serial.print("SEQ,gate,");
+    Serial.print((int32_t)(arm_us - setT) / 1000);          // ms after "set"
+    Serial.print(',');
+    Serial.print(detector.gate_peak_mg, 1);                 // how still, in mg
+    Serial.print(',');
+    Serial.println(detector.gate_open ? (detector.gate_capped ? "cap" : "still")
+                                      : "no-detector");
+    return;
+  }
+
   if ((int32_t)(micros() - seqDeadlineUs) < 0) return;
 
   switch (seqState) {
@@ -692,8 +963,11 @@ static void serviceSequence() {
       // No buffer to start: the ring already holds the last ~13.9 s. "Set"
       // only records where in it the judged window begins.
       setSampleIdx = recWritten;
-      seqState = SEQ_WAIT_GO;
-      seqDeadlineUs = setT + (uint32_t)random(GO_DELAY_MIN_MS, GO_DELAY_MAX_MS) * 1000UL;
+      goCapUs = setT + (uint32_t)random(SET_TO_GO_CAP_MIN_MS, SET_TO_GO_CAP_MAX_MS) * 1000UL;
+      seqState = SEQ_WAIT_ARM;
+      // No deadline: the gate decides. serviceSequence() polls it above,
+      // and the detector's own cap guarantees it opens.
+      seqDeadlineUs = setT;
       Serial.println("SEQ,set");
       setupDetectorFromPreroll();
       break;

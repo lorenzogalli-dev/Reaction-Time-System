@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-capture.py - writes to disk what AccelStream.ino v4 dumps. Nothing else.
+capture.py - writes to disk what AlgorithmRealTime.ino dumps. Nothing else.
 
 This is deliberately dumb. Through v3 the host owned the recording: it held
 the state, it sent the o/s/g markers on a human's keypress, and it decided
@@ -17,8 +17,8 @@ the firmware (if it is about when) or in start_detector.py (if it is about
 what the data means).
 
 Usage:
-    python3 Tools/capture.py                 # autodetect port, run until Ctrl-C
-    python3 Tools/capture.py --port /dev/cu.usbmodem101 --outdir Data
+    python3 Arduino/AlgorithmRealTime/Python_Tools/capture.py                 # autodetect port, run until Ctrl-C
+    python3 Arduino/AlgorithmRealTime/Python_Tools/capture.py --port /dev/cu.usbmodem101 --outdir Data
 """
 
 import argparse
@@ -31,10 +31,20 @@ import time
 
 def autodetect_port():
     from serial.tools import list_ports
-    for p in list_ports.comports():
+    ports = list(list_ports.comports())
+    for p in ports:
         # The XIAO enumerates as a USB CDC device; on macOS that is
         # cu.usbmodem*, on Linux ttyACM*.
         if "usbmodem" in p.device or "ttyACM" in p.device:
+            return p.device
+        # On Windows there is no such naming, so match a COM port that
+        # describes itself as USB Serial / Seeed / J-Link.
+        if "COM" in p.device and ("USB" in (p.description or "") or "Serial" in (p.description or "")):
+            return p.device
+    # Last resort on Windows: a single COM port that is not COM1, which is
+    # usually an internal one.
+    for p in ports:
+        if p.device.startswith("COM") and p.device != "COM1":
             return p.device
     return None
 
@@ -49,7 +59,21 @@ HEADER_KEYS = {
     "TRUNCATED": "truncated",
     "DROPPED": "dropped",
     "CLOCKSTEP": "clockstep_us",
+    # The board's arming instant and its own verdict. Written down rather than
+    # left to be recomputed offline: re-deriving the arming from the samples is
+    # not guaranteed to land on the same instant (the board works in float32,
+    # numpy in float64), and without the verdict the board's answer survives
+    # only in this terminal - so a capture reopened tomorrow has nothing to
+    # check the offline analysis against.
+    "ARM": "arm_t_us",
+    "ARMMG": "arm_peak_mg",
+    "ARMCAP": "arm_capped",
+    "RTMS": "board_reaction_ms",
+    "ONSET": "board_onset_t_us",
 }
+
+# Same, but the value is text, not a number.
+TEXT_KEYS = {"VERDICT": "board_verdict"}
 
 
 def write_csv(path, header, rows):
@@ -75,7 +99,16 @@ def write_csv(path, header, rows):
             us = header.get(key, 0)
             if us:
                 f.write(f"# {key[:-5]}_t_s: {(us - t0) / 1e6:.6f}\n")
-        for key in ("preroll_samples", "truncated", "dropped", "clockstep_us"):
+        # The board's own arming instant, in the same form as on/set/go.
+        if "arm_t_us" in header:
+            f.write(f"# arm_t_us: {header['arm_t_us']}\n")
+            f.write(f"# arm_t_s: {(header['arm_t_us'] - t0) / 1e6:.6f}\n")
+        for key in ("arm_peak_mg", "arm_capped", "preroll_samples", "truncated",
+                    "dropped", "clockstep_us"):
+            if key in header:
+                f.write(f"# {key}: {header[key]}\n")
+        # And what the board decided, so the capture carries its own answer.
+        for key in ("board_verdict", "board_reaction_ms", "board_onset_t_us"):
             if key in header:
                 f.write(f"# {key}: {header[key]}\n")
         f.write("t_s,t_us,x_g,y_g,z_g\n")
@@ -95,6 +128,9 @@ def write_csv(path, header, rows):
                     f"({header.get('preroll_samples', '?')} samples)")
     if not go_us:
         warn.append("no 'go' marker in this dump")
+    if header.get("arm_capped"):
+        warn.append("armed on the cap: the athlete never settled - the verdict "
+                    "stands but is worth reviewing")
     return warn
 
 
@@ -175,9 +211,14 @@ def main():
                 continue
 
             key, _, val = line.partition(",")
+            if key in TEXT_KEYS:
+                header[TEXT_KEYS[key]] = val.strip()
+                continue
             if key in HEADER_KEYS:
                 try:
-                    header[HEADER_KEYS[key]] = int(val)
+                    # ARMMG and RTMS are not integers; keep the float rather
+                    # than dropping the line the way int() alone used to.
+                    header[HEADER_KEYS[key]] = float(val) if "." in val else int(val)
                 except ValueError:
                     pass
                 continue

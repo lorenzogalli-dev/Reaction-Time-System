@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // ClockCheck - answers one question: how fine is micros() on THIS build?
 //
-// AccelStream timestamps every sample with micros(). A bench run on
+// AlgorithmRealTime timestamps every sample with micros(). A bench run on
 // 2026-09-08 produced sample intervals that were only ever 977 us or 1954 us
 // (= 2 x 977), i.e. a hard 1/1024 s grid, while captures from a few days
 // earlier had 59 distinct interval values around 1022 us. Same sketch, same
@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 
 // Seeeduino:nrf52 needs the TinyUSB stack pulled in explicitly for Serial to
-// link (AccelStream gets it transitively through the IMU library, which this
+// link (AlgorithmRealTime gets it transitively through the IMU library, which this
 // sketch deliberately does not use). The mbed core provides Serial itself.
 #if !defined(__MBED__)
 #include <Adafruit_TinyUSB.h>

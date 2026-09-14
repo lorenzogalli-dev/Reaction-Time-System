@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify_rate.py - CLI-only check of AccelStream.ino's real recorded rate.
+verify_rate.py - CLI-only check of AlgorithmRealTime.ino's real recorded rate.
 
 No GUI, no matplotlib: connects, waits a fixed window while the firmware's
 sample ring fills, asks for it ('d'), reads the DUMP_START/.../DUMP_END burst, and
@@ -8,9 +8,9 @@ reports whether the achieved sample rate and data integrity are what the
 firmware promises (833 Hz, no dropped/corrupted rows, DROPPED=0).
 
 Usage:
-    python3 Tools/verify_rate.py                  # autodetect port, 3 s
-    python3 Tools/verify_rate.py --seconds 5
-    python3 Tools/verify_rate.py --port /dev/cu.usbmodem1101
+    python3 Arduino/AlgorithmRealTime/Python_Tools/verify_rate.py                  # autodetect port, 3 s
+    python3 Arduino/AlgorithmRealTime/Python_Tools/verify_rate.py --seconds 5
+    python3 Arduino/AlgorithmRealTime/Python_Tools/verify_rate.py --port /dev/cu.usbmodem1101
 
 Only one program can hold the serial port at a time - close the Arduino
 Serial Monitor (or capture.py) before running this.
@@ -88,6 +88,14 @@ def main():
     print(f"Letting the ring fill for {args.seconds:.1f}s, then dumping...")
     ser.reset_input_buffer()
     time.sleep(args.seconds)
+    # Anything still arriving is the tail of an earlier dump - a run that timed
+    # out mid-transfer leaves the board still transmitting, and reading its
+    # DUMP_END as if it were ours reports "0 rows" on a perfectly healthy
+    # board. Drain before asking.
+    ser.reset_input_buffer()
+    while ser.readline():
+        pass
+    ser.reset_input_buffer()
     ser.write(b"d")
 
     rows = []
@@ -95,11 +103,20 @@ def main():
     dropped = None
     clockstep = None
     started = False
-    deadline = time.time() + 20.0  # generous: dump of a few seconds' data can take a few seconds to transmit
-    while time.time() < deadline:
+    # IDLE timeout, not a total one. 'd' dumps the whole 12 000-sample ring -
+    # about 540 KB of ASCII - and the nRF52840's USB CDC moves it at roughly
+    # 20 KB/s regardless of the nominal baud, so the transfer needs ~27 s. The
+    # 20 s total deadline this used to have cut it off at ~8 700 rows every
+    # time and reported ROW COUNT MISMATCH on a board that was working
+    # perfectly. Waiting on silence instead of on a stopwatch removes the
+    # assumption about how long a dump "should" take.
+    IDLE_LIMIT = 5.0
+    last_data = time.time()
+    while time.time() - last_data < IDLE_LIMIT:
         line = ser.readline().decode(errors="ignore").strip()
         if not line:
             continue
+        last_data = time.time()
         if line.startswith("DUMP_START"):
             started = True
             parts = line.split(",")

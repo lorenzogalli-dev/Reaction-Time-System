@@ -10,7 +10,7 @@ link and the finish-unit's BLE bridge to the phone, described in the root
 
 ---
 
-## 1. Firmware — `Arduino/AccelStream/AccelStream.ino`
+## 1. Firmware — `Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`
 
 The only firmware currently implemented and verified working on real hardware:
 accelerometer capture at **833 Hz nominal (~863 Hz measured)**, paced by the
@@ -68,7 +68,7 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
 ```
 
 **Flash and verify**
-1. Open `Arduino/AccelStream/AccelStream.ino`.
+1. Open `Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`.
 2. Tools → Board → **XIAO nRF52840 Sense (No Updates)**. See the warning above.
 3. Tools → Port → the board's port (`/dev/cu.usbmodem...` on macOS, `COMx` on Windows).
 4. **Upload.** If it times out waiting for the board, double-tap the board's
@@ -95,7 +95,7 @@ ln -s "$(pwd)/Arduino/libraries/Seeed_Arduino_LSM6DS3" \
    process can hold the serial port at a time.
 7. Run the automated check, board sitting still on the desk:
    ```bash
-   python3 Tools/verify_rate.py --seconds 5
+   python3 Arduino/AlgorithmRealTime/Python_Tools/verify_rate.py --seconds 5
    ```
    It must end in **PASS**. A healthy board reports `CLOCKSTEP,8`, `DROPPED,0`,
    an effective rate near **863 Hz** and `gaps: 0`. This is the single command
@@ -135,7 +135,7 @@ the reaction time's zero.
 
 ---
 
-## 2. Python tooling — `Tools/capture.py`, `Tools/verify_rate.py`, `Tools/start_detector.py`
+## 2. Python tooling — `Arduino/AlgorithmRealTime/Python_Tools/`
 
 **Tested with:**
 
@@ -152,11 +152,11 @@ the reaction time's zero.
 pip3 install pyserial matplotlib numpy pandas
 ```
 
-**Run — capture** (board flashed with `AccelStream.ino`, plugged in, Serial
+**Run — capture** (board flashed with `AlgorithmRealTime.ino`, plugged in, Serial
 Monitor closed):
 ```bash
-python3 Tools/capture.py                       # autodetects the serial port
-python3 Tools/capture.py --port /dev/cu.usbmodemXXXX --outdir Data
+python3 Arduino/AlgorithmRealTime/Python_Tools/capture.py                       # autodetects the serial port
+python3 Arduino/AlgorithmRealTime/Python_Tools/capture.py --port /dev/cu.usbmodemXXXX --outdir Data
 ```
 Then press the board's button and run the start. The script only prints the
 board's progress (`SEQ,armed` / `marks` / `set` / `go`) and writes each dump to
@@ -167,16 +167,16 @@ attempt without restarting it.
 **Run — verify the board and the capture path** (the first thing to run after
 flashing; see step 7 of the firmware section):
 ```bash
-python3 Tools/verify_rate.py --seconds 5      # autodetects the port; must print PASS
+python3 Arduino/AlgorithmRealTime/Python_Tools/verify_rate.py --seconds 5      # autodetects the port; must print PASS
 ```
 Checks clock resolution, effective sample rate, dropped samples, gaps, timestamp
 monotonicity and clipping in one shot.
 
 **Run — detection and tuning on a recorded CSV:**
 ```bash
-python3 Tools/start_detector.py                       # GUI, browse to a file
-python3 Tools/start_detector.py Data/accel_X.csv      # GUI, preloaded
-python3 Tools/start_detector.py "Data/*.csv" --cli    # batch, terminal only
+python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py                       # GUI, browse to a file
+python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py Data/accel_X.csv      # GUI, preloaded
+python3 Arduino/AlgorithmRealTime/Python_Tools/start_detector.py "Data/*.csv" --cli    # batch, terminal only
 ```
 The GUI has every threshold in the sidebar and redraws on **Analyse**, so
 tuning is a loop against real captures rather than an edit-rerun cycle. Three
@@ -226,7 +226,7 @@ install` afterward. Full story in `HANDOFF.md`.
   **BLE bridge** to the phone (both described in the root `README.md`) are
   not implemented. They'll likely need Nordic's own nRF Connect SDK / Zephyr
   for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain
-  Arduino IDE toolchain used for `AccelStream.ino` above. Tracked on the
+  Arduino IDE toolchain used for `AlgorithmRealTime.ino` above. Tracked on the
   [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
 - `Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`,
   `tools/kinestart_live.py`, and `playground_IMU/` were all deleted on
