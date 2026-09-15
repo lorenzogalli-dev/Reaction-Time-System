@@ -1,7 +1,116 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-14. Written for an agent starting with no prior context.
+Last updated: 2026-09-15. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-09-15: the gate ran on a real athlete 45 times, mostly worked, and the bench-run proof from 09-14 no longer exists anywhere
+
+The 09-14 section below documents the arm-on-stillness rewrite and says "no
+reaction time from an athlete on blocks through this firmware" is the standing
+open item. That happened the same evening, off the books: 45 attempts sitting
+in `Arduino/AlgorithmRealTime/Python_Tools/Data/`, never mentioned in a commit
+because `capture.py` had silently been writing them to the wrong place. Found,
+reorganised and pushed as `c40c950`.
+
+### The 45 captures, and why they were hiding
+
+`capture.py --outdir` defaulted to the plain string `"Data"`, resolved against
+whatever directory the script was launched from - not the repo root. Run from
+inside `Python_Tools/` (as it evidently was, all evening), every capture landed
+in `Python_Tools/Data/` instead of the top-level `Data/` every other tool and
+`Data/README.md` assumes. Two files were visible at first glance; the other 43
+were still in the same nested folder, timestamps running to 19:02.
+
+All 45 are now `Data/block_starts_140926/` - a real athlete, real blocks, the
+first live data through the finished gate:
+
+| | |
+|---|---|
+| valid starts | 40, median **147.0 ms**, range 111.3-476.5 ms |
+| false starts | 5 |
+
+`capture.py`'s default is now computed from the script's own path
+(`Path(__file__).resolve().parents[3] / "Data"`), so the destination no longer
+depends on the current directory when it's launched.
+
+### One false start checked by hand: the verdict is right, the gate is marginal
+
+`accel_20260914_172357.csv` reported `FALSE START` at go−1294.7 ms and it did
+not look right to the athlete. Board and Python agree on it exactly (as they
+should now - see below), so the question was whether the algorithm is wrong,
+not whether the two implementations disagree.
+
+Reconstructing the raw horizontal signal by hand around the arming instant
+settles it: `horiz` is genuinely climbing, not a blip - roughly 9 mg at arm,
+past 20 mg forty ms later, past **60 mg** within another 150 ms. That is real,
+sustained movement, an order of magnitude above the few mg the same file reads
+everywhere else while actually still. The verdict is correct by the algorithm's
+own rule.
+
+What is worth flagging is *how* it armed. `arm_peak_mg` was **10.89 mg** -
+above the 7.0 mg p95 the 19-capture study measured for genuine held stillness,
+and close to the 15 mg gate. That is consistent with the gate catching a brief
+lull in the middle of still-ongoing settling, not real steadiness - the exact
+failure mode `DET_MIN_BLANK_MS`/`DET_QUIET_HOLD_MS` were tuned against, except
+that tuning was retrospective, replayed over captures where "go" never actually
+depended on the athlete going quiet. This is the first time a real athlete has
+had to *earn* the countdown by settling, which is a different task from the one
+the 27-capture sweep tested. Whether 800/200/15 mg hold up under that pressure
+across more attempts is now the open question, not whether they held up in
+replay.
+
+### One valid start on the high side, and an unresolved second event
+
+`accel_20260914_171838.csv`: 286.1 ms, inside the 09-09 range (127-299 ms) but
+above the 09-11 median (159 ms). Not obviously wrong on its own. But the file
+carries a second, larger re-arm event 165 ms later (87.6 mg against the first
+one's 21.3 mg) - plausibly the real push-off, with 286.1 ms belonging to a
+smaller preparatory movement instead. Not resolved; wants a look at the plot in
+the GUI before trusting either number over the other.
+
+### Confirmed while answering "is this still the old algorithm"
+
+Asked because Python and the board agreed exactly on both captures above, which
+used to be the signature of a *bug* (chambel's unfixed port, pre-09-14). Checked
+`AicPicker.h` directly: the two AIC fixes from the 09-14 section (`k <= n-5` -->
+sweep to `n-6`, variance guard `1e-9` --> `0`) are both present. Board and
+Python agreeing is now the expected result, not a leftover of the old port -
+there is only one algorithm left, in two languages.
+
+### `old_python_algorithm/start_detector.py` - the version this project no longer runs
+
+The last version before the arm-on-stillness rewrite (`7927ead`): fixed
+1000 ms blanking, no `ARM` marker, no arming gate at all. Recovered from git
+history (`git show 7927ead~1:Tools/start_detector.py`) and kept for reference
+now that the algorithm it implements is gone from the live tree. It is a
+snapshot, not a maintained file - do not port future fixes into it.
+
+### `Data/bench_140926/` cannot be found - anywhere
+
+The 09-14 section below describes it in detail: four bench runs, the hardware
+proof that the gate/`ARM`/`ARMCAP` markers work, including the one row where
+the board's own verdict matched `start_detector.py` to +0.000 ms
+(`accel_..._142506`, "valid start, 300.6 ms"). That folder **does not exist**
+in the working tree, is absent from `git log --all` for that path, and a full
+filesystem search found nothing. It was written to disk, described in prose,
+and apparently never `git add`ed. The evidence for "it has run on the board"
+now rests entirely on the prose below, not on data anyone can re-open.
+
+### Open
+
+- **Was `Data/bench_140926/` ever committed anywhere - a stash, a branch, a
+  different machine?** Worth asking before assuming it is simply gone.
+- **The marginal-arming case above needs more than one example.** One false
+  start with `arm_peak_mg` near the gate is not enough to say 800/200/15 mg
+  need retuning; it is enough to say the retrospective sweep did not test the
+  case that matters now.
+- The two-event ambiguity on `accel_20260914_171838.csv` (which onset is the
+  "real" reaction) is unresolved.
+- Everything else open in the 09-14 section is still open: the buzzer's
+  acoustic latency, the `micros()` wrap in `t_s`, and soldering the breadboard
+  before the track.
+
+---
 
 ## READ THIS FIRST — 2026-09-14: the start now arms on measured stillness, it has run on the board, and the 19 captures were never bench runs
 
