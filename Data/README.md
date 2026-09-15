@@ -10,6 +10,7 @@ as every sample.
 | `block_starts_090926/` | 19 attempts, 2026-09-09. **A real athlete on real starting blocks**, board mounted on the back of the block. |
 | `block_starts_110926/` | 8 attempts, 2026-09-11. Same athlete, same mounting, **after the buzzer fix**. |
 | `bench_140926/` | 3 attempts, 2026-09-14. **Bench, on a table, not an athlete** - the first runs of the arming-gate firmware, kept as the hardware proof that the gate, the `ARM` marker and the in-CSV verdict work. Do not tune against them. |
+| `block_starts_140926/` | 45 attempts, 2026-09-14. **A real athlete on real starting blocks**, first live captures through the finished arm-on-stillness gate (`7927ead`). 40 valid starts (median 147.0 ms, range 111.3-476.5 ms), 5 false starts. |
 | `data_before_080926/` | pre-v4 archive. The `go` marker in these is a human keypress relayed over serial, so it lands up to ~90 ms off. Do not tune anything against them. |
 
 ## The difference between the two block-start sets is the stimulus, and it shows

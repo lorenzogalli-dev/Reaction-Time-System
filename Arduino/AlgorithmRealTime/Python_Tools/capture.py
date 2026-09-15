@@ -27,6 +27,15 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
+
+# Repo root's Data/, not wherever this script happens to be launched from -
+# .../Arduino/AlgorithmRealTime/Python_Tools/capture.py -> repo root is three
+# levels up. A relative "Data" default silently wrote into whatever the
+# current directory was, which is how 45 captures ended up nested inside
+# Python_Tools/Data instead of the top-level Data/ the rest of the tooling
+# (and Data/README.md) expects.
+DEFAULT_OUTDIR = Path(__file__).resolve().parents[3] / "Data"
 
 
 def autodetect_port():
@@ -139,7 +148,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial port (default: autodetected)")
     ap.add_argument("--baud", type=int, default=921600)
-    ap.add_argument("--outdir", default="Data", help="where to write the CSVs")
+    ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR),
+                    help="where to write the CSVs (default: the repo's top-level Data/)")
     args = ap.parse_args()
 
     import serial
