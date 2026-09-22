@@ -1,9 +1,263 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-15. Written for an agent starting with no prior context.
+Last updated: 2026-09-22. Written for an agent starting with no prior context.
 Sections are newest first.
 
-## READ THIS FIRST — 2026-09-15: the gate ran on a real athlete 45 times, mostly worked, and the bench-run proof from 09-14 no longer exists anywhere
+## READ THIS FIRST — 2026-09-22: the Wi-Fi t0 link measured in the field, 60-70 m against a 100 m requirement
+
+First real measurements of the phone link, on an ESP32-C3 SuperMini outdoors,
+sitting on the ground the way it will sit behind the block. The rig is now in
+the repo as `Arduino/WifiFieldTest/`, which **replaces `Arduino/WifiRangeTest/`**
+- that one was written, never compiled, and has been deleted.
+
+### What this link is for, because it changes how every number below is read
+
+It does **not** carry the reaction time. That is computed on the XIAO and stays
+there. This link carries the **t0 instant to the phone**, which films the
+photofinish and has to anchor the video to it. Two consequences:
+
+- **Latency does not matter.** The message carries its own timestamp, not a
+  "now". A t0 that arrives two seconds late with the right instant is still
+  usable. What matters is that it arrives, and that the clocks are aligned.
+- **The phone is at the finish line**, because that is where it films, and the
+  blocks are at the start. The 100 m requirement is geometry, not performance.
+
+### The range result
+
+From `measurements/20260922/03_full-run-70m.csv`, the one usable run (69 s,
+markers every 10 m, phone in hand, board on the ground):
+
+| dist | RSSI med | pings ok | lost | RTT med |
+|---:|---:|---:|---:|---:|
+| 0 m | −57 | 69 | 0 | 9 ms |
+| 10 m | −73 | 26 | 0 | 11 ms |
+| 20 m | −78 | 26 | 0 | 12 ms |
+| 30 m | −83 | 22 | 0 | 422 ms |
+| 40 m | −85 | 1 | 17 | - |
+| 50 m | −88 | 33 | 1 | 25 ms |
+| 60 m | −90 | 11 | 8 | 18 ms |
+| 70 m | −91 | 0 | 10 | dead |
+
+**The 30-40 m rows are not a distance effect.** The WebSocket had gone zombie -
+TCP never closed, pings kept queueing - and the run recovered at 50 m only
+because the client watchdog closed and reopened the socket (`drop` then `open`,
+four seconds apart, both at 50 m). Read the table as: clean to ~50 m, losses
+from 60, **dead at 70 m at −91 dBm**.
+
+Slope is **~21 dB/decade** between 10 and 70 m, i.e. essentially free space.
+Lying on the ground is *not* costing a worse propagation exponent, which also
+means **raising it off the ground buys less than expected**. Extrapolating,
+100 m lands near **−94 dBm**: 3-4 dB short of where the link died, 8-10 dB
+short of having any margin.
+
+**Run-to-run spread is the size of the fix.** `02_short-run-30m.csv`, taken
+minutes earlier on the same ground, reads **−81 dBm at 10 m** against **−73**
+in the long run. Eight dB between two measurements of the same thing, which is
+as large as the entire gain being chased. No single curve should be trusted;
+three or four repeats of the same walk are needed before spending money on a
+module.
+
+### The clock, and why the frame rate is the real bottleneck
+
+| | |
+|---|---:|
+| sync jitter at 0 m | 2.50 ms |
+| sync jitter at 60 m | 4.00 ms |
+| ESP vs phone clock drift | **+11 ppm** (6.7 ms per 10 min) |
+| offset scatter, drift removed | 0.29 ms sd |
+| t0 latency, healthy link | median 8.1 ms, min 3.1 ms |
+
+Against a 30 fps video the frame period is 33.3 ms, so the quantisation error
+is ±16.7 ms worst case and **9.6 ms sd**. Summed in quadrature with the link's
+≤4 ms, the network adds **8%**. The bottleneck is the camera, not the radio.
+
+The link only starts to matter at **120 fps**, where the frame is 8.3 ms
+(2.4 ms sd) and the jitter becomes the dominant term. And the **+11 ppm drift**
+is a fifth of a frame at 30 fps but a frame and a half at 240 fps, so a one-off
+sync is not enough at any rate - the page resyncs continuously.
+
+Untested and probably larger than any of this at higher frame rates: **rolling
+shutter** (the sensor scans a frame over 10-30 ms, so head and feet in the same
+frame are not the same instant) and the accuracy of the timestamp the phone
+attaches to each frame.
+
+### What was wrong with the first run, and what got fixed
+
+`01_rssi-broken.csv` is kept only as a record. Three instrumentation defects,
+all now fixed:
+
+- **RSSI was 0 in all 306 rows.** The firmware read it and printed it to
+  serial but never sent it to the page. The single most important variable was
+  missing from the first session entirely. It now rides along with every ping
+  reply, plus a broadcast every second.
+- **RTTs up to 26 s.** Not latency: queueing. Each ping is now tracked
+  individually, unanswered after 3 s counts as lost, and six in a row closes
+  the socket so the reconnect is counted instead of hanging.
+- **Lost pings were invisible.** Only replies were logged, so the actual
+  degradation signal was absent. Losses are now their own rows, with distance.
+
+Also fixed after the first outing: the log now lives in the phone's storage and
+survives drops, reloads and OS-killed tabs, and the firmware boots with the
+captive portal off, because the portal window is closed by the OS when the
+network drops and took the log with it.
+
+### Three changes staged for the next session, not yet measured
+
+- **t0 retransmitted until acknowledged**, every 250 ms for up to 15 s. At the
+  instant of t0 the athlete is crouched on the blocks, directly on the line of
+  sight to the finish, and a human body at close range costs 10-20 dB - more
+  than any module change would recover. Since latency is free, the fix is to
+  repeat until the line clears. The CSV now carries a `tries` column, which is
+  the number to watch: t0s arriving on attempt 1 mean margin, attempt 12 means
+  three seconds of living on repeats.
+- **802.11b only**, giving up the fast modulations for a few dB of sensitivity;
+  the payload is a few dozen bytes every five seconds. With an automatic
+  fallback to b/g/n if no client associates within 90 s, so a phone that
+  refuses to join cannot strand the test in the middle of a field.
+- **Antenna out of the block's shadow.** Physical, not code. The retransmission
+  covers the athlete, who leaves after a second; the block body does not.
+
+### Open
+
+- **The requirement may move to 150 m**, which none of the above reaches. The
+  gap to 100 m is 3-4 dB and there are ~10 dB available between 802.11b, an
+  external u.FL antenna and placement. 150 m is another 3.5 dB on top and would
+  put the single-module path at its limit.
+- **Regulatory ceiling.** EU is 100 mW EIRP, and the board already transmits at
+  20 dBm. A 5 dBi antenna would be out of spec in transmit, so TX power has to
+  come down by the antenna gain. The **receive** gain is free and unregulated,
+  and the phone-to-board direction is likely the weaker of the two.
+- **Two ESPs in ESP-NOW long-range mode** (`WIFI_PROTOCOL_LR`, Espressif-only,
+  hundreds of metres to a kilometre) is the fallback that changes the order of
+  magnitude, with one at the blocks and one beside the phone at the finish.
+  Rejected for now: a second device to carry is a real product cost.
+- **2.4 GHz congestion at a stadium** has not been measured at all. Every
+  number here was taken on empty air.
+- `capture.py`-style reproducibility: the analysis behind these tables was
+  session scratch, not a committed script. Same failure mode as `bench_140926`
+  and the threshold sweep in the 09-21 section.
+
+---
+
+## READ THIS FIRST — 2026-09-21: the threshold-independence claim, re-measured on all 83 block starts for the half-time paper
+
+Written while checking one sentence drafted for the half-time paper's abstract
+(the slot that has to "state your primary result"). The draft read:
+
+> On 16 real block starts, a two-stage onset detector fixes the reported
+> reaction time regardless of the detection threshold (0.0 ms spread over
+> 10-50 mg, against 29 ms for a plain threshold crossing on a bench
+> recording), with an estimated random error of 1-2 ms.
+
+Three of its four claims did not survive the check. **The result itself is
+real, and is stronger than the sentence claimed** - but the evidence was not
+where the sentence said it was, and the claim was stated wider than the data
+supports.
+
+### What was wrong with it
+
+**"16 real block starts" has no source anywhere in this repo.** The block-start
+data is four sessions on real blocks with real athletes: 19 (`090926`) + 8
+(`110926`) + 45 (`140926`) + 11 (`150926`) = **83 captures**, of which **79**
+produce an event in the judged window. The draft understated its own evidence
+by a factor of five.
+
+**The figures in the parentheses were not block starts at all.** `0.0 ms
+against 29 ms` is the table in `INFO.md` §4, measured on a *single* bench
+recording from 2026-09-08. The sentence opened on real starts and then quoted
+bench numbers, which is exactly the kind of seam a reviewer pulls on. It is
+also unnecessary: the sweep runs on the real data now, see below.
+
+**"regardless of the detection threshold" is too strong.** The picker makes the
+*timing* of a detected onset threshold-free. It does not make *detection*
+threshold-free, and on 5 of the 79 the threshold decides **which** event is
+first, which the picker cannot repair because it never sees the event that was
+missed.
+
+Only the last claim held unchanged: **1-2 ms** is the random-error budget
+already in this file (clock 8 µs, sample timing σ ≈ 334 µs, AIC ≈ 1 sample).
+
+### The sweep, re-run on the real data
+
+Method: for every capture in the four `Data/block_starts_*` directories,
+`start_detector.analyse()` at `floor_mg` = 10, 20, 30, 50, once with
+`use_aic=True` and once with `use_aic=False`, taking the **first event in the
+judged window** - the one whose reaction time is the reported one. Where the
+header carries the board's own `arm_t_s` (14/09 and 15/09) it is used, so the
+arming gate stays fixed and the detection threshold is the only thing moving.
+Measured ODR across the set: median **865.8 Hz**, so one sample = **1.155 ms**.
+
+Sweeping 10 -> 50 mg, a five-fold change. The counts are over all 79; the
+median, p90 and worst case are over the 74 where the same event stays first
+throughout, the five exceptions being tabled separately below:
+
+| spread of the reported reaction time | with the AIC picker | threshold only |
+|---|---|---|
+| identical to the sample (0.00 ms) | **70/79 (89%)** | 6/79 (8%) |
+| within one sample (≤ 1.2 ms) | **74/79 (94%)** | - |
+| median | **0.00 ms** | **9.3 ms** |
+| p90 | 0.00 ms | 21.9 ms |
+| worst case | 1.16 ms | **52.1 ms** |
+
+With the picker in, the worst case over the whole five-fold sweep is one
+sample. Without it, the median capture moves 9.3 ms and the worst moves 52 ms -
+half a disqualification margin, from a parameter nobody can derive.
+
+### The five the picker cannot save, and why they belong in the paper
+
+These are event-*selection* changes, not onset changes: at a higher floor the
+earlier, smaller event is never confirmed, so a later one becomes the first.
+
+| capture | 10 mg | 20 mg | 30 mg | 50 mg | |
+|---|---|---|---|---|---|
+| `140926/172357` | −1294.7 | −1294.7 | −1294.7 | 197.0 | **verdict flips** |
+| `140926/184348` | 49.8 | 49.8 | 49.8 | 165.6 | **verdict flips** |
+| `140926/183204` | 213.1 | 213.1 | 213.1 | 231.6 | |
+| `140926/185759` | 227.3 | 230.7 | 367.5 | 367.5 | |
+| `150926/185751` | 119.3 | 119.3 | 119.3 | 157.6 | |
+
+Two of them cross the 100 ms line, so the threshold, not the athlete, decides
+false start vs valid start. `172357` is the same capture the 09-15 section
+examines by hand and concludes the gate is marginal on; this is the second,
+independent symptom of the same thing, and it strengthens that open item rather
+than adding a new one.
+
+### What the abstract can honestly say
+
+Recommended, and the version the numbers above support line by line:
+
+> Across 79 block starts recorded from several athletes, a two-stage onset
+> detector makes the reported reaction time independent of the detection
+> threshold: over a five-fold sweep (10-50 mg) the onset is unchanged to within
+> one sample (1.2 ms) in 74 cases and identical in 70, against a median spread
+> of 9.3 ms and a worst case of 52 ms for a plain threshold crossing on the
+> same data, with an estimated random error of 1-2 ms.
+
+**The caveat that has to stay visible:** this sweep is offline, run by
+`start_detector.py`. The board's C++ agrees with it to the microsecond on 38/45
+of the 14/09 captures but diverges on 7, up to 11.6 ms - the AIC-input
+difference documented in the 09-15 section. So what is demonstrated is that
+**the algorithm** is threshold-independent, not that the shipped firmware is.
+Do not let the abstract blur the two; it is a sentence away from a claim the
+repo contradicts.
+
+### Open
+
+- **The sweep scripts were session scratch and are not in the repo.** This is
+  the `bench_140926` failure mode again: a number in a document with nothing
+  behind it anyone can re-open, and this time it is going into a paper. It
+  should be a committed script under `Arduino/AlgorithmRealTime/Python_Tools/`
+  that prints the two tables above from `Data/` in one run.
+- **4 captures produce no event at any threshold** (`090926/123532`,
+  `090926/133119`, `090926/185706`, `110926/185009`) and were dropped from the
+  79 without anyone looking at why. If any of them is a real start the detector
+  missed, the paper's denominator is wrong and a miss rate belongs in it.
+- Everything open in the 09-15 section is still open, and the board/Python
+  divergence there is now load-bearing for the paper rather than a curiosity.
+
+---
+
+## READ THIS FIRST — 2026-09-15: 45 real starts through the gate, a board/Python divergence that is not float32, and the 09-14 bench proof is gone
 
 The 09-14 section below documents the arm-on-stillness rewrite and says "no
 reaction time from an athlete on blocks through this firmware" is the standing
@@ -33,12 +287,68 @@ first live data through the finished gate:
 (`Path(__file__).resolve().parents[3] / "Data"`), so the destination no longer
 depends on the current directory when it's launched.
 
+### Old Python vs new Python: identical, as expected
+
+Onset detection (STA/LTA + AIC) is the same code in both; only the gate
+changed. Wherever both judge an attempt the reaction time is identical. The old
+one refuses **15 of the 45** as `NOT JUDGEABLE` - the defect the 09-14 section
+describes, now confirmed on data taken after the fix.
+
+### Board vs `start_detector.py`: 38/45 identical to the µs, 7 not
+
+Compared against the board's own `board_reaction_ms` in each CSV header
+(`start_detector.py --cli`, board arming instant read from the header):
+
+| capture | board | Python | gap |
+|---|---|---|---|
+| `175935` | 151.662 | 140.076 | **+11.6 ms** (10 samples) |
+| `181304`, `182820`, `184139`, `184444`, `184622`, `185136` | | | **+1 sample** (~1.15 ms) each |
+
+Every gap has the **board later**. Rounding noise would go both ways.
+
+The colleague's explanation was float32 vs float64. Right order of magnitude -
+any numeric difference either moves the AIC pick by a whole sample (1.2 ms) or
+not at all, which is why most captures agree exactly - but **not the cause**.
+Rebuilding the C++ input in Python and switching one difference on at a time:
+
+| Python variant | matches board |
+|---|---|
+| as shipped (AIC on the detector's live-baseline trace) | 38/45 |
+| **horiz recomputed with the baseline frozen at the candidate, as `AicPicker.h` does** | **44/45**, including the 11.6 ms one |
+| + window selected on integer `t_us` + float32 signal | 44/45, no change |
+
+So the divergence is **the AIC input signal**. `AicPicker.h`'s comment "the two
+agree to 0.000000 ms, every time" was measured on the 09-09 captures and **does
+not hold on the 09-14 set**. The remaining one (`184622`, 1 sample) is not
+explained by any variant; candidates are the board's float32 raw->g path or the
+CSV's 4-decimal (0.1 mg) rounding of `x_g/y_g/z_g`. Not proven.
+
+**Decided: left as is for now** - no code changed. Which onset is closer to the
+truth is unknown without an independent reference. If aligning later, the
+natural direction is making `start_detector.py` use the frozen baseline, since
+the board's number is the one the athlete is given; and fix the stale comment in
+`AicPicker.h` either way. The comparison script was session scratch, not in the
+repo: it wraps `StartDetector.update` to record `b_h` when `baseline_frozen`
+goes true, recomputes horiz from the raw rows with that `b_h`, and re-runs
+`refine_onset`'s contrast check and `aic_pick` on it.
+
+### Confirmed while answering "is this still the old algorithm"
+
+Asked because Python and the board agreed exactly on the two captures examined
+by hand below, which used to be the signature of a *bug* (chambel's unfixed
+port, pre-09-14). Checked `AicPicker.h` directly: the two AIC fixes from the
+09-14 section (`k <= n-5` --> sweep to `n-6`, variance guard `1e-9` --> `0`) are
+both present. There is only one algorithm left, in two languages, so exact
+agreement is the expected result and not a leftover of the old port - subject to
+the input-signal difference in the section above, which is what the 7
+disagreements are.
+
 ### One false start checked by hand: the verdict is right, the gate is marginal
 
 `accel_20260914_172357.csv` reported `FALSE START` at go−1294.7 ms and it did
-not look right to the athlete. Board and Python agree on it exactly (as they
-should now - see below), so the question was whether the algorithm is wrong,
-not whether the two implementations disagree.
+not look right to the athlete. Board and Python agree on it exactly (it is one
+of the 38, not one of the 7 above), so the question was whether the algorithm is
+wrong, not whether the two implementations disagree.
 
 Reconstructing the raw horizontal signal by hand around the arming instant
 settles it: `horiz` is genuinely climbing, not a blip - roughly 9 mg at arm,
@@ -68,15 +378,6 @@ one's 21.3 mg) - plausibly the real push-off, with 286.1 ms belonging to a
 smaller preparatory movement instead. Not resolved; wants a look at the plot in
 the GUI before trusting either number over the other.
 
-### Confirmed while answering "is this still the old algorithm"
-
-Asked because Python and the board agreed exactly on both captures above, which
-used to be the signature of a *bug* (chambel's unfixed port, pre-09-14). Checked
-`AicPicker.h` directly: the two AIC fixes from the 09-14 section (`k <= n-5` -->
-sweep to `n-6`, variance guard `1e-9` --> `0`) are both present. Board and
-Python agreeing is now the expected result, not a leftover of the old port -
-there is only one algorithm left, in two languages.
-
 ### `old_python_algorithm/start_detector.py` - the version this project no longer runs
 
 The last version before the arm-on-stillness rewrite (`7927ead`): fixed
@@ -98,17 +399,23 @@ now rests entirely on the prose below, not on data anyone can re-open.
 
 ### Open
 
+- **Board/Python AIC-input divergence above: 7/45, up to 11.6 ms.**
 - **Was `Data/bench_140926/` ever committed anywhere - a stash, a branch, a
   different machine?** Worth asking before assuming it is simply gone.
+- **The 45-capture set is not yet analysed for the gate itself:** cap hits,
+  arming instant after `set`, `set -> go` distribution, whether the 5 false
+  starts are real.
 - **The marginal-arming case above needs more than one example.** One false
   start with `arm_peak_mg` near the gate is not enough to say 800/200/15 mg
   need retuning; it is enough to say the retrospective sweep did not test the
   case that matters now.
 - The two-event ambiguity on `accel_20260914_171838.csv` (which onset is the
   "real" reaction) is unresolved.
+- **`Data/block_starts_150926/`** (11 captures, landed in `723d794`) is not
+  described anywhere yet - nobody has said what those runs were.
 - Everything else open in the 09-14 section is still open: the buzzer's
-  acoustic latency, the `micros()` wrap in `t_s`, and soldering the breadboard
-  before the track.
+  acoustic latency, the `micros()` wrap in `capture.py`'s `t_s`, and soldering
+  the breadboard before the track.
 
 ---
 
@@ -330,6 +637,8 @@ each file is and the command to run it.
 - **No reaction time from an athlete on blocks through this firmware.** The
   bench runs prove the mechanism, not the measurement. Nothing since the timing
   was widened to 700-1500 ms has been tried with a real start.
+  **[CLOSED 2026-09-15: 45 on-block attempts in `Data/block_starts_140926/`.
+  See the top section.]**
 - **The buzzer's acoustic latency is still unmeasured and still dominant.** The
   cheapest route needs nothing new: the IMU and the buzzer share a support, so
   the buzzer's mechanical onset reaches the accelerometer stamped with the same
