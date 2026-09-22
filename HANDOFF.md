@@ -3,6 +3,369 @@
 Last updated: 2026-09-22. Written for an agent starting with no prior context.
 Sections are newest first.
 
+## READ THIS FIRST — 2026-09-22 (evening): the half-time paper checked line by line against the data, and the threshold sweep is finally a committed script
+
+The paper draft was read against `Data/`, the firmware and this file, every
+number re-derived rather than trusted. **The primary result holds.** Most of
+the rest of the evaluation section did not, and the failure is always the same
+shape: a number that was true of *one session* or *one recording* written as if
+it were true of the whole set.
+
+New in the repo, and the reason none of this has to be re-derived again:
+`Arduino/AlgorithmRealTime/Python_Tools/sweep_threshold.py`. One command, ~55 s,
+and it prints the sweep table, the captures the picker cannot save, and writes
+`Docs/threshold_sweep.pdf`. This closes the open item that has been carried
+since 09-21, and the same one `bench_140926` died of.
+
+### What held
+
+Sample rate 865.8 Hz, one sample 1.155 ms, clock 8 µs, jitter 334 µs, 0 dropped
+and 0 truncated rows across all 83 captures. Every detector constant quoted in
+the paper matches `StartDetector.h`: STA/LTA 15/800 ms, ratio 6, floor 20 mg,
+AIC window 150+50 ms, stillness 15 mg for 200 ms, go 0.7-1.5 s after arming,
+false start under 100 ms. The figure's capture is `150926/183435`: AIC 138.0 ms,
+threshold-only 154.2 ms, **16.2 ms** apart, exactly as printed.
+
+### What did not
+
+- **"Over 45 starts the unit reports 40 valid" is one session of four.** Those
+  are the 14/09 numbers. Across the four sessions it is 79 attempts with an
+  event, 72 valid, 7 false starts, median 154.0 ms.
+- **147.0 ms is the offline detector's median, not the board's.** The board's
+  own verdicts on the same 45 give **147.8 ms**. `Data/README.md` has the same
+  conflation and should be fixed with it.
+- **"(19 starts)" and "(8 starts)" in the stimulus comparison are attempts,
+  not starts.** The valid starts behind 178 ms and 159 ms are **15** and **6**.
+- **The 29 ms threshold spread is a single 08-09 recording** (`INFO.md` §4),
+  not the block starts the sentence opens on. The 79-capture sweep replaces it.
+- **The ramp-steepness claim was inverted.** The threshold's delay is about
+  threshold ÷ slope, so it is *largest* on the gentlest push-off: 20/1.25 ≈
+  13 ms against 20/3.49 ≈ 5.8 ms. The draft said it grew with steepness.
+- **The gate applies to 56 of the 79 starts.** 09-09 and 11-09 were recorded
+  before it existed, with "go" on a blind random after "set".
+- **"No latency enters" is only true of the host and the serial path.** The
+  buzzer's acoustic latency, 5-20 ms and still unmeasured, enters every number.
+- **Figure 1 is the old system.** Zigbee, two XIAO blocks, an OLED, an 18650,
+  BLE to the phone - none of which is the architecture in the text, and the
+  conclusions still say "bring up the Zigbee link". Redraw it around the
+  ESP-NOW long-range path, and say *planned*: the coexistence test in the
+  section above has not been run.
+- **"Five sprinters" cannot be checked against this repo.** `Data/README.md`
+  says "a real athlete" and then "same athlete" twice. One of the two documents
+  is wrong and it is not obvious which.
+
+### The four captures that produce no event, opened one at a time
+
+They had been dropped from 83 to 79 without anyone looking. They are not one
+phenomenon:
+
+| capture | what happened | a start? |
+|---|---|---|
+| `090926/133119` | **`micros()` wrapped between "set" and "go"** - set at 4294.11 s, go at 1.60 s, so the header reads go 4289 s *before* set and the gate never opens. A 4.1 g push-off sits in the file. | **yes**: unwrapped by hand it is a valid start at **175.6 ms** |
+| `090926/123532` | 3.7 g **125 ms before "go"**. The gate, applied retrospectively to a pre-gate session, opens 736 ms *after* go and never sees it. | **yes**, an anticipation |
+| `090926/185706` | peak 9 mg in the second after go - noise | no push-off in the window |
+| `110926/185009` | peak 50 mg, against 1000-3600 mg for a real push-off | no push-off in the window |
+
+`micros()` wraps every 71.6 minutes from power-up, so this will happen again in
+any session that runs that long. It was already an open item; it is now known to
+have cost a real start. The fix belongs in the reader, not in the CSVs.
+
+**Decided for the paper: keep 79.** The two recoverable ones are excluded with
+a stated reason rather than repaired, so the denominator matches every other
+number in the draft. If the wrap is fixed in `start_detector.py` later, it
+becomes 80 and the 09-09 row becomes 16 valid, 1 false start.
+
+### The sweep, re-run at 17 thresholds instead of 4
+
+`sweep_threshold.py --step 2.5`, 10-50 mg, first event in the judged window,
+shift measured against the 10 mg value:
+
+| | AIC picker | threshold only |
+|---|---|---|
+| median shift over the sweep | **0.00 ms** | **9.28 ms** |
+| p90 | 0.00 ms | 21.60 ms |
+| worst | 1.16 ms | 52.08 ms |
+| median at 50 mg | 0.00 ms | 9.28 ms |
+
+**The 9.3 in the abstract and the 9.3 at the right-hand edge of the figure are
+two different statistics** - median of the per-capture maximum, and median of
+the shift at 50 mg - that happen to agree to two digits. Do not let the paper
+imply one is the other.
+
+**Sorting the captures by how far the picker's onset moves gives a clean gap:**
+zeros, a cluster at one sample (1.14-1.16 ms), then **nothing until 18.5 ms**.
+The five above it are the event-*selection* changes already tabled in the 09-21
+section. The script splits on 10 ms, anywhere in the gap, so the 74/5 split is
+not a judgement call.
+
+**One number is grid-dependent and the paper should stop quoting it alone:**
+"identical" was 70/79 over four thresholds and is 69/79 over seventeen, because
+a finer sweep gives more chances to land on the next sample. **74/79 within one
+sample does not move.** Quote 74, or say "over the four thresholds swept".
+
+### The figure
+
+`Docs/threshold_sweep.pdf`, 3.4 x 2.3 in, i.e. one column at `\linewidth` with
+no rescaling. Median and interquartile range over the 74, blue flat at zero with
+a zero-width band, red climbing in visible 1.2 ms steps because that is the
+sample period. Bands, the ±1 sample grey stripe and the 10 mg reference are all
+named *on the figure*, after a reviewer asked what the shaded areas were.
+
+### Open
+
+- **`Data/README.md` says 147.0 ms for the 14/09 median**, which is the offline
+  detector's; the board says 147.8. Same conflation as the paper's.
+- **The `micros()` wrap is unfixed** in `capture.py` and `start_detector.py`.
+- **How many athletes.** Nobody has written down who ran which session.
+- **The two captures with no push-off in the recorded second** are still
+  unexplained: no start, or a start later than go+1 s, where the window ends.
+- Everything in the 09-21 and 09-15 sections is still open, in particular the
+  board/Python AIC-input divergence, which the paper now has to declare.
+
+---
+
+## READ THIS FIRST — 2026-09-22 (later): how the t0 reaches the phone, five architectures weighed
+
+Written straight after the field measurements in the section below, working out
+what to do about 60-70 m against a 100 m requirement **that may become 150 m**.
+Nothing here is built yet. The conclusion is that the deferred-sync design
+should be written first **whatever else gets chosen**, because every other
+option needs it underneath as a fallback.
+
+Recap of what the link is for, because it governs everything: it carries the
+**t0 instant to the phone filming the photofinish**, not the reaction time,
+which is computed on the XIAO and stays there. **Latency is therefore free** -
+the message carries its own timestamp - and the only things that matter are
+that it arrives and that the clocks can be related.
+
+### A. One module, better radio - the incremental path
+
+The gap from the measured 70 m to 100 m is **3-4 dB**. Available:
+
+| | |
+|---|---:|
+| 802.11b only (staged, unmeasured) | 3-6 dB |
+| external u.FL antenna | 3-5 dB |
+| antenna out of the block's shadow | a few dB |
+| t0 retransmitted until acked (staged) | removes the athlete's 10-20 dB |
+
+About ten dB against three or four needed, and half of it free. **This very
+likely reaches 100 m. It does not reach 150 m**, which is another 3.5 dB on top
+and would put the single-module path past its limit.
+
+**Regulatory ceiling, and a distinction that was initially confused:** EU is
+100 mW EIRP and the board already transmits at 20 dBm, so a 5 dBi antenna is
+out of spec *in transmit* and TX power has to come down by the antenna gain.
+The **receive** gain is free and unregulated, and the phone-to-board direction
+is likely the weaker of the two. Note this ceiling is about **antenna gain**,
+not about long-range modulation - see E, which does not raise power at all.
+
+### B. An athlete-worn relay - rejected as specified, viable in principle
+
+The idea: the athlete wears a device that receives the t0 at the blocks (zero
+metres, they are crouched on it) and carries it to the finish (zero metres
+again, they cross right in front of the phone). Both hops are at contact range,
+so the distance problem disappears by construction. The intuition is sound.
+
+**The KKM W52 bracelet cannot do it.** From the manufacturer's page: nRF52
+series, **advertisement only, no scanning or receiving**, `Sensor: N/A`, no RTC,
+CR2032, 1000 ms default broadcast interval. It shouts an identifier and nothing
+else. The nRF52 inside could be reprogrammed but KKM publishes no SDK, and it
+is a sealed coin-cell bracelet.
+
+**The flaw in the idea as first stated:** a courier carries a *number*, not a
+*clock*. The t0 is in the start unit's time base, and in that design the phone
+never talks to the start unit at all, so it has nothing to map it onto. The fix
+is to carry **elapsed time** ("t0 was 11.4 s ago") rather than the raw t0 -
+which needs the courier to have a clock and to receive, i.e. to be a
+programmable device, not a beacon.
+
+Done properly - a real two-way sync at both ends rather than a one-shot
+advertisement - the error lands around **3-4 ms**, set by the BLE connection
+interval, which is comparable to the Wi-Fi link and under the frame budget. A
+XIAO nRF52840 with a 100-150 mAh LiPo is about 30 x 25 x 10 mm and runs 15+
+hours on the Arduino core; the built-in BQ25101 charges it over the same USB-C.
+Worn at the shorts waistband, where athletes already carry timing chips, rather
+than as a bracelet.
+
+**Why it is still not the choice:** a third device to charge, distribute and
+wear, competition rules that often forbid it, and - decisively - **no t0 if the
+athlete does not finish**. False start, pull-up, injury: exactly the attempts
+worth looking at are the ones that produce no data.
+
+### C. The phone's own microphone - ruled out by the athlete
+
+The phone records audio on the same time base as the video, so the buzzer in
+the audio track would anchor t0 at audio resolution (0.02 ms at 48 kHz) with no
+radio at all, correcting for the 291 ms flight time over 100 m. Residual error
+would be 3-5 ms: temperature unknown to ±5 °C (±2.5 ms), 2 m/s wind (±1.7 ms),
+distance to ±0.5 m (±1.5 ms).
+
+**Ruled out: the buzzer is not audible at that distance.** Left on record
+because it is the cheapest option by a wide margin and would come back if the
+start signal ever gets louder, or if a matched filter on the known waveform is
+ever tried - it can recover a tone well below audibility.
+
+### D. Deferred sync, store and forward - build this first
+
+The start unit stores each t0 in its own clock with an identifier; the phone
+stores each finish event in its own clock; whenever the two are near each other
+they connect, sync, and the results resolve. No range requirement at all.
+
+**This is the most accurate of the five**, not a compromise: interpolating
+between two syncs over a two-minute rep leaves **~1.3 ms** at the measured
+11 ppm drift, against 2.5-4 ms for any live link. What it gives up is the
+number being visible at the finish while the athlete is still breathing.
+
+**Build it regardless of what else is chosen.** Even with a perfect radio link,
+sooner or later a packet does not arrive, and without store-and-forward that
+rep is gone - and an athlete's rep cannot be repeated. It is the one piece of
+code that is not at risk of being thrown away.
+
+#### Clock design, in detail, because three traps live here
+
+**The board's clock resets on boot.** `micros()` counts from power-up. Every
+record therefore needs a **boot-session id**, incremented in flash at each
+start. The rule that follows: *a t0 is exactly mappable only if it lies between
+two syncs of the same boot session.* One with no sync after it can only be
+extrapolated. In practice, sync at power-up and every time the coach walks past
+the blocks, which happens naturally between reps.
+
+**The phone must use a monotonic clock, and the right one.** Not `Date.now()`
+or wall time - those jump on NTP correction, timezone change or a user edit,
+and would silently destroy the interpolation. On iOS `mach_absolute_time` stops
+while the phone sleeps, so **`mach_continuous_time`**; on Android
+**`CLOCK_BOOTTIME`**, not `CLOCK_MONOTONIC`. The phone does sleep in a pocket
+between reps, so this is not theoretical.
+
+**Do not stop the recording to mark the finish.** The stop has its own variable
+latency and throws away the ability to review frames. Keep the camera running
+and take the **frame's own timestamp**: `CMSampleBuffer` presentation timestamp
+on iOS, camera2 `SENSOR_TIMESTAMP` on Android. Android caveat: that timestamp's
+base varies by device - read `SENSOR_INFO_TIMESTAMP_SOURCE`, and if it reports
+`UNKNOWN` you do not know what it is anchored to. Must be checked on the handset
+models actually used.
+
+### E. Two ESP32s, ESP-NOW long range - the live-numbers path
+
+ESP-A at the blocks, wired to the XIAO and sharing its power; ESP-B at the
+finish beside the phone; `WIFI_PROTOCOL_LR` between them. Supported on ESP32,
+S2, S3 and **C3**, so the SuperMini already in hand qualifies; Espressif claims
+up to a kilometre line of sight. **Long range does not raise transmit power** -
+the gain comes from coding, i.e. in receive sensitivity, which is unregulated.
+Two lines of code, same core, nothing new to learn.
+
+**The clocks get easier, not harder**, despite three hops instead of one:
+
+| hop | mechanism | error |
+|---|---|---:|
+| XIAO → ESP-A | **a wire**: XIAO raises a pin at t0, ESP-A captures the edge in a hardware interrupt | sub-µs |
+| ESP-A → ESP-B | two bare-metal MCUs, no OS scheduling, no TCP, no association | sub-ms expected |
+| ESP-B → phone | Wi-Fi at one metre, the case already measured | 2.5 ms bound, 0.29 ms residual |
+
+The hard hop becomes a wire and the fragile hop is never more than a metre away.
+Total is still set by the phone, ~1-2 ms.
+
+**The single technical risk, and it should be tested before anything is built:**
+ESP-B has **one 2.4 GHz radio** and must simultaneously run the LR link to ESP-A
+and an access point for the phone. A phone cannot associate to an LR-only AP,
+so this means STA in LR for ESP-NOW and AP in b/g/n for the phone, **on the same
+channel**. Espressif documents per-interface protocol settings, but this exact
+combination is the kind that either works in an afternoon or costs a week.
+**Unverified.** Half the answer is available with a single module: bring up AP
+and LR together and see whether the radio survives and the phone associates.
+
+**If it fails, the fallback is BLE to the phone**, which is workable - a real
+connection with a two-way exchange, not the one-shot advertisement that sank
+option B - at **3-8 ms**, set by the ~15 ms connection interval iOS negotiates
+and CoreBluetooth callback jitter. Fine at 30 fps, marginal at 60. But note it
+**moves the radio conflict rather than removing it**: two stacks now time-share
+one antenna, with Wi-Fi/BT coexistence added on top of long range, and the
+sketch is already at 79% flash with Wi-Fi alone.
+
+**Practical asymmetry worth exploiting:** the finish unit has no size or
+placement constraints - tripod or bag, not a sealed box behind a block with an
+athlete on top. Put the external antenna and the height *there*. Antenna gain at
+one end improves **both** directions of the link, so it is the most efficient
+place to spend it, and the block-side unit can stay as it is.
+
+**Powering ESP-B from the phone's USB-C** would probably work electrically on
+iPhone 15+ and any USB-C Android, but it drains the phone while it films - the
+heaviest thing a phone does - and a cable hanging off a tripod-mounted phone is
+the most fragile part of the system. Unnecessary anyway: ESP-B needs to be
+*near* the phone, not attached. Give it its own cell.
+
+### Zigbee and sub-GHz, considered and set aside
+
+**Zigbee** is still 2.4 GHz. Its sensitivity is better than plain Wi-Fi (around
+−100 dBm against −90), but long-range Wi-Fi already closes that gap, and **the
+phone does not speak Zigbee**, so it needs a module at the finish anyway - the
+same device count as E, with an unfamiliar stack and unfamiliar hardware. No
+reason to prefer it.
+
+**Sub-GHz LoRa at 868 MHz** is the genuinely stronger radio: kilometres, and far
+better through obstacles. Seeed's `Wio-SX1262` plugs into the XIAO form factor,
+so it stays in the existing ecosystem. Worth revisiting only if the requirement
+goes past ~500 m; it is more work than ESP-NOW LR for range that is not needed.
+
+### The error budget, and why most of it does not matter for reps
+
+For a 100 m, with the deferred-sync or the two-ESP design (they differ by about
+a millisecond):
+
+| source | type | 30 fps | 60 fps |
+|---|---|---:|---:|
+| **which frame the torso crosses in** | random | **9.6 ms** | **4.8 ms** |
+| rolling shutter, uncorrected | systematic | 10-30 ms | 10-30 ms |
+| t0 on the board (already in the budget) | random | 1-2 ms | 1-2 ms |
+| sync path asymmetry | systematic | 0.5-2 ms | 0.5-2 ms |
+| drift interpolation residual (10 min bracket) | systematic | 0.4 ms | 0.4 ms |
+| sync random residual (min-delay, 60 samples) | random | 0.3 ms | 0.3 ms |
+
+**The synchronisation is not the problem** - a couple of ms out of ten. The
+camera is, exactly as the measurements in the section below concluded.
+
+**Rolling shutter is the largest line and had not been counted before.** The
+sensor reads the image row by row over 10-30 ms, so a torso crossing at
+mid-height was read many ms after the frame's timestamp. It is systematic and
+**correctable** given the readout time and the row the finish line sits on.
+
+**Frame quantisation is beatable by interpolating.** At 10 m/s the torso moves
+33 cm per frame; tracking its position across two consecutive frames and
+interpolating onto the line gets to roughly a fifth of a frame, under 7 ms even
+at 30 fps.
+
+**One calibration removes every systematic term at once:** the start unit lights
+an LED at a known instant of its own clock while the phone films it. Which frame,
+and which row, the LED appears in gives the difference between what the board
+says and what the phone sees, **through the whole real chain** - sync asymmetry,
+audio/video offset, rolling shutter, all together. Done once per handset model,
+stored, subtracted thereafter.
+
+**And for training reps it matters less than it looks.** What is compared is one
+attempt against the next, same athlete, same setup, so **every systematic term
+cancels**. The limit on that comparison is the random part alone: **~10 ms at
+30 fps, ~5 at 60**, less with interpolation. The LED calibration is only needed
+for absolute times comparable with official timing.
+
+### Open, in the order it should be done
+
+1. **Test the ESP-B radio coexistence** (AP for the phone + LR simultaneously,
+   same channel, one module). One afternoon, no build required, and it decides
+   whether E is available at all.
+2. **Write the deferred-sync design (D)**, with the boot-session id and the
+   monotonic-clock rules above. Needed under every other option.
+3. **Three or four repeats of the same walk** with the staged 802.11b and t0
+   retransmission, to see what A is actually worth. Two measurements of the same
+   thing differed by 8 dB, which is the size of the whole gain being chased.
+4. **Measure the rolling shutter and the frame-timestamp offset** on the handsets
+   that will be used. Currently unmeasured and the largest single line in the
+   budget.
+5. **2.4 GHz congestion in a stadium** - every number so far was taken on empty
+   air, and a meet is the worst RF environment this will ever see.
+
+---
+
 ## READ THIS FIRST — 2026-09-22: the Wi-Fi t0 link measured in the field, 60-70 m against a 100 m requirement
 
 First real measurements of the phone link, on an ESP32-C3 SuperMini outdoors,
