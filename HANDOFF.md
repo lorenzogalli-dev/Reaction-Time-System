@@ -1,7 +1,47 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-22. Written for an agent starting with no prior context.
+Last updated: 2026-09-24. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-09-24: a second `prostart/` in the repo root, and this time it is not a duplicate
+
+The 09-11 section below deleted an untracked `prostart/` from the root as build
+junk and says "the real app is and always was `Flutter App/prostart/`". The new
+root `prostart/` (commit `86dce6a`) is **a different app with the same package
+name**. Do not delete it, and do not merge it with the one under `Flutter App/`
+without deciding which one is the product.
+
+| | `Flutter App/prostart/` | `prostart/` (new) |
+|---|---|---|
+| Purpose | the working app: BLE to the board, live accelerometer, recording | a UI mockup for the presentation |
+| Data | real, `flutter_blue_plus` + `provider` | **all fake**, `lib/mock_data.dart`; no Bluetooth, no timing |
+| Screens | onboarding, home, live data, settings | splash, home, reaction result, photofinish result |
+| Dependencies | BLE, provider, ... | only `cupertino_icons` |
+
+The mockup shows the two product modes (reaction time from the block, photofinish
+time from the camera). Those two result screens exist only here. Open any page
+directly for a screenshot with
+`flutter run --dart-define=PAGE=home|reaction|photofinish` (no define = splash).
+The two images it shows are static assets: `assets/images/start_138.png` (a
+start trace, 138 ms) and `assets/images/finish.png`.
+
+`prostart/Prostart Media/` holds the app screenshots (`IMG_22xx`) and the page
+renders, each also in a transparent-background version, used by the
+presentation. The script for it is `Prostart- Presentation Script.docx` in the
+root (commit `70c7c0e`).
+
+`.dart_tool/`, `build/` and `.idea/` stay out via `prostart/.gitignore`
+(`.dart_tool` alone was ~300 MB). The root `.gitignore` still only names paths
+under `Flutter App/prostart/`.
+
+### Open
+
+- **Decide which app is the product.** Most likely the mockup's screens move
+  into `Flutter App/prostart/` on top of its BLE layer, then the mockup gets
+  deleted. Until then, any change to the UI has to name which of the two it is in.
+- `prostart/.github/modernize/java-upgrade/` is two hook scripts left by an IDE
+  extension, committed by accident. They can go.
+- `prostart/README.md` is still the `flutter create` template.
 
 ## READ THIS FIRST — 2026-09-22 (evening): the half-time paper checked line by line against the data, and the threshold sweep is finally a committed script
 
