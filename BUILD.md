@@ -4,9 +4,9 @@ This is the practical companion to `HANDOFF.md`: only what to install and what
 command to run, per component. See `HANDOFF.md` for how each piece works
 internally and the history behind the current design.
 
-Only what's actually implemented is covered here. The Zigbee start↔finish
-link and the finish-unit's BLE bridge to the phone, described in the root
-`README.md`, don't exist in code yet — see [What's not buildable yet](#4-whats-not-buildable-yet).
+Only what's actually implemented is covered here. The ESP-NOW long-range
+start↔finish link and the finish relay's BLE bridge to the phone, described in
+the root `README.md`, don't exist in code yet — see [What's not buildable yet](#4-whats-not-buildable-yet).
 
 ---
 
@@ -194,7 +194,7 @@ module docstring before changing them.
 
 ---
 
-## 3. Companion app — `Old Flutter App/prostart`
+## 3. Companion app — `old_flutter_app/prostart`
 
 This is the previous app, no longer developed. The current one is `prostart/`
 in the repo root (only `cupertino_icons`, none of the pins below apply to it):
@@ -209,7 +209,7 @@ in the repo root (only `cupertino_icons`, none of the pins below apply to it):
 
 **Install & run**
 ```bash
-cd "Old Flutter App/prostart"
+cd old_flutter_app/prostart
 flutter pub get
 flutter run
 ```
@@ -226,11 +226,11 @@ install` afterward. Full story in `HANDOFF.md`.
 
 ## 4. What's not buildable yet
 
-- The **Zigbee firmware** for the start↔finish link, and the finish unit's
-  **BLE bridge** to the phone (both described in the root `README.md`) are
-  not implemented. They'll likely need Nordic's own nRF Connect SDK / Zephyr
-  for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain
-  Arduino IDE toolchain used for `AlgorithmRealTime.ino` above. Tracked on the
+- The **XIAO → ESP32 pin handover**, the **ESP-NOW long-range** start↔finish
+  link, and the finish relay's **BLE bridge** to the phone (all described in
+  the root `README.md`) are not implemented. They run on ESP32s with the
+  Arduino `esp32` core, the same one `Arduino/WifiFieldTest/` builds with, so
+  no new toolchain is needed. Tracked on the
   [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
 - `Arduino/BLEtest/`, `Arduino/HighFrequencySampleRate/`,
   `tools/kinestart_live.py`, and `playground_IMU/` were all deleted on

@@ -2,12 +2,12 @@
 .DS_Store
 
 # Flutter/Dart
-Old Flutter App/prostart/build/
-Old Flutter App/prostart/.dart_tool/
-Old Flutter App/prostart/.flutter-plugins
-Old Flutter App/prostart/.flutter-plugins-dependencies
-Old Flutter App/prostart/ios/Pods/
-Old Flutter App/prostart/ios/.symlinks/
+old_flutter_app/prostart/build/
+old_flutter_app/prostart/.dart_tool/
+old_flutter_app/prostart/.flutter-plugins
+old_flutter_app/prostart/.flutter-plugins-dependencies
+old_flutter_app/prostart/ios/Pods/
+old_flutter_app/prostart/ios/.symlinks/
 **/.DS_Store
 
 # Python

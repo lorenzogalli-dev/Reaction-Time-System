@@ -1,6 +1,6 @@
 # 🏁 Reaction-Time System
 
-**A low-cost, portable reaction-time and photo-finish system for track & field, built around two low-power microcontrollers and a companion app.**
+**A low-cost, portable reaction-time and photo-finish system for track & field: a sensor unit on the starting block, a relay beside the finish line, and a phone app.**
 
 > On 4 August 2024, Noah Lyles won the Olympic 100 m final in Paris by **five thousandths of a second** (0.005 s) over Kishane Thompson — a margin smaller than a single frame of standard video. Reaction time is one of the few things an athlete can deliberately train, yet the instruments precise enough to measure it are reserved for elite competitions and cost hundreds of thousands of krona. This project closes that gap.
 
@@ -8,9 +8,9 @@
 
 ## 🖼️ System at a glance
 
-![System overview v2: the start block and finish block (each a XIAO nRF52840 Sense with button, OLED, speaker, IMU, battery, in a compact enclosure) linked by Zigbee, the finish block relaying to the phone app over BLE (with WiFi Direct as a fallback if Zigbee is unreliable), and the eight-step end-to-end flow from connection and clock calibration, through the local start sequence and reaction-time measurement, to AI torso-crossing analysis and results on the phone.](Docs/reaction_time_diagram_v2.png)
+![System overview: the start unit on the starting block, a Wi-Fi link (ESP-NOW long range) to a small ESP32 box at the finish, and a Bluetooth link from that box to the phone on a tripod filming the finish line.](Docs/architecture.png)
 
-*Both blocks compute and timestamp locally in microseconds on their own clock. The phone is used only for calibration, receiving results, recording video, and AI post-processing.*
+*The start unit times the reaction locally, in microseconds, on its own clock. The radio chain only has to deliver the result and the start instant to the phone, which films the finish.*
 
 ---
 
@@ -23,7 +23,7 @@ This repository contains the design and implementation of a **two-part system**:
 
 The goal isn't to replace certified competition timing systems, but to bring a meaningful fraction of their precision — enough to be genuinely useful for training, testing, and local competitions — down to a price point and portability that a club or an individual athlete can actually afford. 💪
 
-Costs, pricing, and a rough revenue projection are laid out in [Business Plan](#-business-plan) below. A deeper technical write-up and design-alternative comparison may exist as a separate course report; it isn't part of this repository.
+Costs, pricing, and a rough revenue projection are laid out in [Business Plan](#-business-plan) below. The technical write-up for the course is the half-time paper, in [`Half Time Paper/`](./Half%20Time%20Paper/).
 
 ---
 
@@ -41,31 +41,36 @@ Costs, pricing, and a rough revenue projection are laid out in [Business Plan](#
 
 ## ⚙️ How the System Works
 
-The architecture went through a real pivot during development, driven by two things we actually measured rather than assumed — see [Open Risks](#-open-risks--things-to-validate) for the details:
-
-1. **No Wi-Fi.** A direct Wi-Fi (SoftAP + UDP) link between the starting device and the phone was the original plan, but it asks the user to join a device-hosted network before every session — a setup step that doesn't belong in a "turn it on and go" product. Dropped in favor of always-on, pair-once radios.
-2. **BLE alone doesn't have the range.** Real-world testing put BLE's reliable range at **~25 m** — far short of the 100 m between a sprint start and a finish line. A single BLE hop can't bridge that.
-
-The current design splits the link into two hops instead of asking one radio to do both jobs:
-
 ```
-Start unit (XIAO #1)  --Zigbee-->  Finish unit (XIAO #2)  --BLE-->  Phone (Flutter app)
+XIAO nRF52840 Sense ──wire── ESP32 #1  ──ESP-NOW long range──  ESP32 #2 ──BLE──  Phone
+   (start block)            (start block)        ~100 m           (finish line)    (prostart app)
 ```
 
-- **Start unit** — sits at the blocks. Button trigger, onboard speaker for the "on your marks – set – go" sequence, and an IMU (accelerometer) that detects the push-off. Reaction time is computed **locally**, on the same clock that generated the "go" cue, so BLE/Zigbee latency downstream never touches the measurement itself.
-- **Finish unit** — sits at (or near) the finish line, within BLE range of the phone. Receives the start unit's timestamp over **Zigbee** (longer range and low power, well suited to a fixed point-to-point link) and relays it to the phone over **BLE** — so the phone only ever needs to be near the finish line, never the start. If Zigbee proves unreliable in the field, **WiFi Direct (SoftAP)** is the documented fallback for the same start↔finish hop.
-- **Phone (Flutter app)** — displays the reaction time, logs it, and runs the photo-finish pipeline against its own camera feed.
+- **Start unit: XIAO nRF52840 Sense + ESP32 #1.** The XIAO sits on the block. It plays the "on your marks – set – go" sequence on its buzzer, detects the push-off with its onboard IMU, and computes the reaction time **locally**, on the same clock that generated the "go". No radio latency downstream ever touches the measurement. The ESP32 next to it is the XIAO's radio: the XIAO raises a pin at the start instant (t0), the ESP32 timestamps that edge in a hardware interrupt, and it sends the result on.
+- **Start ↔ finish: ESP-NOW long range.** Espressif's long-range mode (`WIFI_PROTOCOL_LR`) between two ESP32s. The gain comes from coding, i.e. receive sensitivity, not from transmit power, so it stays within the EU limits. There is no access point, no association and no TCP, just two bare-metal boards.
+- **ESP32 #2: the finish-line relay.** It sits near the phone and has no size or placement constraints, so this is where an external antenna and height go.
+- **Finish ↔ phone: BLE.** Only over a few metres. The phone never needs to be near the start.
+- **Phone: the `prostart/` Flutter app.** It shows the reaction time, logs it, and films the finish. The start instant t0 from the block is the zero of the photofinish time.
 
-This split is under active validation right now — the open question is whether the two independent microcontrollers' clocks can be synchronized precisely enough across the Zigbee hop for reaction-time-grade timing. See [Open Risks](#-open-risks--things-to-validate).
+### Why this chain, and not a single link
+
+Each choice here was measured, not assumed (details in `HANDOFF.md`):
+
+1. **BLE alone reaches ~25 m.** Sprint start to finish is 100 m.
+2. **One ESP32 on Wi-Fi straight to the phone reaches 60-70 m.** It was measured in the field with `Arduino/WifiFieldTest`: clean to ~50 m and dead at 70 m (-91 dBm), 3-4 dB short of 100 m. On top of that, the phone would have to join a device network before every session.
+3. **ESP-NOW long range covers the long hop between two dedicated boards, and BLE covers the short one to the phone.** The hard hop, XIAO to radio, is a wire, and the fragile one, radio to phone, is never more than a few metres long.
+
+**Latency does not matter, arrival does.** The reaction time is already final when it leaves the block, and t0 carries its own timestamp. What the link has to guarantee is that the message arrives, and that the clocks can be related. The error budget for the photofinish is set by the phone camera's frame rate (a 30 fps frame is ~33 ms), not by the radios (2.5-4 ms of sync jitter measured).
 
 ### Key design decisions ⚖️
 
 | Component | Chosen approach | Why |
 |---|---|---|
-| Push-off detection | **IMU** (accelerometer) on device body | Cheap, no block modification needed, easy retrofit — vs. a force/pressure sensor behind the pedal (more accurate, but invasive) |
-| Start sequence | **Onboard speaker**, locally generated | Zero sync uncertainty between "go" cue and measurement clock, works without a human starter |
-| Start ↔ Finish link | **Zigbee**, WiFi Direct (SoftAP) as fallback | Longer reliable range than BLE at low power, for a fixed point-to-point link that doesn't need a phone in the middle |
-| Finish ↔ Phone link | **BLE** | Short-range but simple and universal; the phone only needs to be near the finish line, not the start |
+| Push-off detection | **IMU** (accelerometer) on the device body | Cheap, no block modification, easy retrofit. A force/pressure sensor behind the pedal would be more accurate, but invasive |
+| Start sequence | **Onboard buzzer**, generated locally | Zero sync uncertainty between the "go" and the measurement clock, and no human starter needed |
+| Start unit radio | **ESP32 wired to the XIAO** | Keeps the timing-critical firmware on the XIAO untouched. The t0 handover is a pin edge, sub-µs |
+| Start ↔ finish link | **ESP-NOW long range** | Range the single Wi-Fi link could not reach, without raising transmit power |
+| Finish ↔ phone link | **BLE** | Universal, pair once, and only a few metres long |
 
 ---
 
@@ -74,7 +79,7 @@ This split is under active validation right now — the open question is whether
 - **Reaction time** — µs-precision, from "go" cue to detected push-off
 - **Ground contact / flight time** *(future extension)*
 - **Finish-line crossing order & total race time** — via the photo-finish extension
-- **Clock synchronization stability** across trials — both device-to-device (Zigbee, start ↔ finish) and device-to-phone (BLE)
+- **Clock synchronization stability** across trials, over ESP-NOW (start ↔ finish) and over BLE (finish ↔ phone)
 
 ---
 
@@ -84,28 +89,28 @@ This split is under active validation right now — the open question is whether
 
 | Component | Purpose |
 |---|---|
-| Seeed XIAO nRF52840 Sense | MCU + onboard 6-axis IMU (LSM6DS3), BLE / 802.15.4 radio |
+| Seeed XIAO nRF52840 Sense | MCU + onboard 6-axis IMU (LSM6DS3): start sequence, push-off detection, reaction time |
+| ESP32-C3 (SuperMini) | The XIAO's radio: ESP-NOW long range to the finish |
 | Push button | Manual trigger |
-| Class-D amplifier + speaker | Start-sequence playback |
-| LiPo battery + charge circuit | Portable, multi-hour use |
+| Buzzer | Start-sequence playback, driven at its 4 kHz resonance |
+| LiPo battery + charge circuit | Powers both boards |
 
-### Finish unit
+### Finish relay
 
 | Component | Purpose |
 |---|---|
-| Seeed XIAO nRF52840 Sense | Zigbee ↔ BLE bridge to the phone |
-| LiPo battery + charge circuit | Portable, multi-hour use |
-
-Both units are the same board family, which keeps the bill of materials simple and the firmware toolchain identical between them.
+| ESP32 | ESP-NOW long range ↔ BLE bridge to the phone |
+| External antenna (optional) | Range margin, on the side with room for it |
+| Battery | Its own cell, so it does not drain the phone while it films |
 
 ---
 
 ## 💻 Software Stack
 
-- **Firmware (implemented today):** Arduino IDE (C/C++), the vendored Seeed `LSM6DS3` library, `Wire.h` (I2C) — see `Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`, the current no-BLE accelerometer capture firmware used for on-block validation.
-- **Firmware (not yet implemented):** the Zigbee start↔finish link and the finish-unit's BLE bridge to the phone described above don't exist in this repo yet — likely to need Nordic's own SDK/Zephyr for the 802.15.4/Zigbee stack on the nRF52840, rather than the plain `ArduinoBLE` library. Tracked on the [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
-- **Companion app:** Flutter (Dart) — `flutter_blue_plus` for BLE.
-- **Capture/analysis tooling:** Python (`capture.py`, `start_detector.py`) — see [BUILD.md](./BUILD.md) for exact versions and setup.
+- **Firmware (implemented):** Arduino IDE (C/C++) on the XIAO, `Seeeduino:mbed` core (the `nrf52` core silently degrades `micros()` to ~1 ms), and the vendored Seeed `LSM6DS3` library. `Arduino/AlgorithmRealTime/` runs the start sequence and the on-device detector. `Arduino/WifiFieldTest/` is the ESP32-C3 sketch the range was measured with.
+- **Firmware (not yet implemented):** the XIAO → ESP32 pin handover, the ESP-NOW long-range link, and the relay's BLE bridge. The first thing to test is whether ESP32 #2 can run long range and a link to the phone at the same time on its single 2.4 GHz radio. Tracked on the [backlog](https://github.com/users/lorenzogalli-dev/projects/4).
+- **App:** Flutter (Dart), in `prostart/`. Today it is the UI with mock data. The BLE layer (`flutter_blue_plus`) will be ported from the previous app in `old_flutter_app/prostart/`.
+- **Capture/analysis tooling:** Python (`capture.py`, `start_detector.py`, `sweep_threshold.py`). See [BUILD.md](./BUILD.md) for exact versions and setup.
 - **Photo-finish AI pipeline:** computer-vision torso-crossing detection + sub-frame interpolation *(premium tier, planned)*.
 
 ---
@@ -116,21 +121,22 @@ Both units are the same board family, which keeps the bill of materials simple a
 
 ### Cost side
 
-**Hardware (bill of materials, per full kit = 1 start unit + 1 finish unit):**
+**Hardware (bill of materials, per full kit = 1 start unit + 1 finish relay):**
 
 | Item | Qty | Unit cost | Line cost |
 |---|---|---|---|
-| Seeed XIAO nRF52840 Sense | 2 | 180 SEK (~$17) | 360 SEK |
-| Enclosure, button, speaker, misc. wiring | 1 set | 150 SEK | 150 SEK |
+| Seeed XIAO nRF52840 Sense | 1 | 180 SEK (~$17) | 180 SEK |
+| ESP32-C3 | 2 | 40 SEK (~$4) | 80 SEK |
+| Enclosures, button, buzzer, antenna, misc. wiring | 1 set | 200 SEK | 200 SEK |
 | LiPo battery + charge circuit | 2 | 70 SEK | 140 SEK |
 | Assembly & QA overhead | — | 150 SEK | 150 SEK |
-| **Total COGS per kit** | | | **~800 SEK (~$76)** |
+| **Total COGS per kit** | | | **~750 SEK (~$71)** |
 
-**Development ("us as programmers"):** built by a 5-person team over one KTH course term — sweat equity, not a cash cost at this stage. If this moved past the course into an actual venture, a realistic estimate to take the current prototype to a manufacturable v1 (firmware hardening, Zigbee bring-up, enclosure design, app polish, compliance testing) is **~1,200,000 SEK (~$114,000)** over 6 months, mostly salaries for a small team.
+**Development ("us as programmers"):** built by a 5-person team over one KTH course term — sweat equity, not a cash cost at this stage. If this moved past the course into an actual venture, a realistic estimate to take the current prototype to a manufacturable v1 (firmware hardening, ESP-NOW bring-up, enclosure design, app polish, compliance testing) is **~1,200,000 SEK (~$114,000)** over 6 months, mostly salaries for a small team.
 
 ### Revenue side
 
-**Hardware price:** 1,990 SEK (~$190) per kit, retail — well under the "hundreds of thousands of kronor" professional systems cost from the pitch at the top of this README. Gross margin per kit: ~1,190 SEK (~60%).
+**Hardware price:** 1,990 SEK (~$190) per kit, retail — well under the "hundreds of thousands of kronor" professional systems cost from the pitch at the top of this README. Gross margin per kit: ~1,240 SEK (~62%).
 
 **App — freemium:**
 
@@ -158,10 +164,10 @@ Both units are the same board family, which keeps the bill of materials simple a
 | Premium subscriptions | 3,000 users | ~600 SEK/yr | 1,800,000 SEK |
 | Ad revenue (free tier) | 12,000 users | ~20 SEK/yr | 240,000 SEK |
 | **Total Year-3 revenue** | | | **~21,940,000 SEK (~$2.1M)** |
-| Hardware COGS | 10,000 | 800 SEK | 6,000,000 SEK |
-| **Gross profit (before opex)** | | | **~15,940,000 SEK (~$1.5M)** |
+| Hardware COGS | 10,000 | 750 SEK | 7,500,000 SEK |
+| **Gross profit (before opex)** | | | **~14,440,000 SEK (~$1.4M)** |
 
-This is a back-of-the-envelope model to size the opportunity, not a forecast — customer-acquisition cost, support, warranty returns, and the Zigbee clock-sync risk above all sit outside it.
+This is a back-of-the-envelope model to size the opportunity, not a forecast — customer-acquisition cost, support, warranty returns, and the radio-link risks above all sit outside it.
 
 ---
 
@@ -179,16 +185,18 @@ Reaction-Time-System/
 │   │       ├── start_detector.py   # the same algorithm offline (GUI/CLI): tuning
 │   │       │                       #   and the reference the C++ is checked against
 │   │       └── verify_rate.py      # pass/fail check on rate, clock and integrity
+│   ├── WifiFieldTest/           # ESP32-C3: the field range test of the Wi-Fi t0 link
 │   ├── BuzzerSweep/             # diagnostic: finds the buzzer's resonance
 │   ├── ClockCheck/              # diagnostic: measures real micros() resolution
 │   ├── SerialEchoTest/          # minimal hardware/cable sanity check
 │   ├── I2C_Scanner/             # I2C bus debug sketch
 │   └── libraries/               # vendored board libraries (Seeed LSM6DS3)
 ├── prostart/                    # Flutter app (current; UI with mock data for now)
-├── Old Flutter App/
+├── old_flutter_app/
 │   └── prostart/                # previous app: BLE + live accelerometer, no longer developed
 ├── Data/                        # recorded CSV captures and their plots
-├── Docs/                        # diagrams and figures
+├── Docs/                        # architecture image, diagrams, figures
+├── Half Time Paper/             # the course's half-time paper (PDF)
 ├── RUN.md                       # what each file is and the command to run it
 ├── INFO.md                      # how the detection algorithm works, and why
 ├── BUILD.md                     # exact versions and how to run every component
@@ -219,12 +227,12 @@ For exact tool/library versions and the full step-by-step for both firmware and 
 
 What we're actually seeing right now, not a wishlist:
 
-- ❌ **Wi-Fi as the primary phone link is out.** Ruled out on UX grounds (see [How the System Works](#️-how-the-system-works)) — a direct SoftAP link to the phone is not being pursued. WiFi Direct (SoftAP) still exists as a narrower fallback purely for the start↔finish hop, only if Zigbee proves unreliable there.
-- 📏 **BLE range measured at ~25 m max**, confirmed in real testing — this is what forced the two-hop Zigbee + BLE design instead of a single BLE link end-to-end.
-- 🔄 **Zigbee start↔finish link — in progress.** We're now building and testing the two-XIAO link; the open question is whether the two boards' independent clocks can be synchronized tightly enough over Zigbee for reaction-time-grade precision. Not yet validated.
-- 🔊 **Speaker audibility** on an active, noisy track, at range.
+- 📡 **One ESP32 radio, two links.** ESP32 #2 has to talk ESP-NOW long range to the block and BLE to the phone on the same 2.4 GHz radio. Not tested yet, and it decides whether this architecture works as drawn. It is the next thing to test, one afternoon on a single board.
+- 📏 **Range.** Direct Wi-Fi measured 60-70 m against the 100 m needed (possibly 150 m). Long range has not been measured on our hardware yet, and every number so far was taken on empty air, not in a stadium full of 2.4 GHz traffic.
+- ⏱️ **The phone camera is the timing bottleneck** for the photofinish: frame rate, rolling shutter and the frame-timestamp offset, none of them measured yet on the phones that will be used.
+- 🔊 **Buzzer acoustic latency (5-20 ms), still unmeasured.** It enters every reaction time, and so does the buzzer's audibility on a noisy track.
 - 🔋 **Battery life** under real, extended use, for both units.
-- 🛠️ **Firmware reliability.** An earlier firmware combining BLE, a hardware FIFO, and a software PLL for timestamping turned out to hang or crash-loop unpredictably on two separate boards; the root cause was never isolated, so it was replaced with a deliberately minimal, no-BLE accelerometer firmware (`Arduino/AlgorithmRealTime/AlgorithmRealTime.ino`) that's now verified working on real hardware. Full write-up in `HANDOFF.md`. The lesson for the Zigbee work ahead: add complexity one piece at a time, testing after each addition, rather than integrating everything at once.
+- 🛠️ **Firmware reliability.** An earlier firmware combining BLE, a hardware FIFO, and a software PLL on the XIAO hung or crash-looped unpredictably on two boards. It was replaced by the deliberately minimal firmware in `Arduino/AlgorithmRealTime/`, now verified on real hardware. Moving the radio to a separate ESP32 is also what keeps the XIAO that simple. Full write-up in `HANDOFF.md`.
 
 ---
 
@@ -240,10 +248,10 @@ Day-to-day tasks and priorities live on the project backlog, not here:
 
 The end-to-end experience we're building toward:
 
-1. The coach or athlete opens the app and pairs with the finish unit once over BLE — the finish unit is already paired to the start unit over Zigbee, so this is a one-time setup, not a per-session ritual.
+1. The coach or athlete opens the app and pairs with the finish relay once over BLE. The relay is already paired with the start unit over ESP-NOW, so this is a one-time setup, not a per-session ritual.
 2. The athlete gets into the blocks. Someone taps **Start** in the app, or presses the physical button on the start unit directly — no phone needed at the blocks.
 3. The start unit plays "on your marks… set…" with a randomized delay, then "go" — and the reaction-time clock starts at the exact instant the sound leaves the speaker.
-4. The IMU detects the push-off; the start unit computes reaction time locally and sends it over Zigbee to the finish unit, which relays it to the phone over BLE.
+4. The IMU detects the push-off. The XIAO computes the reaction time locally, and its ESP32 sends it, with the start instant, over ESP-NOW long range to the finish relay, which passes it to the phone over BLE.
 5. The phone shows the reaction time immediately, and — if the camera was recording — lets the user tag the torso crossing for a total time, automatically on Premium.
 6. Everything is logged to that athlete's profile: viewable individually on Free, or across a whole squad on a Coach plan.
 

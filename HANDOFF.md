@@ -6,17 +6,17 @@ Sections are newest first.
 ## READ THIS FIRST — 2026-09-24: a second `prostart/` in the repo root, and this time it is not a duplicate
 
 **Decided the same day: `prostart/` is the app from now on.** `Flutter App/` was
-renamed `Old Flutter App/`. Every older section below that says
-`Flutter App/prostart/` means what is now `Old Flutter App/prostart/`. It stays
+renamed `old_flutter_app/`. Every older section below that says
+`Flutter App/prostart/` means what is now `old_flutter_app/prostart/`. It stays
 in the repo because its BLE layer (`lib/services/ble_service.dart`) is what the
 new app will need once it stops using mock data.
 
 The 09-11 section below deleted an untracked `prostart/` from the root as build
 junk and says "the real app is and always was `Flutter App/prostart/`". The new
 root `prostart/` (commit `86dce6a`) is **a different app with the same package
-name**. Do not delete it, and do not merge it back into the one under `Old Flutter App/`.
+name**. Do not delete it, and do not merge it back into the one under `old_flutter_app/`.
 
-| | `Old Flutter App/prostart/` | `prostart/` (new) |
+| | `old_flutter_app/prostart/` | `prostart/` (new) |
 |---|---|---|
 | Purpose | the working app: BLE to the board, live accelerometer, recording | a UI mockup for the presentation |
 | Data | real, `flutter_blue_plus` + `provider` | **all fake**, `lib/mock_data.dart`; no Bluetooth, no timing |
@@ -41,10 +41,10 @@ root (commit `70c7c0e`).
 ### Open
 
 - **Bring the BLE layer over.** The new app has no Bluetooth yet; port it from
-  `Old Flutter App/prostart/lib/services/` rather than rewriting it (the
+  `old_flutter_app/prostart/lib/services/` rather than rewriting it (the
   `systemDevices` stale-connection fix, under "What didn't work — do not
   repeat", is in there).
-- The root `.gitignore` covers only `Old Flutter App/prostart/`; the new app is
+- The root `.gitignore` covers only `old_flutter_app/prostart/`; the new app is
   covered by its own `prostart/.gitignore`.
 - History, Stats and Profile tabs are "coming soon" placeholders.
 

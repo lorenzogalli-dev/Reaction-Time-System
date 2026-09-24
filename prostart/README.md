@@ -5,7 +5,7 @@ off the starting block and **photofinish** time from the camera.
 
 **Status: UI only.** Every number and image on screen comes from
 `lib/mock_data.dart`. The app has no Bluetooth and does no timing yet. The BLE
-layer to port is in `../Old Flutter App/prostart/lib/services/`.
+layer to port is in `../old_flutter_app/prostart/lib/services/`.
 
 ## Run
 
