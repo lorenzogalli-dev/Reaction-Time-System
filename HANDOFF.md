@@ -3,6 +3,69 @@
 Last updated: 2026-09-24. Written for an agent starting with no prior context.
 Sections are newest first.
 
+## READ THIS FIRST — 2026-09-24 (later): one MCU at the start instead of two? Discussed, not decided, nothing changed
+
+Question raised: the start unit is XIAO + ESP32 (two MCUs, joined by a t0 wire).
+Would one ESP32 with an external IMU be better, and how much code would that
+cost? No code was touched. This is the analysis, so nobody re-derives it.
+
+### Hardware facts
+- The XIAO nRF52840 Sense has BLE but no Wi-Fi, so ESP-NOW long range cannot
+  run on it. That is the only reason the ESP32 is there.
+- ESP32 (C3, S3, classic) has Wi-Fi and BLE 5/4.2. No BLE Classic on the C3, not needed.
+- Boards with Wi-Fi + BLE + IMU on one PCB do exist:
+  - **ESP32-based, native ESP-NOW:** M5StickC Plus/Plus2, M5Stack Core2, M5Atom
+    Matrix, M5AtomS3 (MPU6886, some revisions BMI270); Waveshare ESP32-S3 boards
+    with a display (QMI8658). Check the IMU on the exact revision before buying.
+  - **Arduino Nano 33 IoT (LSM6DS3) and Nano RP2040 Connect (LSM6DSOX):** Wi-Fi/BLE
+    is a separate NINA-W102 module running u-blox firmware. Not native ESP-NOW
+    unless reflashed. Not recommended.
+- The alternative that keeps the IMU: an ESP32-S3 (e.g. XIAO ESP32-S3) plus an
+  external LSM6DS3TR-C breakout. Same IMU means the current threshold tuning
+  stays valid.
+
+### The real risk is timing, not code
+The 09-08 to 09-14 history: BLE + FIFO + software PLL on the XIAO hung
+unpredictably, and the two-board split exists to keep the XIAO firmware minimal.
+On a single ESP32 the Wi-Fi stack runs high-priority tasks and interrupts that
+can add jitter to the IMU sampling.
+- ESP32-C3 is single core: radio and sampling share the CPU. Highest risk.
+- ESP32-S3 or classic ESP32 has two cores: sampling on one, radio on the other.
+- The M5 IMUs (MPU6886, ~1 kHz max) are noisier and slower than the LSM6DS3
+  (currently ~866 Hz measured). Switching to one means re-running
+  `sweep_threshold.py` and re-capturing the reference starts.
+
+### How much code changes
+Little. The engine is hardware-independent.
+- `StartDetector.h` (394 lines) and `AicPicker.h` (216) include only `<Arduino.h>`
+  and `<math.h>`. Near-zero port cost; re-check the `micros()` wrap assumption.
+- The vendored LSM6DS3 library uses `Wire`; on ESP32 that is `Wire.begin(SDA, SCL)`.
+- `AlgorithmRealTime.ino` (1044 lines) is the part to touch:
+  - `PIN_LSM6DS3TR_C_INT1` and `PIN_LSM6DS3TR_C_POWER` are Seeed board macros;
+    define the pins by hand (the sketch has an `#error` if INT1 is missing).
+  - `BUTTON_PIN`, `BUZZER_PIN`, `BUZZER_PIN_B` (D0/D1/D2) need remapping.
+  - `drdyIsr` must be `IRAM_ATTR`.
+  - Re-measure the clock (`CLOCKSTEP`): the XIAO mbed core gives a 1 MHz timer,
+    ESP32 is `esp_timer`; verify its resolution, do not assume.
+  - `Serial` at 921600 over native USB CDC behaves differently on HWCDC (C3/S3).
+- Estimate: an afternoon to port, a few days to validate (jitter, dropped
+  samples, fresh reference captures). Not writing code is the cost; measuring is.
+
+### Recommendation, not a decision
+Keep XIAO + ESP32 for the demo and the paper: it works and is verified. In
+parallel, run one isolated test: ESP32-S3 + external LSM6DS3, ESP-NOW long range
+transmitting continuously, sampling at the current rate, and measure jitter and
+drops with `verify_rate.py`. If the numbers hold, collapse to one MCU.
+
+Cheap hedge, do it now: write the ESP-NOW layer as its own module with one
+entry point (`sendResult(t0, reaction_us)`). Then a later one-MCU switch only
+changes the caller. Packet format, finish relay and app stay untouched.
+
+### Open
+- The one-MCU jitter test above has not been run.
+- The single-radio question from the 09-22 section (ESP32 #2 doing ESP-NOW LR
+  and BLE to the phone at once) is still the first thing to test.
+
 ## READ THIS FIRST — 2026-09-24: a second `prostart/` in the repo root, and this time it is not a duplicate
 
 **Decided the same day: `prostart/` is the app from now on.** `Flutter App/` was
