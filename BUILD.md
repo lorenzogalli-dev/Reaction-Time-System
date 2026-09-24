@@ -194,7 +194,11 @@ module docstring before changing them.
 
 ---
 
-## 3. Companion app — `Flutter App/prostart`
+## 3. Companion app — `Old Flutter App/prostart`
+
+This is the previous app, no longer developed. The current one is `prostart/`
+in the repo root (only `cupertino_icons`, none of the pins below apply to it):
+`cd prostart && flutter pub get && flutter run`.
 
 **Tested with:**
 
@@ -205,7 +209,7 @@ module docstring before changing them.
 
 **Install & run**
 ```bash
-cd "Flutter App/prostart"
+cd "Old Flutter App/prostart"
 flutter pub get
 flutter run
 ```

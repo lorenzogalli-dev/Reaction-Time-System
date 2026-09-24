@@ -5,13 +5,18 @@ Sections are newest first.
 
 ## READ THIS FIRST — 2026-09-24: a second `prostart/` in the repo root, and this time it is not a duplicate
 
+**Decided the same day: `prostart/` is the app from now on.** `Flutter App/` was
+renamed `Old Flutter App/`. Every older section below that says
+`Flutter App/prostart/` means what is now `Old Flutter App/prostart/`. It stays
+in the repo because its BLE layer (`lib/services/ble_service.dart`) is what the
+new app will need once it stops using mock data.
+
 The 09-11 section below deleted an untracked `prostart/` from the root as build
 junk and says "the real app is and always was `Flutter App/prostart/`". The new
 root `prostart/` (commit `86dce6a`) is **a different app with the same package
-name**. Do not delete it, and do not merge it with the one under `Flutter App/`
-without deciding which one is the product.
+name**. Do not delete it, and do not merge it back into the one under `Old Flutter App/`.
 
-| | `Flutter App/prostart/` | `prostart/` (new) |
+| | `Old Flutter App/prostart/` | `prostart/` (new) |
 |---|---|---|
 | Purpose | the working app: BLE to the board, live accelerometer, recording | a UI mockup for the presentation |
 | Data | real, `flutter_blue_plus` + `provider` | **all fake**, `lib/mock_data.dart`; no Bluetooth, no timing |
@@ -31,17 +36,17 @@ presentation. The script for it is `Prostart- Presentation Script.docx` in the
 root (commit `70c7c0e`).
 
 `.dart_tool/`, `build/` and `.idea/` stay out via `prostart/.gitignore`
-(`.dart_tool` alone was ~300 MB). The root `.gitignore` still only names paths
-under `Flutter App/prostart/`.
+(`.dart_tool` alone was ~300 MB).
 
 ### Open
 
-- **Decide which app is the product.** Most likely the mockup's screens move
-  into `Flutter App/prostart/` on top of its BLE layer, then the mockup gets
-  deleted. Until then, any change to the UI has to name which of the two it is in.
-- `prostart/.github/modernize/java-upgrade/` is two hook scripts left by an IDE
-  extension, committed by accident. They can go.
-- `prostart/README.md` is still the `flutter create` template.
+- **Bring the BLE layer over.** The new app has no Bluetooth yet; port it from
+  `Old Flutter App/prostart/lib/services/` rather than rewriting it (the
+  `systemDevices` stale-connection fix, under "What didn't work — do not
+  repeat", is in there).
+- The root `.gitignore` covers only `Old Flutter App/prostart/`; the new app is
+  covered by its own `prostart/.gitignore`.
+- History, Stats and Profile tabs are "coming soon" placeholders.
 
 ## READ THIS FIRST — 2026-09-22 (evening): the half-time paper checked line by line against the data, and the threshold sweep is finally a committed script
 

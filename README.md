@@ -184,8 +184,9 @@ Reaction-Time-System/
 │   ├── SerialEchoTest/          # minimal hardware/cable sanity check
 │   ├── I2C_Scanner/             # I2C bus debug sketch
 │   └── libraries/               # vendored board libraries (Seeed LSM6DS3)
-├── Flutter App/
-│   └── prostart/                # Flutter companion app
+├── prostart/                    # Flutter app (current; UI with mock data for now)
+├── Old Flutter App/
+│   └── prostart/                # previous app: BLE + live accelerometer, no longer developed
 ├── Data/                        # recorded CSV captures and their plots
 ├── Docs/                        # diagrams and figures
 ├── RUN.md                       # what each file is and the command to run it
@@ -207,7 +208,7 @@ Reaction-Time-System/
 
 ### App
 1. Install [Flutter](https://docs.flutter.dev/get-started/install)
-2. `cd "Flutter App/prostart" && flutter pub get`
+2. `cd prostart && flutter pub get`
 3. `flutter run`
 
 For exact tool/library versions and the full step-by-step for both firmware and the Python capture tooling, see **[BUILD.md](./BUILD.md)**.
