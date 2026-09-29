@@ -3,6 +3,93 @@
 Last updated: 2026-09-29. Written for an agent starting with no prior context.
 Sections are newest first.
 
+## READ THIS FIRST — 2026-09-29 (night): AlgorithmRealTime v5 runs standalone — display, one button, runs kept on flash
+
+The start unit no longer needs a laptop. Flashed and checked on the bench
+the same evening; the user ran the whole flow by hand ("funziona tutto").
+Not yet used at the track.
+
+### What it does
+`off --hold 3 s--> READY --press--> 3-2-1 --> "On your marks" (beep)
+--20-25 s--> "Set" (beep) --armed + 0.7-1.5 s--> "Go" (beep) --1 s-->`
+result (reaction time in s, or FALSE START with its signed time), stored on
+flash, dumped on serial as before. Press on the result -> READY. Press during
+a start -> abort. Hold 3 s anywhere -> "Nice session today!" and nRF52840
+System OFF; a press wakes it, and it stays on only if held the full 3 s (a
+progress bar shows it). Plugging in / upload / reset boots straight to READY,
+so the serial port does not vanish after every upload. When the board is
+off the port is gone: switch it on (or double-tap reset) before uploading.
+
+Serial output is unchanged and complete; with no terminal open the mbed core
+drops it without blocking (USBCDC checks `_terminal_connected`).
+
+### Wiring (1.77" ST7735S 160x128, AZ-Delivery "Ver 3.1", header pins 1-8)
+GND->GND, VCC->**3V3**, SCK->D8, SDA->D10, RES->D5, RS->D6, CS->D7,
+LEDA->D4. Pins 9-14 (GT_* font chip) unconnected. Button D0 and buzzer
+D1/D2 as before. `TFT_BGR` / `TFT_ROTATION` in `Display.h` if a different
+panel batch comes out colour-swapped or upside down (this one did not).
+
+### Files
+- `Display.h` — own ST7735 driver on `mbed::SPI` (8 MHz, MISO unused),
+  5x7 font scaled, and a **draw queue**: screens are queued, `displayPump()`
+  draws for at most `DRAW_BUDGET_US` = 300 µs right after each sample, never
+  between two. No Adafruit libraries on purpose (they draw blocking).
+- `Storage.h` — 25 fixed 80 KB slots on the 2 MB QSPI flash + one sector for
+  the run-id counter, via `nrfx_qspi` directly. Binary (10 B/sample, header
+  written last). Oldest run overwritten when full: the board has no calendar
+  clock, so retention is by count, not days.
+- `Python_Tools/pull_captures.py` — `L`/`F`/`X` over serial; writes
+  `Data/board/prostart_r00012.csv` with capture.py's own `write_csv`.
+  `--erase` only after a complete download.
+- New dump lines: `GAPS,<n>` / `MAXGAP,<us>` (sample intervals > 1.5x nominal
+  since the button) and `STORED,<id>`. capture.py and verify_rate.py know them.
+
+### Two things found on the way — both matter beyond the display
+1. **The IMU ran at 100 kHz I2C through v4.** The sketch called
+   `Wire.setClock(400000)`, but on the Sense the library reaches the IMU via
+   `#define Wire Wire1` *inside LSM6DS3.cpp*, so the sketch set the unused
+   D4/D5 bus. That is where the "~1023 µs burst read" of 09-08 came from. Now
+   `Wire1.setClock(400000)`. The timestamp is taken before the read, so its
+   meaning is unchanged; verify_rate after the change: 865.1 Hz, dt std
+   17.1 µs, DROPPED 0, 0 gaps.
+2. **The Seeeduino:mbed 2.9.3 Sense build has no mbed QSPI** (`DEVICE_QSPI`
+   off: no `mbed::QSPI`, no `QSPIFBlockDevice` in libmbed.a, and `<dirent.h>`
+   is unsupported), although the headers and Seeed's Spi_Flash example are
+   there. `nrfx_qspi_*` is linked and works: JEDEC reads back.
+
+### Measurement impact, measured (bench, board still, one sequence each)
+The first cut budgeted the display in pixels (200 px/sample) and lost single
+samples while drawing "Set" and "Go" (GAPS 43; dt ~2.1 ms at go+34..42 ms):
+tiny text rectangles cost three command transactions each, which the pixel
+count ignored. Switched to the time budget; same test: **GAPS 1**. Sample
+interval std by window on that run (#2 on the flash):
+
+| window | std dt | min-max µs |
+|---|---:|---:|
+| still, before set | 22.1 µs | 1099-1225 |
+| drawing "Set" | 24.9 | 1095-1215 |
+| drawing "Go" (go+0-100 ms) | 29.2 | 1092-1209 |
+| reaction window go+100-1000 ms | 21.5 | 1104-1216 |
+| v4 captures 09-15, gaps excluded | 22-23 | 1051-1635 |
+
+**The one remaining gap (~12 ms at "set") is not the display and not new:**
+it is `setupDetectorFromPreroll()` replaying ~2500 samples, and the 09-15
+captures show the same 12.9 ms at set-1.0 ms. So `GAPS,1` is the normal
+value from now on. Those v4 captures also have a ~1.9 ms gap at the arming
+instant (set+1000 ms) that the v5 run does not; one run, not claimed fixed.
+
+Untouched: buzzer (4000 Hz PWM antiphase, `beep()` timestamping), StartDetector.h,
+AicPicker.h, the random marks->set and arm->go windows. Changed but not
+measurement-relevant: button->marks is a fixed 3 s countdown (was 2-3 s
+random); a start begins on button RELEASE (to tell it from the 3 s hold);
+the dump now comes after the ~1 s flash write.
+
+### Open
+- Standalone session on a power bank, then `pull_captures.py`; power off/on.
+- Real block starts: confirm `GAPS,1` with an athlete moving.
+- Flash holds two bench runs (#1, #2, "no movement"): `pull_captures.py --erase`.
+- Buzzer acoustic latency: still never measured, now the largest error term.
+
 ## READ THIS FIRST — 2026-09-29 (evening): a 31 mm wire and B raised to 2 m take ESP-NOW LR past 100 m; the crouched athlete is what still bites
 
 Two more sessions on an athletics track, after the ceramic-antenna walk in the

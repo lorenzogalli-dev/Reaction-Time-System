@@ -131,6 +131,13 @@ def main():
             # dump carries no start sequence, so the markers are all 0 here.
             print(f"[board] {line}")
             continue
+        if line.startswith(("GAPS,", "MAXGAP,", "STORED,", "ARM,", "ARMMG,", "ARMCAP,",
+                            "VERDICT,", "RTMS,", "ONSET,")):
+            # Left over from the last start (GAPS counts from the button, the
+            # rest is that run's verdict). Not about this ring's rate: the
+            # gap check below measures the ring itself.
+            print(f"[board] {line}")
+            continue
         if line.startswith("CLOCKSTEP,"):
             val = line.split(",", 1)[1].strip()
             clockstep = int(val) if val.isdigit() else None

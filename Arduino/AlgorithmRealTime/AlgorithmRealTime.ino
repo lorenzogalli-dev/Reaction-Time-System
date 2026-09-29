@@ -2,6 +2,8 @@
 #include "Wire.h"
 #include "StartDetector.h"
 #include "AicPicker.h"
+#include "Display.h"
+#include "Storage.h"
 
 static StartDetector detector;
 
@@ -46,9 +48,25 @@ static StartDetector detector;
 // (5-20 ms): systematic and constant, so it is calibrated once and
 // subtracted, not fought on every run.
 //
-// Sequence, all delays randomised so the rhythm cannot be learned:
-//   button -> 2-3 s -> beep "on your marks" -> 20-25 s -> beep "set"
-//          -> 2.2-3 s -> beep "go" -> 1 s -> dump
+// v5 (2026-09-29): STANDALONE - DISPLAY, ONE BUTTON, FLASH
+// --------------------------------------------------------
+// The board no longer needs a terminal. A 1.77" TFT (Display.h, wiring there)
+// shows every step, the one button does everything, and every start is kept
+// on the QSPI flash (Storage.h) to be pulled later. Serial output is unchanged
+// and still complete - with no terminal open the core simply drops it.
+//
+//   off  --hold 3 s-->  READY  --press-->  3, 2, 1  -->  "On your marks" (beep)
+//        --20-25 s-->  "Set" (beep)  --armed + 0.7-1.5 s-->  "Go" (beep)
+//        --1 s-->  RESULT (reaction time, or FALSE START with its time)
+//   RESULT --press--> READY.   Press during a start: abort, back to READY.
+//   Hold 3 s anywhere: "Nice session today!", then System OFF (~µA). A press
+//   wakes the chip, and it only stays on if the button is held the full 3 s.
+//   Plugging in / uploading / reset boots straight to READY.
+//
+// Sequence delays other than the countdown stay randomised so the rhythm
+// cannot be learned:
+//   button -> 3 s countdown -> beep "on your marks" -> 20-25 s -> beep "set"
+//          -> armed + 0.7-1.5 s -> beep "go" -> 1 s -> result, store, dump
 //
 // The recording window is [set - PREROLL_SAMPLES, go + 1 s]. The pre-roll is
 // not padding: the detector's LTA needs ~800 ms to converge, so a capture
@@ -77,6 +95,11 @@ static StartDetector detector;
 // 'd' dumps the whole ring immediately (no sequence, no markers) - this is
 //     what verify_rate.py uses for its rate/integrity check.
 // 'p' prints one immediate reading, independent of the above.
+// 'L' lists the runs stored on flash: FILES,<n>,<free slots> then one
+//     FILE,<id>,<samples> each, oldest first, then FILES_END.
+// 'F' replays every stored run as a normal DUMP_START..DUMP_END block (with a
+//     STORED,<id> line), then FETCH_END. pull_captures.py drives this.
+// 'X' erases every stored run: ERASED,<n>.
 //
 // One second after "go" the board dumps the window by itself:
 //   DUMP_START,<n>
@@ -87,6 +110,9 @@ static StartDetector detector;
 //   TRUNCATED,<0|1>       1 = the ring wrapped, the pre-roll is short
 //   DROPPED,<n>           samples the data-ready watchdog had to recover
 //   CLOCKSTEP,<us>        measured micros() resolution of this build
+//   GAPS,<n>              sample intervals over 1.5x nominal since the button
+//   MAXGAP,<us>           the longest of them
+//   STORED,<id>           this run's id on the flash (absent: not stored)
 //   <n CSV rows, t_us,x_g,y_g,z_g, full ODR, no decimation>
 //   DUMP_END
 //   ... then idle decimated streaming resumes automatically.
@@ -267,7 +293,13 @@ static const uint32_t BEEP_MS = 100;
 // Randomised so the athlete cannot learn the rhythm - the reason this matters
 // is that an anticipated "go" is exactly what a reaction time must not
 // measure. Arduino's random(a, b) is inclusive of a, exclusive of b.
-static const long MARKS_DELAY_MIN_MS = 2000,  MARKS_DELAY_MAX_MS = 3001;
+// Button -> "on your marks" is a fixed, visible 3-2-1 countdown since v5 (it
+// was a random 2-3 s). Nobody reacts to "on your marks", so nothing is lost.
+static const uint32_t COUNTDOWN_MS = 3000;
+// Held this long: power off (or, just woken, stay on).
+static const uint32_t LONG_PRESS_MS = 3000;
+// Left in the retained GPREGRET2 register when going off (see setup()).
+static const uint8_t SYSTEM_OFF_FLAG = 0xA5;
 // Back to 20-25 s on 2026-09-11, the original v4 value (it had been shortened
 // to 10-15 s to make bench iteration less tedious). This is the realistic
 // "on your marks" hold, and it costs nothing: the sample ring fills
@@ -348,6 +380,23 @@ static uint32_t lastSampleUs = 0;
 // discarding that fact is how a timing bug survives to the next person.
 static uint32_t droppedSamples = 0;
 
+// Intervals between consecutive samples longer than 1.5x nominal, counted from
+// the button press. The watchdog count above cannot see these: a loop blocked
+// for 20 ms loses ~16 samples but recovers with one clean edge afterwards. v5
+// adds a display to the loop, so this is how a draw that stalls sampling
+// would show up in the capture instead of passing silently.
+static uint32_t gapCount = 0, maxGapUs = 0, prevSampleT = 0;
+
+// Button-press instant; the countdown digits are timed from it.
+static uint32_t seqStartUs = 0;
+// Id the last finished run got on the flash, 0 if it was not stored.
+static uint32_t lastStoredId = 0;
+// READY or RESULT, when no sequence is running.
+static bool showingResult = false;
+// True while the press that powered the board on is still being held: its
+// release must not also start a sequence.
+static bool buttonSwallow = false;
+
 // Measured resolution of micros() on this build, in microseconds. Every
 // timestamp in a capture is only as good as this number, and it is NOT a
 // property of the sketch - it depends on which core the sketch was built
@@ -400,19 +449,45 @@ static void drdyIsr() {
 }
 
 void setup() {
+  // Why this boot happened, read before anything else. OFF = a button press
+  // woke the chip from System OFF (see enterSystemOff); everything else -
+  // plugging in, an upload, the reset button - is a deliberate "on".
+  // GPREGRET2 is set just before going off and survives System OFF; it is
+  // checked as well because the XIAO's bootloader runs first and is not ours
+  // to trust with RESETREAS.
+  uint32_t resetReason = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = 0xFFFFFFFFUL;   // write-1-to-clear
+  bool wokeFromOff = (resetReason & POWER_RESETREAS_OFF_Msk) != 0 ||
+                     NRF_POWER->GPREGRET2 == SYSTEM_OFF_FLAG;
+  NRF_POWER->GPREGRET2 = 0;
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  tftBegin();
+  // A press only wakes the chip; staying on takes the full 3 s hold, so a
+  // knock in the bag does not leave it running.
+  if (wokeFromOff) {
+    if (!holdToWake()) enterSystemOff();
+    screenClearAll();   // the progress bar is not a tracked text box
+  }
+
   Serial.begin(921600);
   // Native USB CDC: Serial only becomes true once a host opens the port.
-  // Bounded wait so a battery-powered board (no host attached) doesn't hang
-  // here forever.
-  unsigned long waitStart = millis();
-  while (!Serial && millis() - waitStart < 3000) delay(10);
+  // Bounded wait so the banner below is not lost right after an upload - and
+  // skipped after a wake, where the person is holding the board, not a laptop.
+  if (!wokeFromOff) {
+    screenClearAll();
+    queueTextCentered(40, 3, C_ORANGE, "ProStart");
+    queueTextCentered(80, 1, C_GREY, "starting...");
+    displayPump(0xFFFFFFFFUL);
+    unsigned long waitStart = millis();
+    while (!Serial && millis() - waitStart < 3000) delay(10);
+  }
 
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BUZZER_PIN_B, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   digitalWrite(BUZZER_PIN_B, LOW);
   buzzerInit();
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef PIN_LSM6DS3TR_C_POWER
   // XIAO Sense IMU power-enable pin: if left low, begin() fails even with
@@ -433,7 +508,14 @@ void setup() {
   if (!imuReady) {
     Serial.println("IMU error - check wiring/power pin");
   } else {
-    Wire.setClock(400000);
+    // Wire1, not Wire. On the Sense the IMU sits on the internal bus, and the
+    // library reaches it through `#define Wire Wire1` inside LSM6DS3.cpp - a
+    // define this file never sees. Through v4 this line said Wire.setClock(),
+    // which set the unused D4/D5 bus and left the IMU at the 100 kHz default:
+    // that is where the "~1023 us per burst read" measured on 09-08 came from.
+    // At 400 kHz the read is ~0.3 ms, and the ~0.9 ms left per sample is what
+    // the display is allowed to use during a start (see displayPump in loop).
+    Wire1.setClock(400000);
 
     // Route accelerometer data-ready to INT1.
     myIMU.writeRegister(LSM6DS3_ACC_GYRO_INT1_CTRL,
@@ -468,6 +550,21 @@ void setup() {
     Serial.println("!! (\"XIAO nRF52840 Sense (No Updates)\"), which uses a real 1 MHz timer.");
   }
 
+  if (storageBegin()) {
+    Serial.print("flash: JEDEC ");
+    Serial.print(jedecId, HEX);
+    Serial.print(", ");
+    Serial.print(storageCount());
+    Serial.print("/");
+    Serial.print(SLOT_COUNT);
+    Serial.print(" run slots used, next id ");
+    Serial.println(nextRunId);
+  } else {
+    Serial.print("!! flash: QSPI init failed (JEDEC ");
+    Serial.print(jedecId, HEX);
+    Serial.println(") - runs will NOT be stored");
+  }
+
   Serial.println("Ready. Idle preview streaming. 'p' one reading.");
   Serial.print("Start sequence: press the button on D");
   Serial.print(BUTTON_PIN);
@@ -478,8 +575,13 @@ void setup() {
   Serial.print(" at ");
   Serial.print(BEEP_FREQ_HZ);
   Serial.println(" Hz");
-  Serial.println("  button -> 2-3s -> MARKS -> 20-25s -> SET -> 2.2-3s -> GO -> 1s -> dump");
+  Serial.println("  button -> 3-2-1 -> MARKS -> 20-25s -> SET -> armed+0.7-1.5s -> GO -> 1s -> dump");
   Serial.println("  'a' or a second press aborts. 'd' dumps the ring as-is.");
+  Serial.println("  Hold the button 3 s to power off. 'L' list / 'F' fetch / 'X' erase stored runs.");
+
+  // Still holding the press that switched it on: its release is not a command.
+  buttonSwallow = (digitalRead(BUTTON_PIN) == LOW);
+  showReady();
 }
 
 // Single I2C transaction: X/Y/Z occupy six consecutive registers
@@ -514,7 +616,8 @@ static void printCsvRow(uint32_t t_us, int16_t rawX, int16_t rawY, int16_t rawZ)
 // It exists because the ring is always full anyway: "dump what you have" needs
 // no arm/stop handshake at all, which is one less piece of state than the
 // start/stop commands it replaces.
-static void dumpRecording(bool wholeRing) {
+// The window a dump covers, [from, recWritten), and the header describing it.
+static void buildLiveMeta(bool wholeRing, CaptureMeta* m, uint32_t* fromOut) {
   // Window is [set - PREROLL_SAMPLES, recWritten), clamped to what the ring
   // still physically holds. The clamp is not defensive noise: without it, a
   // request reaching further back than MAX_REC_SAMPLES would read slots that
@@ -527,32 +630,67 @@ static void dumpRecording(bool wholeRing) {
                       : ((setSampleIdx > PREROLL_SAMPLES) ? (setSampleIdx - PREROLL_SAMPLES) : 0);
   bool truncated = (from < oldest);
   if (truncated) from = oldest;
-  uint32_t n = recWritten - from;
 
+  memset(m, 0, sizeof(*m));
+  m->magic = CAPTURE_MAGIC;
+  m->version = CAPTURE_VERSION;
+  m->metaSize = sizeof(CaptureMeta);
+  m->n = recWritten - from;
+  m->onT = onCaptured ? onT : 0;
+  m->setT = setCaptured ? setT : 0;
+  m->goT = goCaptured ? goT : 0;
+  m->preroll = wholeRing ? 0 : (setSampleIdx - from);
+  m->truncated = truncated ? 1 : 0;
+  m->dropped = droppedSamples;
+  m->gaps = gapCount;
+  m->maxGapUs = maxGapUs;
+  m->clockStep = clockStepUs;
+  m->armValid = detector.gate_open ? 1 : 0;
+  m->armT = detector.gate_t_us;
+  m->armMg = detector.gate_peak_mg;
+  m->armCapped = detector.gate_capped ? 1 : 0;
+  if (lastVerdict != nullptr) {
+    m->hasVerdict = 1;
+    strncpy(m->verdict, lastVerdict, sizeof(m->verdict) - 1);
+    m->rtMs = lastReactionMs;
+    m->onsetUs = lastOnsetUs;
+  }
+  *fromOut = from;
+}
+
+static void emitDumpHeader(const CaptureMeta& m) {
   Serial.print("DUMP_START,");
-  Serial.println(n);
+  Serial.println(m.n);
   Serial.print("ON,");
-  Serial.println(onCaptured ? onT : 0);
+  Serial.println(m.onT);
   Serial.print("SET,");
-  Serial.println(setCaptured ? setT : 0);
+  Serial.println(m.setT);
   Serial.print("GO,");
-  Serial.println(goCaptured ? goT : 0);
+  Serial.println(m.goT);
   // How much pre-"set" history the detector actually gets, in samples. It is
   // reported rather than assumed because TRUNCATED can shorten it.
   Serial.print("PREROLL,");
-  Serial.println(wholeRing ? 0 : (setSampleIdx - from));
+  Serial.println(m.preroll);
   Serial.print("TRUNCATED,");
-  Serial.println(truncated ? 1 : 0);
+  Serial.println(m.truncated);
   // Non-zero means the data-ready watchdog had to recover samples, so some
   // timestamps in this capture are only good to DRDY_STALL_TIMEOUT_US. The
   // host treats an unrecognised 2-field line as banner text, so this is safe
   // to add to the protocol.
   Serial.print("DROPPED,");
-  Serial.println(droppedSamples);
+  Serial.println(m.dropped);
   // Stamped into every capture so a CSV can always be checked after the
   // fact, instead of trusting that whoever recorded it used the right core.
   Serial.print("CLOCKSTEP,");
-  Serial.println(clockStepUs);
+  Serial.println(m.clockStep);
+  Serial.print("GAPS,");
+  Serial.println(m.gaps);
+  Serial.print("MAXGAP,");
+  Serial.println(m.maxGapUs);
+  if (m.id != 0) {
+    Serial.print("STORED,");
+    Serial.println(m.id);
+  }
   // ARM is a marker in exactly the sense ON/SET/GO are: an instant the board
   // decided, on the board's own clock. It is written down rather than left to
   // be recomputed because re-deriving it from the samples is not guaranteed to
@@ -561,20 +699,28 @@ static void dumpRecording(bool wholeRing) {
   // 0.3 mg difference moved the arming by 1.5 s. Reading the decision beats
   // reconstructing it, for the same reason the "go" beep is timestamped rather
   // than inferred.
-  if (detector.gate_open) {
-    Serial.print("ARM,");     Serial.println(detector.gate_t_us);
-    Serial.print("ARMMG,");   Serial.println(detector.gate_peak_mg, 2);
-    Serial.print("ARMCAP,");  Serial.println(detector.gate_capped ? 1 : 0);
+  if (m.armValid) {
+    Serial.print("ARM,");     Serial.println(m.armT);
+    Serial.print("ARMMG,");   Serial.println(m.armMg, 2);
+    Serial.print("ARMCAP,");  Serial.println(m.armCapped);
   }
   // And the verdict itself. Without this the board's answer lives only in the
   // terminal: reopen the capture tomorrow and there is nothing to compare the
   // offline analysis against, which is precisely the comparison that catches a
   // firmware and a bench tool drifting apart.
-  if (lastVerdict != nullptr) {
-    Serial.print("VERDICT,");  Serial.println(lastVerdict);
-    Serial.print("RTMS,");     Serial.println(lastReactionMs, 3);
-    Serial.print("ONSET,");    Serial.println(lastOnsetUs);
+  if (m.hasVerdict) {
+    Serial.print("VERDICT,");  Serial.println(m.verdict);
+    Serial.print("RTMS,");     Serial.println(m.rtMs, 3);
+    Serial.print("ONSET,");    Serial.println(m.onsetUs);
   }
+}
+
+static void dumpRecording(bool wholeRing, uint32_t storedId) {
+  CaptureMeta m;
+  uint32_t from;
+  buildLiveMeta(wholeRing, &m, &from);
+  m.id = storedId;
+  emitDumpHeader(m);
   for (uint32_t i = from; i < recWritten; i++) {
     uint32_t slot = i % MAX_REC_SAMPLES;
     printCsvRow(recT[slot], recX[slot], recY[slot], recZ[slot]);
@@ -582,8 +728,91 @@ static void dumpRecording(bool wholeRing) {
   Serial.println("DUMP_END");
 }
 
-static void serviceSampling() {
-  if (!imuReady) return;
+// Writes the same window dumpRecording(false) prints to the flash. Returns the
+// run id, 0 on failure. Blocks for ~1 s (mostly sector erases): called on the
+// result screen, where nothing is being measured and the display is drawn.
+static uint32_t storeRun() {
+  if (!storageReady) return 0;
+  CaptureMeta m;
+  uint32_t from;
+  buildLiveMeta(false, &m, &from);
+  if (m.n > SLOT_MAX_SAMPLES) {
+    // Never expected (a start dumps ~6.5 s, a slot holds ~9.5 s); if it
+    // happens, keep the end - "go" and the push-off - and say so.
+    uint32_t cut = m.n - SLOT_MAX_SAMPLES;
+    from += cut;
+    m.n = SLOT_MAX_SAMPLES;
+    m.preroll = (m.preroll > cut) ? m.preroll - cut : 0;
+    m.truncated = 1;
+  }
+  m.id = nextRunId;
+
+  uint32_t slot = storagePickSlot();
+  uint32_t base = slot * SLOT_BYTES;
+  uint32_t bytes = sizeof(CaptureMeta) + m.n * sizeof(SampleRec);
+  slotId[slot] = 0;   // whatever was there is gone from here on
+  if (!flashErase(base, (bytes + SECTOR_BYTES - 1) / SECTOR_BYTES * SECTOR_BYTES)) return 0;
+
+  // Samples first, header last (see Storage.h).
+  SampleRec* chunk = (SampleRec*)qspiBuf;
+  const uint32_t perChunk = sizeof(qspiBuf) / sizeof(SampleRec);
+  uint32_t addr = base + sizeof(CaptureMeta);
+  uint32_t k = 0;
+  for (uint32_t i = 0; i < m.n; i++) {
+    uint32_t slotIdx = (from + i) % MAX_REC_SAMPLES;
+    chunk[k].t = recT[slotIdx];
+    chunk[k].x = recX[slotIdx];
+    chunk[k].y = recY[slotIdx];
+    chunk[k].z = recZ[slotIdx];
+    if (++k == perChunk || i + 1 == m.n) {
+      uint32_t len = k * sizeof(SampleRec);
+      memset((uint8_t*)qspiBuf + len, 0xFF, sizeof(qspiBuf) - len);   // word padding
+      if (!flashWrite(addr, qspiBuf, len)) return 0;
+      addr += len;
+      k = 0;
+    }
+  }
+  if (!flashWrite(base, &m, sizeof(m))) return 0;
+
+  // Read the header back: a write that "succeeded" into a flash that ignored
+  // it (write-protected, wrong mode) must not be reported as saved.
+  CaptureMeta check;
+  if (!flashRead(base, &check, sizeof(check)) || check.magic != CAPTURE_MAGIC || check.id != m.id) {
+    return 0;
+  }
+  slotId[slot] = m.id;
+  slotN[slot] = m.n;
+  nextRunId++;
+  return m.id;
+}
+
+// Replays one stored run as a normal dump. False if it could not be read.
+static bool emitStoredRun(uint32_t slot) {
+  uint32_t base = slot * SLOT_BYTES;
+  CaptureMeta m;
+  if (!flashRead(base, &m, sizeof(m)) || m.magic != CAPTURE_MAGIC ||
+      m.metaSize != sizeof(CaptureMeta) || m.n > SLOT_MAX_SAMPLES) {
+    return false;
+  }
+  emitDumpHeader(m);
+  SampleRec* chunk = (SampleRec*)qspiBuf;
+  const uint32_t perChunk = sizeof(qspiBuf) / sizeof(SampleRec);
+  uint32_t addr = base + sizeof(CaptureMeta);
+  for (uint32_t done = 0; done < m.n; ) {
+    uint32_t k = (m.n - done < perChunk) ? (m.n - done) : perChunk;
+    if (!flashRead(addr, qspiBuf, k * sizeof(SampleRec))) break;   // count mismatch says so
+    for (uint32_t i = 0; i < k; i++) printCsvRow(chunk[i].t, chunk[i].x, chunk[i].y, chunk[i].z);
+    addr += k * sizeof(SampleRec);
+    done += k;
+  }
+  Serial.println("DUMP_END");
+  return true;
+}
+
+// Returns true when it read a sample - the display may draw right after one,
+// never between two (see loop()).
+static bool serviceSampling() {
+  if (!imuReady) return false;
 
   uint32_t t;
   if (drdyPending) {
@@ -602,12 +831,21 @@ static void serviceSampling() {
     t = micros();
     droppedSamples++;
   } else {
-    return;
+    return false;
   }
 
   int16_t rawX, rawY, rawZ;
   readSampleRaw(&rawX, &rawY, &rawZ);
   lastSampleUs = micros();
+
+  if (seqState != SEQ_IDLE) {
+    uint32_t dt = t - prevSampleT;
+    if (dt > SAMPLE_PERIOD_US + SAMPLE_PERIOD_US / 2) {
+      gapCount++;
+      if (dt > maxGapUs) maxGapUs = dt;
+    }
+  }
+  prevSampleT = t;
 
   // The ring fills in every state, always - that IS the pre-roll. There is no
   // "start recording" step any more, only a "set" boundary marked in data
@@ -640,6 +878,7 @@ static void serviceSampling() {
       }
     }
   }
+  return true;
 }
 
 // --- buzzer drive ----------------------------------------------------------
@@ -899,8 +1138,12 @@ static void startSequence() {
   }
   onCaptured = setCaptured = goCaptured = false;
   droppedSamples = 0;
+  gapCount = maxGapUs = 0;
+  showingResult = false;
+  seqStartUs = seed;
   seqState = SEQ_WAIT_MARKS;
-  seqDeadlineUs = seed + (uint32_t)random(MARKS_DELAY_MIN_MS, MARKS_DELAY_MAX_MS) * 1000UL;
+  seqDeadlineUs = seed + COUNTDOWN_MS * 1000UL;
+  showCountdown(3);
   Serial.println("SEQ,armed");
 }
 
@@ -911,6 +1154,7 @@ static void abortSequence(const char* why) {
   buzzerOn = false;
   Serial.print("SEQ,abort,");
   Serial.println(why);
+  showReady();
 }
 
 // Deadline comparisons are done on a signed difference so they stay correct
@@ -957,6 +1201,7 @@ static void serviceSequence() {
       seqState = SEQ_WAIT_SET;
       seqDeadlineUs = onT + (uint32_t)random(SET_DELAY_MIN_MS, SET_DELAY_MAX_MS) * 1000UL;
       Serial.println("SEQ,marks");
+      showMarks();
       break;
     case SEQ_WAIT_SET:
       beep(&setT, &setCaptured);
@@ -970,41 +1215,245 @@ static void serviceSequence() {
       seqDeadlineUs = setT;
       Serial.println("SEQ,set");
       setupDetectorFromPreroll();
+      showSet();
       break;
     case SEQ_WAIT_GO:
       beep(&goT, &goCaptured);
       seqState = SEQ_TAIL;
       seqDeadlineUs = goT + TAIL_AFTER_GO_MS * 1000UL;
       Serial.println("SEQ,go");
+      showGo();
       break;
     case SEQ_TAIL:
       seqState = SEQ_IDLE;
       evaluateAndReportResults();
-      dumpRecording(false);
+      // Result on screen first, synchronously: the flash write below blocks
+      // for up to a second, and the person is looking at the display now.
+      showResult();
+      showResultFooter("saving...");
+      displayPump(0xFFFFFFFFUL);
+      lastStoredId = storeRun();
+      if (lastStoredId) {
+        Serial.print("STORE,");
+        Serial.println(lastStoredId);
+      } else {
+        Serial.println("STORE,failed");
+      }
+      {
+        char foot[27];
+        if (lastStoredId) snprintf(foot, sizeof(foot), "#%lu saved | press: ready", (unsigned long)lastStoredId);
+        else snprintf(foot, sizeof(foot), "NOT saved | press: ready");
+        showResultFooter(foot);
+      }
+      dumpRecording(false, lastStoredId);
       break;
     default:
       break;
   }
 }
 
+
+// ===========================================================================
+// Screens. These only QUEUE drawing - loop() pumps it, see there.
+// ===========================================================================
+
+static void showReady() {
+  showingResult = false;
+  screenBegin();
+  queueTextCentered(8, 3, C_ORANGE, "ProStart");
+  queueTextCentered(40, 3, C_GREEN, "READY");
+  queueTextCentered(74, 1, C_WHITE, "Press the button to");
+  queueTextCentered(86, 1, C_WHITE, "begin the start sequence");
+  char line[27];
+  if (storageReady) snprintf(line, sizeof(line), "%lu run(s) on board", (unsigned long)storageCount());
+  else snprintf(line, sizeof(line), "flash error: not saving");
+  queueTextCentered(114, 1, C_GREY, line);
+}
+
+static int countdownShown = 0;
+
+static void showCountdown(int digit) {
+  countdownShown = digit;
+  screenBegin();
+  char s[2] = {(char)('0' + digit), 0};
+  queueTextCentered(29, 10, C_WHITE, s);
+}
+
+static void showMarks() {
+  screenBegin();
+  queueTextCentered(30, 3, C_WHITE, "On your");
+  queueTextCentered(64, 3, C_WHITE, "marks");
+}
+
+static void showSet() {
+  screenBegin();
+  queueTextCentered(43, 6, C_YELLOW, "Set");
+}
+
+static void showGo() {
+  screenBegin();
+  queueTextCentered(39, 7, C_GREEN, "Go");
+}
+
+// Seconds with three decimals, the way a start is reported in athletics:
+// 152.4 ms -> "0.152", -45 ms -> "-0.045". Integer maths: this core's printf
+// has no %f.
+static void formatSeconds(char* buf, size_t len, float ms) {
+  long v = lroundf(ms);
+  const char* sign = (v < 0) ? "-" : "";
+  if (v < 0) v = -v;
+  snprintf(buf, len, "%s%ld.%03ld", sign, v / 1000, v % 1000);
+}
+
+static void showResult() {
+  showingResult = true;
+  screenBegin();
+  char val[16];
+  const char* v = lastVerdict;
+  if (v != nullptr && strcmp(v, "valid start") == 0) {
+    queueTextCentered(10, 2, C_WHITE, "Reaction time");
+    formatSeconds(val, sizeof(val), lastReactionMs);
+    queueTextCentered(40, 5, C_GREEN, val);
+    queueTextCentered(84, 2, C_GREY, "seconds");
+  } else if (v != nullptr && strcmp(v, "FALSE START") == 0) {
+    // Negative: moved before "go". Positive but under DET_FALSE_START_MS:
+    // after "go", but too soon to have been a reaction to it.
+    queueTextCentered(10, 2, C_RED, "FALSE START");
+    formatSeconds(val, sizeof(val), lastReactionMs);
+    queueTextCentered(44, 4, C_RED, val);
+    queueTextCentered(84, 2, C_GREY, "seconds");
+  } else if (v != nullptr && strcmp(v, "no movement") == 0) {
+    queueTextCentered(30, 3, C_YELLOW, "No start");
+    queueTextCentered(66, 2, C_GREY, "detected");
+  } else {
+    queueTextCentered(24, 3, C_RED, "Error");
+    queueTextCentered(64, 1, C_GREY,
+                      detector.fault != nullptr ? detector.fault : (v ? v : "no verdict"));
+  }
+}
+
+static void showResultFooter(const char* text) {
+  queueFill(0, 112, TFT_W, 8, C_BLACK);
+  queueTextCentered(113, 1, C_GREY, text);
+}
+
+// ===========================================================================
+// Power: "off" is the nRF52840's System OFF - everything stopped, RAM lost,
+// a few µA. The button's pin is armed to wake it, and waking is a reset:
+// setup() sees RESETREAS.OFF and asks for the 3 s hold before going on.
+// ===========================================================================
+
+// Called in setup() after a wake. The button is being held; show a bar that
+// fills over LONG_PRESS_MS (counted from boot, so the press that woke the chip
+// counts). Released early -> false, and the caller goes straight back off.
+static bool holdToWake() {
+  screenClearAll();
+  queueTextCentered(30, 3, C_ORANGE, "ProStart");
+  queueTextCentered(62, 1, C_GREY, "keep holding...");
+  queueFill(19, 84, 122, 12, C_GREY);
+  queueFill(20, 85, 120, 10, C_BLACK);
+  displayPump(0xFFFFFFFFUL);
+  int16_t drawn = 0;
+  while (millis() < LONG_PRESS_MS) {
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      delay(BUTTON_DEBOUNCE_MS);
+      if (digitalRead(BUTTON_PIN) == HIGH) return false;
+    }
+    int16_t want = (int16_t)(120UL * millis() / LONG_PRESS_MS);
+    if (want > drawn) {
+      tftFillRect(20 + drawn, 85, want - drawn, 10, C_GREEN);
+      drawn = want;
+    }
+    delay(10);
+  }
+  return true;
+}
+
+static void enterSystemOff() {
+  tftSleep();
+#ifdef PIN_LSM6DS3TR_C_POWER
+  pinMode(PIN_LSM6DS3TR_C_POWER, OUTPUT);
+  digitalWrite(PIN_LSM6DS3TR_C_POWER, LOW);   // the IMU is powered from a GPIO
+#endif
+  // Wait for the release: armed while still held, the press that asked for
+  // "off" would wake the chip again at once.
+  for (;;) {
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      delay(BUTTON_DEBOUNCE_MS);
+      if (digitalRead(BUTTON_PIN) == HIGH) break;
+    }
+    delay(5);
+  }
+  // Pull-up input with SENSE=low: a press raises DETECT, which is what brings
+  // the chip out of System OFF. Pin configuration is retained while off, which
+  // is also what keeps the backlight and the buzzer pins low.
+  uint32_t pin = (uint32_t)digitalPinToPinName(BUTTON_PIN);
+  NRF_GPIO_Type* port = (pin >= 32) ? NRF_P1 : NRF_P0;
+  port->PIN_CNF[pin & 31] = (GPIO_PIN_CNF_DIR_Input       << GPIO_PIN_CNF_DIR_Pos)   |
+                            (GPIO_PIN_CNF_INPUT_Connect   << GPIO_PIN_CNF_INPUT_Pos) |
+                            (GPIO_PIN_CNF_PULL_Pullup     << GPIO_PIN_CNF_PULL_Pos)  |
+                            (GPIO_PIN_CNF_DRIVE_S0S1      << GPIO_PIN_CNF_DRIVE_Pos) |
+                            (GPIO_PIN_CNF_SENSE_Low       << GPIO_PIN_CNF_SENSE_Pos);
+  NRF_POWER->GPREGRET2 = SYSTEM_OFF_FLAG;
+  NRF_POWER->SYSTEMOFF = 1;
+  __DSB();
+  for (;;) { }
+}
+
+static void shutDown() {
+  if (seqState != SEQ_IDLE) abortSequence("power off");
+  Serial.println("POWER,off");
+  screenBegin();
+  queueTextCentered(40, 2, C_WHITE, "Nice session");
+  queueTextCentered(66, 2, C_ORANGE, "today!");
+  displayPump(0xFFFFFFFFUL);
+  delay(2000);
+  enterSystemOff();
+}
+
+// ===========================================================================
+// Button and serial
+// ===========================================================================
+
+static void shortPress() {
+  if (seqState != SEQ_IDLE) return;
+  if (showingResult) showReady();
+  else startSequence();
+}
+
 // Polled, not interrupt-driven: loop() already turns over at the sample rate,
 // so a press is seen within ~1.2 ms, and a bouncing mechanical contact on an
 // interrupt is a well-known way to flood a system.
+//
+// One button, three meanings. Abort acts on the PRESS - a spoiled start is
+// thrown away at once. The rest act on the RELEASE, because until then a
+// press cannot be told apart from the start of a 3 s hold (power off).
 static void serviceButton() {
-  static bool lastLevel = HIGH;
-  static uint32_t lastChangeMs = 0;
+  static bool lastLevel = HIGH;          // HIGH = released (INPUT_PULLUP)
+  static uint32_t lastChangeMs = 0, pressMs = 0;
+  static bool pressUsed = false, longFired = false;
   bool level = (digitalRead(BUTTON_PIN) == HIGH);
   uint32_t now = millis();
-  if (level == lastLevel) return;
-  if (now - lastChangeMs < BUTTON_DEBOUNCE_MS) return;  // still bouncing
-  lastChangeMs = now;
-  lastLevel = level;
-  if (!level) {
-    // Falling edge = pressed (INPUT_PULLUP, button to GND). Pressing during a
-    // running sequence aborts it, so a spoiled start can be thrown away
-    // without reaching for a keyboard.
-    if (seqState == SEQ_IDLE) startSequence();
-    else abortSequence("button");
+
+  if (level != lastLevel && now - lastChangeMs >= BUTTON_DEBOUNCE_MS) {
+    lastChangeMs = now;
+    lastLevel = level;
+    if (!level) {
+      pressMs = now;
+      pressUsed = longFired = false;
+      if (!buttonSwallow && seqState != SEQ_IDLE) {
+        abortSequence("button");
+        pressUsed = true;
+      }
+    } else {
+      if (buttonSwallow) buttonSwallow = false;
+      else if (!pressUsed && !longFired) shortPress();
+    }
+  }
+
+  if (!lastLevel && !longFired && !buttonSwallow && now - pressMs >= LONG_PRESS_MS) {
+    longFired = true;
+    shutDown();
   }
 }
 
@@ -1012,15 +1461,15 @@ static void handleSerial() {
   if (!Serial.available()) return;
   char c = Serial.read();
   if (c == 'b') {
-    // Same effect as the button, so the whole sequence can be exercised
-    // before any button is wired.
+    // Same as the button, except that it starts straight from the result
+    // screen too - at the bench one keypress per run is what you want.
     if (seqState == SEQ_IDLE) startSequence();
     else abortSequence("serial");
   } else if (c == 'a') {
     abortSequence("serial");
   } else if (c == 'd') {
     // Dump whatever the ring holds right now, no sequence involved.
-    if (seqState == SEQ_IDLE) dumpRecording(true);
+    if (seqState == SEQ_IDLE) dumpRecording(true, 0);
   } else if (c == 'p') {
     if (!imuReady) {
       Serial.println("IMU not ready");
@@ -1033,12 +1482,51 @@ static void handleSerial() {
       Serial.print("  y="); Serial.print(rawToG(rawY), 4);
       Serial.print("  z="); Serial.println(rawToG(rawZ), 4);
     }
+  } else if (c == 'L' || c == 'F' || c == 'X') {
+    // Flash access blocks; never in the middle of a start.
+    if (seqState != SEQ_IDLE) return;
+    uint8_t order[SLOT_COUNT];
+    uint32_t n = storageSlotsByAge(order);
+    if (c == 'L') {
+      Serial.print("FILES,"); Serial.print(n); Serial.print(',');
+      Serial.println(SLOT_COUNT - n);   // free slots
+      for (uint32_t i = 0; i < n; i++) {
+        Serial.print("FILE,"); Serial.print(slotId[order[i]]); Serial.print(',');
+        Serial.println(slotN[order[i]]);
+      }
+      Serial.println("FILES_END");
+    } else if (c == 'F') {
+      for (uint32_t i = 0; i < n; i++) {
+        if (!emitStoredRun(order[i])) { Serial.print("FETCH_FAIL,"); Serial.println(slotId[order[i]]); }
+      }
+      Serial.println("FETCH_END");
+    } else {
+      Serial.print("ERASED,");
+      Serial.println(storageEraseAll());
+      if (!showingResult) showReady();   // refresh the "runs on board" line
+    }
   }
 }
 
+// The countdown digits are the only screen changes driven by the clock alone.
+static void serviceCountdown() {
+  if (seqState != SEQ_WAIT_MARKS) return;
+  int digit = 3 - (int)((micros() - seqStartUs) / 1000000UL);
+  if (digit >= 1 && digit != countdownShown) showCountdown(digit);
+}
+
+// Time the display may take after each sample. A sample period is ~1157 us
+// and the 400 kHz burst read ~0.3 ms of it; 300 us plus one unit's overshoot
+// (~0.2 ms) leaves margin before the next data-ready edge. GAPS in every dump
+// is the check. A screen change during a start takes ~50-100 ms this way.
+static const uint32_t DRAW_BUDGET_US = 300;
+
 void loop() {
-  serviceSampling();
+  bool sampled = serviceSampling();
   serviceSequence();
+  serviceCountdown();
   serviceButton();
   handleSerial();
+  // Right after a sample, never between two: that is the whole point.
+  if (sampled || !imuReady) displayPump(DRAW_BUDGET_US);
 }

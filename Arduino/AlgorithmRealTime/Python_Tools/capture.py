@@ -79,6 +79,12 @@ HEADER_KEYS = {
     "ARMCAP": "arm_capped",
     "RTMS": "board_reaction_ms",
     "ONSET": "board_onset_t_us",
+    # v5: sample intervals over 1.5x nominal since the button (a display draw
+    # that stalled the sampler would show here), and the run's id on the
+    # board's flash.
+    "GAPS": "gaps",
+    "MAXGAP": "max_gap_us",
+    "STORED": "board_run_id",
 }
 
 # Same, but the value is text, not a number.
@@ -113,7 +119,7 @@ def write_csv(path, header, rows):
             f.write(f"# arm_t_us: {header['arm_t_us']}\n")
             f.write(f"# arm_t_s: {(header['arm_t_us'] - t0) / 1e6:.6f}\n")
         for key in ("arm_peak_mg", "arm_capped", "preroll_samples", "truncated",
-                    "dropped", "clockstep_us"):
+                    "dropped", "clockstep_us", "gaps", "max_gap_us", "board_run_id"):
             if key in header:
                 f.write(f"# {key}: {header[key]}\n")
         # And what the board decided, so the capture carries its own answer.
@@ -132,6 +138,9 @@ def write_csv(path, header, rows):
                     "wrong Arduino core, timestamps are ~1 ms granular")
     if header.get("dropped", 0):
         warn.append(f"{header['dropped']} sample(s) recovered by the data-ready watchdog")
+    if header.get("gaps", 0):
+        warn.append(f"{header['gaps']} gap(s) in the sampling, longest "
+                    f"{header.get('max_gap_us', '?')} us")
     if header.get("truncated", 0):
         warn.append("ring wrapped: less pre-set history than intended "
                     f"({header.get('preroll_samples', '?')} samples)")
