@@ -3,12 +3,98 @@
 Last updated: 2026-09-29. Written for an agent starting with no prior context.
 Sections are newest first.
 
+## READ THIS FIRST — 2026-09-29 (evening): a 31 mm wire and B raised to 2 m take ESP-NOW LR past 100 m; the crouched athlete is what still bites
+
+Two more sessions on an athletics track, after the ceramic-antenna walk in the
+section below. The files are renamed by test; the index is in
+`Arduino/EspNowLrTest/measurements/20260929/README.md`. Every table comes from
+`analyse.py`: the live terminal overstates delivery near the edge (it showed
+66 % at 140 m, the real figure is 35 %).
+
+**The change between sessions:** a **31 mm wire (λ/4 at 2.4 GHz) soldered on
+each board's ceramic antenna**, straight up with a small horizontal loop. The
+place changed too, from people moving in between to an open track, so the gain
+below is antenna + environment and cannot be split from this data.
+
+### Walk on the track with the wire (`03_track-walk-31mm-wire`)
+
+A on the ground, B on a stick ~1 m, no phone. One-way A→B:
+
+| dist | LR250 | LR500 | 11b 1M | RSSI | t0 |
+|---:|---:|---:|---:|---:|---|
+| 0 m | 100 % | 100 % | 100 % | −44 | try 1 |
+| 10 m | 100 | 100 | 100 | −65 | try 1 |
+| 30 m | 95.0 | 94.5 | 93.5 | −79 | try 1 |
+| 50 m | 95.6 | 94.0 | 93.5 | −83 | try 1-2 |
+| 70 m | 93.5 | 94.5 | 86.1 | −86 | try 1-2 |
+| 85 m | 96.0 | 97.0 | 94.1 | −88 | try 1 |
+| **110 m** | **83.0** | 76.5 | 50.2 | −90 | LR 1-3, 11b up to 5 |
+| **130 m** | **96.6** | 93.5 | 91.0 | −88 | try 1 |
+| 140 m | 35.0 | 5.0 | 29.1 | −93 | LR250 1 and 4, others lost |
+| 160 m | 0 | 0 | 0 | – | lost |
+
+- **+9 dB at 0 m** (−44 against −53 with ceramic only), and the edge moves
+  from 75-100 m to **130-140 m**. The slope is still free-space, ~21 dB/decade,
+  so the gain is in the fixed deficit, exactly where the section below said to
+  look. At 10 m the link is still ~25 dB under free space.
+- **100 m is met on the t0 criterion** (LR250 at 110 m: every t0 on the first
+  try) and misses the packet one by a little (83 % against ≥ 90 %). **150 m
+  is not met.**
+- **At the edge LR250 is the mode:** 83 % against 50 % for 11b at 110 m. Up to
+  85 m the three are equivalent.
+- 130 m came out better than 110 m: fading from spot to spot. One walk only.
+
+### 110 m with the athlete crouched over A, phone connected (`04_110m-crouched-phone-B2m`)
+
+Phone on B's AP (`ap on`) for the whole file, page open. Seven 30 s stations at
+110 m, B on the ~1 m stick for 1-6, **raised to ~2 m for 7**:
+
+| station | LR250 | LR500 | 11b | RSSI | t0 tries per slot (5 s window = max 20) |
+|---|---:|---:|---:|---:|---|
+| 1-6, crouched over A (some with repeated starts, not split in the log) | **17-64 %** | 11-70 | 1.5-58 | −91…−93 | often 10-20, many slots lost |
+| **7, B at ~2 m** | **92.5** | 94.5 | 88.0 | −91 | 1-2 |
+| then 130 m, B still high | 79.7 | 69.0 | 18.5 | −93 | 1-13, one lost |
+
+- **A body over A costs the few dB that were left.** At 110 m without it,
+  LR250 was at 83 % with first-try t0s. With it, 17-64 %, and t0s needing
+  several seconds or lost within the 5 s slot. In the product the t0 retries
+  for 15 s and the athlete is gone within a second, so it will most likely still
+  arrive, but there is **no margin**. Whether the person was still crouched
+  during station 7 was not recorded.
+- **Height at the finish is the cheapest lever found so far:** B at ~2 m gave
+  92.5 % at 110 m with the phone connected, and 80 % at 130 m. That is the
+  09-22 argument (put height and antenna at the finish, where nothing limits
+  them) confirmed. A tripod does it.
+- **Coexistence at range: closed.** With the phone on B's AP the whole time
+  (~7 requests/s), station 7 did *better* than the no-phone walk at the same
+  distance. The Wi-Fi AP does not hurt the LR link, at 1 m or at 110 m.
+
+### Where this leaves architecture E
+
+ESP-NOW LR on two ESP32-C3 SuperMini, with a 31 mm wire and the finish unit on
+a ~2 m tripod, **covers 100-110 m, including with a phone on the finish unit**.
+The crouched athlete is the one condition still marginal, and the retry scheme
+is what carries it. 150 m would need more: a real external antenna (u.FL,
+2-3 dBi) at the finish first, since B has no size limit.
+
+### Open
+- **Repeat the walk** with the wire and B at ~2 m. Every figure above is one
+  walk; the spread between walks was 8 dB on 09-22.
+- **Crouched athlete with B at 2 m**, with notes for each station: does the t0
+  still go through on the first try or two? Also time the repeated-start case:
+  how long after the athlete rises the t0 lands. That is the number the
+  product cares about, and today's log cannot separate it.
+- **Wire vs no wire at a fixed spot** (5 minutes): what the wire alone is worth.
+  Only matters for the paper.
+- An external u.FL antenna on B, only if 150 m becomes the requirement.
+- ESP-NOW LR + BLE coexistence is still untested, as in the section below.
+
 ## READ THIS FIRST — 2026-09-29 (afternoon): ESP-NOW LR in the field dies between 75 and 100 m, and the reason is a fixed ~30 dB deficit, not the distance
 
 One walk on the track, 0-125 m every 25 m, A on the ground behind the block, B
 on a stick at about 1 m, **people moving in between**. Only run 1 of the plan
 was done: no repeats, no `ap on` at range, no crouched athlete. Files:
-`measurements/20260929/125103_A.csv` + `125113_B.csv`. Table from the new
+`measurements/20260929/02_walk-ceramic-antenna_{A,B}.csv`. Table from the new
 `Arduino/EspNowLrTest/analyse.py`, which counts delivery against what A
 actually sent. The live terminal counted only between the first and last packet
 seen, which overstates delivery at range, so trust the script.
@@ -47,7 +133,7 @@ directions to within 1-2 dB.
 **Needed:** ~10 dB for 100 m, ~15 dB for 150 m. The 30 dB deficit is where to
 find it.
 
-### Open, in order
+### Open, in order (superseded the same day: the wire and the 2 m finish unit in the section above answer 2 and part of 1)
 1. **Split the deficit, 15 min, at a fixed 25 m:** A on the ground vs raised
    1 m, and B in two orientations, 30 s each. Terrain vs antenna. No new code.
 2. **External antenna, B first:** B sits at the finish with no size limit, and
@@ -73,7 +159,7 @@ repeated every 250 ms until acked. Each laptop powers its board over USB and log
 every line to `measurements/<date>/HHMMSS_<role>.csv`. Mode is deterministic from
 `seq` (`(seq // 100) % 3`), so the two files join on `seq` without a shared clock.
 
-**Bench, 1 m, 29/09** (`measurements/20260929/121838_A.csv`; the matching B file
+**Bench, 1 m, 29/09** (`measurements/20260929/01_bench-1m_A.csv`; the matching B file
 is on the Windows laptop):
 - **B receives all three modes at once** with the STA protocol set to b/g/n+LR.
   This was the one assumption the firmware made unverified.

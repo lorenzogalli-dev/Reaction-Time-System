@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-station table from one EspNowLrTest walk: the A file and the B file.
 
-    python3 analyse.py measurements/20260929/125103_A.csv measurements/20260929/125113_B.csv
+    python3 analyse.py measurements/20260929/02_walk-ceramic-antenna_A.csv measurements/20260929/02_walk-ceramic-antenna_B.csv
 
 Stations come from the M lines typed on laptop B. The two files share no
 clock; they are joined through the sequence number, which is deterministic:
