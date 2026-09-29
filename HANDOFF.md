@@ -1,7 +1,59 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-24. Written for an agent starting with no prior context.
+Last updated: 2026-09-29. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-09-29: ESP-NOW long range between two ESP32-C3, built and bench-verified; field test pending
+
+New rig: `Arduino/EspNowLrTest/` (firmware, `flash.sh`, `logger.py`, README with
+the full field procedure). It tests architecture E from the 09-22 section. Nothing
+else in the repo was touched.
+
+**How it works.** Same firmware on both boards; the role (A = start, B = finish)
+is stored in NVS and set by `logger.py A|B`. A broadcasts a packet every 50 ms and
+rotates the PHY every 5 s: LR 250k → LR 500k → 802.11b 1M, so the three are
+compared at the same spot in the same seconds (the 09-22 run-to-run spread was
+8 dB). B echoes every packet in the mode it came in. One fake t0 per slot,
+repeated every 250 ms until acked. Each laptop powers its board over USB and logs
+every line to `measurements/<date>/HHMMSS_<role>.csv`. Mode is deterministic from
+`seq` (`(seq // 100) % 3`), so the two files join on `seq` without a shared clock.
+
+**Bench, 1 m, 29/09** (`measurements/20260929/121838_A.csv`; the matching B file
+is on the Windows laptop):
+- **B receives all three modes at once** with the STA protocol set to b/g/n+LR.
+  This was the one assumption the firmware made unverified.
+- `esp_now_set_peer_rate_config` on the broadcast peer switches mode at runtime
+  without errors (core 3.3.12).
+- Round trip A→B→A lost 1.2 %: isolated single packets, random position in
+  the slot, not at mode switches, zero queue drops. One-way A→B read 98.5–100 %
+  on B. Looks like indoor channel-1 traffic.
+- Round-trip delay, median / p95: LR250 7.7 / 9.9 ms, LR500 4.7 / 6.7, 11b
+  2.8 / 4.6. Latency is free for the t0, see 09-22.
+- **Clock offset A↔B: IQR 88 µs, drift 1.4 ppm.** The A→B hop is not a sync problem.
+- **Coexistence, the top open risk from 09-22, passes on the bench.** B running
+  a b/g/n AP for a phone (page polling at 10 Hz) on the same channel as the LR
+  link: one-way stayed at 100 %, the phone got every request. Still to be
+  re-checked at range (field run 4).
+
+**Tooling gotchas.**
+- The ESP32 core was not installed on the Mac any more; it is now (3.3.12, about
+  5 GB unpacked).
+- Arduino's `ctags` is x86 and this Mac has no Rosetta. `flash.sh` passes
+  `tools.ctags.pattern=/usr/bin/true` at compile time only; `upload` rejects
+  that flag.
+- On the Windows laptop, run `python logger.py B` inside the conda env, not
+  `python3` or `py`: those are other interpreters.
+
+### Open
+- **The field test itself:** stations 0-200 m every 25 m, three plain runs, one
+  with `ap on` and the phone, one with a person crouched over A. The procedure
+  is in the README.
+- **ESP-NOW LR + BLE coexistence on B is untested.** It is *not* implied by the
+  Wi-Fi result: Wi-Fi AP and ESP-NOW share one MAC on one channel, while BLE
+  time-shares the radio through the coexistence arbiter, and B is deaf to LR
+  during BLE connection events. Test it before choosing BLE for the phone link;
+  it needs a bigger app partition, since the sketch is at 77 %.
+- The analysis script: to be written against the real field CSVs.
 
 ## READ THIS FIRST — 2026-09-24 (later): one MCU at the start instead of two? Discussed, not decided, nothing changed
 
