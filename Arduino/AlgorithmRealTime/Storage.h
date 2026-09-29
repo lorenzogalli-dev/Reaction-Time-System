@@ -28,7 +28,7 @@
 #include "nrfx_qspi.h"
 
 static const uint32_t CAPTURE_MAGIC   = 0x50535431;   // "PST1"
-static const uint16_t CAPTURE_VERSION = 1;
+static const uint16_t CAPTURE_VERSION = 2;   // 2: + wallclock
 static const uint32_t SLOT_COUNT      = 25;
 static const uint32_t SLOT_BYTES      = 80UL * 1024;
 static const uint32_t COUNTER_ADDR    = SLOT_COUNT * SLOT_BYTES;   // one 4 KB sector
@@ -49,6 +49,7 @@ struct CaptureMeta {
   float    armMg, rtMs;
   uint32_t onsetUs;
   char     verdict[24];
+  uint32_t wallclock;        // unix time of the start, 0 = board had no time
 };
 static_assert(sizeof(CaptureMeta) % 4 == 0, "QSPI transfers are whole words");
 
@@ -68,26 +69,76 @@ static uint32_t slotN[SLOT_COUNT];
 // EasyDMA: RAM only, word aligned, lengths in whole words.
 static uint32_t qspiBuf[1000];        // 4000 bytes = 400 samples
 
-static bool qspiWait() {
-  for (uint32_t i = 0; i < 2000000; i++) {
-    if (nrfx_qspi_mem_busy_check() == NRFX_SUCCESS) return true;
-  }
+// Why the last flash operation failed, for the STORE,failed line: which step,
+// nrfx's return code, at which address. A save that fails without saying why
+// is not debuggable from the field.
+static const char* flashErrStep = "";
+static int flashErrCode = 0;
+static uint32_t flashErrAddr = 0;
+
+static uint32_t FLASH_WAIT_LIMIT_MS = 1000;
+
+static bool flashFail(const char* step, int code, uint32_t addr) {
+  flashErrStep = step; flashErrCode = code; flashErrAddr = addr;
   return false;
 }
 
+// Polls the flash's WIP bit. Bounded by time, not iterations: a 4 KB sector
+// erase is ~50 ms typical, 300 ms worst case on the P25Q16H.
+static uint32_t flashMaxWaitMs = 0;    // longest wait since last reset of it
+
+// Reads the flash's status register (RDSR, 0x05). Returns nrfx's code.
+static int flashReadStatus(uint8_t* sr) {
+  nrf_qspi_cinstr_conf_t ci;
+  memset(&ci, 0, sizeof(ci));
+  ci.opcode = 0x05;
+  ci.length = NRF_QSPI_CINSTR_LEN_2B;
+  ci.io2_level = true;
+  ci.io3_level = true;
+  uint8_t rx[1] = {0xFF};
+  int e = (int)nrfx_qspi_cinstr_xfer(&ci, NULL, rx);
+  *sr = rx[0];
+  return e;
+}
+
+// Waits for the flash's WIP bit to clear, reading the status register itself.
+//
+// NOT nrfx_qspi_mem_busy_check(). On this core (SDK 15.0 nrfx) it was caught
+// both ways on 2026-09-29: right after an erase it answered "free" while RDSR
+// read 0x03 (WEL|WIP, erasing), and in the failing case it answered BUSY (17)
+// for 10 s on a flash long done - which is what made the first save after
+// every boot fail with "NOT saved". Raw RDSR read the truth every time.
+static bool qspiWait(const char* step, uint32_t addr) {
+  uint32_t t0 = millis();
+  int e = 0;
+  uint8_t sr = 0xFF;
+  while (millis() - t0 < FLASH_WAIT_LIMIT_MS) {
+    e = flashReadStatus(&sr);
+    if (e == (int)NRFX_SUCCESS && (sr & 0x01) == 0) {
+      uint32_t w = millis() - t0;
+      if (w > flashMaxWaitMs) flashMaxWaitMs = w;
+      return true;
+    }
+  }
+  return flashFail(step, e != (int)NRFX_SUCCESS ? e : 1000 + sr, addr);
+}
+
 static bool flashRead(uint32_t addr, void* buf, uint32_t len) {
-  return nrfx_qspi_read(buf, (len + 3) & ~3UL, addr) == NRFX_SUCCESS;
+  nrfx_err_t e = nrfx_qspi_read(buf, (len + 3) & ~3UL, addr);
+  return e == NRFX_SUCCESS || flashFail("read", (int)e, addr);
 }
 
 static bool flashWrite(uint32_t addr, const void* buf, uint32_t len) {
-  if (nrfx_qspi_write(buf, (len + 3) & ~3UL, addr) != NRFX_SUCCESS) return false;
-  return qspiWait();
+  nrfx_err_t e = nrfx_qspi_write(buf, (len + 3) & ~3UL, addr);
+  if (e != NRFX_SUCCESS) return flashFail("write", (int)e, addr);
+  return qspiWait("write-wait", addr);
 }
 
 static bool flashErase(uint32_t addr, uint32_t len) {
   for (uint32_t a = addr; a < addr + len; a += SECTOR_BYTES) {
-    if (nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_4KB, a) != NRFX_SUCCESS) return false;
-    if (!qspiWait()) return false;
+    nrfx_err_t e = nrfx_qspi_erase(NRF_QSPI_ERASE_LEN_4KB, a);
+    if (e != NRFX_SUCCESS) return flashFail("erase", (int)e, a);
+    if (!qspiWait("erase-wait", a)) return false;
   }
   return true;
 }
@@ -98,11 +149,14 @@ static void storageRescan() {
     CaptureMeta m;
     slotId[s] = slotN[s] = 0;
     if (!flashRead(s * SLOT_BYTES, &m, sizeof(m))) continue;
-    if (m.magic != CAPTURE_MAGIC || m.metaSize != sizeof(CaptureMeta) ||
-        m.n > SLOT_MAX_SAMPLES || m.id == 0) continue;
+    if (m.magic != CAPTURE_MAGIC || m.id == 0) continue;
+    // A header from an older format still holds an id that was handed out:
+    // it keeps the counter above it, even though the run itself is not
+    // readable any more and its slot counts as free.
+    if (m.id > maxId) maxId = m.id;
+    if (m.metaSize != sizeof(CaptureMeta) || m.n > SLOT_MAX_SAMPLES) continue;
     slotId[s] = m.id;
     slotN[s] = m.n;
-    if (m.id > maxId) maxId = m.id;
   }
   // The counter sector outlives an erase-all, so a pulled "r00007" never gets
   // a different start's data under the same name later.

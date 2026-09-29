@@ -7,9 +7,13 @@ The board replays each stored run through its normal dump ('F'), so nothing
 here is a second parser of a second format: it is capture.py's header table
 and capture.py's write_csv, fed from a different command.
 
-Files are named by the board's run id (prostart_r00012.csv), which never
-repeats - so pulling twice just rewrites the same files, and nothing is lost
-by pulling before erasing.
+Files are named <date>_<time>_r<id>_<result>.csv, e.g.
+20260929_193512_r00012_0.160s.csv or ..._FS-0.045s.csv. The date is when the
+start happened, and the board only knows it if a PC gave it the time (capture.py
+and this script do, on connect) since its last power-on. A run recorded on a
+power bank after a power cycle is named nodate_r00012_0.160s.csv rather than
+given a wrong date. The run id never repeats, so pulling twice just rewrites
+the same files, and nothing is lost by pulling before erasing.
 
 Usage:
     python3 Arduino/AlgorithmRealTime/Python_Tools/pull_captures.py            # list + download
@@ -23,7 +27,9 @@ import sys
 import time
 from pathlib import Path
 
-from capture import HEADER_KEYS, TEXT_KEYS, autodetect_port, write_csv
+import datetime
+
+from capture import HEADER_KEYS, TEXT_KEYS, autodetect_port, result_tag, send_time, write_csv
 
 DEFAULT_OUTDIR = Path(__file__).resolve().parents[3] / "Data" / "board"
 
@@ -78,7 +84,10 @@ def fetch_all(ser, outdir):
             if len(rows) != expected or not rows:
                 failed.append(f"{rid} ({len(rows)}/{expected} rows)")
                 continue
-            path = os.path.join(outdir, f"prostart_r{rid:05d}.csv")
+            wc = header.get("board_wallclock_unix")
+            when = (datetime.datetime.fromtimestamp(wc).strftime("%Y%m%d_%H%M%S")
+                    if wc else "nodate")
+            path = os.path.join(outdir, f"{when}_r{rid:05d}_{result_tag(header)}.csv")
             warn = write_csv(path, header, rows)
             verdict = header.get("board_verdict", "?")
             rt = header.get("board_reaction_ms")
@@ -126,8 +135,19 @@ def main():
         sys.exit(1)
     ser = serial.Serial(port, args.baud, timeout=0.2)
     time.sleep(1.0)
+    send_time(ser)
 
-    runs, free = list_runs(ser)
+    # A board just switched on spends up to ~3 s booting before it answers.
+    for attempt in range(3):
+        try:
+            runs, free = list_runs(ser)
+            break
+        except TimeoutError:
+            if attempt == 2:
+                print("The board does not answer - is it switched on?", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(1.0)
+            send_time(ser)
     print(f"{len(runs)} run(s) on the board, {free} free slot(s)")
     if args.list or not runs:
         return

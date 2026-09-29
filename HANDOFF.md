@@ -100,6 +100,26 @@ measurement-relevant: button->marks is a fixed 3 s countdown (was 2-3 s
 random); a start begins on button RELEASE (to tell it from the 3 s hold);
 the dump now comes after the ~1 s flash write.
 
+### Fixed after the user's first run by hand (same night)
+- **"NOT saved" on the first save after every boot.** `nrfx_qspi_mem_busy_check()`
+  (SDK 15.0 nrfx in this core) is unreliable: right after an erase it said
+  "free" while RDSR read 0x03 (erasing), and in the failing case it said BUSY
+  (17) for 10 s on a flash long done. `qspiWait()` now polls RDSR itself.
+  Checked: first save after boot 484-500 ms; 840 sector erases all ≤ 11 ms.
+  `STORE,failed,<step>,<code>,<addr>,<ms>` now says why if it ever fails, and
+  `E` over serial times erases on the empty slots (never touches a run).
+- **Wake is dark.** A press on a board that is off shows nothing; the display
+  is initialised only after the 3 s hold (backlight pin driven low first).
+- **File names carry date, time and result**:
+  `20260929_193726_r00001_nomove.csv`, `..._0.160s.csv`, `..._FS-0.045s.csv`
+  (pull), `accel_<pc time>_<result>.csv` (capture.py). The board has no clock
+  that survives power-off: the PC sends `T<unix s>` on connect (capture.py,
+  pull_captures.py) and runs store `WALLCLOCK`; a run recorded after a power
+  cycle on a power bank is `nodate_...` rather than wrongly dated.
+- Stored format is now v2 (+ wallclock). v1 runs on the flash read as empty
+  but still hold their ids, so ids keep increasing (a first cut restarted at
+  1; caught on the bench).
+
 ### Open
 - Standalone session on a power bank, then `pull_captures.py`; power off/on.
 - Real block starts: confirm `GAPS,1` with an athlete moving.

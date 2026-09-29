@@ -183,6 +183,7 @@ static void tftBegin() {
 
 static void tftSleep() {
   tftBacklight(false);
+  if (tftSpi == nullptr) return;   // never initialised (short press while off)
   tftCommand(0x28);                // DISPOFF
   tftCommand(0x10);                // SLPIN
 }

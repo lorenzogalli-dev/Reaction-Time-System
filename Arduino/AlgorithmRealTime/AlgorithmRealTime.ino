@@ -100,6 +100,9 @@ static StartDetector detector;
 // 'F' replays every stored run as a normal DUMP_START..DUMP_END block (with a
 //     STORED,<id> line), then FETCH_END. pull_captures.py drives this.
 // 'X' erases every stored run: ERASED,<n>.
+// 'T<unix seconds>' sets the time runs are stamped with (WALLCLOCK), until
+//     the next power-off. capture.py and pull_captures.py send it.
+// 'E' diagnostic: erases the EMPTY slots and reports erase timings.
 //
 // One second after "go" the board dumps the window by itself:
 //   DUMP_START,<n>
@@ -113,6 +116,7 @@ static StartDetector detector;
 //   GAPS,<n>              sample intervals over 1.5x nominal since the button
 //   MAXGAP,<us>           the longest of them
 //   STORED,<id>           this run's id on the flash (absent: not stored)
+//   WALLCLOCK,<unix s>    when the start happened (absent: board had no time)
 //   <n CSV rows, t_us,x_g,y_g,z_g, full ODR, no decimation>
 //   DUMP_END
 //   ... then idle decimated streaming resumes automatically.
@@ -389,6 +393,11 @@ static uint32_t gapCount = 0, maxGapUs = 0, prevSampleT = 0;
 
 // Button-press instant; the countdown digits are timed from it.
 static uint32_t seqStartUs = 0;
+// Unix time at millis() == 0, set by the PC with 'T' (capture.py and
+// pull_captures.py send it on connect). 0 = unknown. RAM only: the board has
+// no clock that survives power-off, so a session started on a power bank
+// records its runs without a date rather than with a wrong one.
+static uint32_t epochAtBoot = 0;
 // Id the last finished run got on the flash, 0 if it was not stored.
 static uint32_t lastStoredId = 0;
 // READY or RESULT, when no sequence is running.
@@ -462,13 +471,15 @@ void setup() {
   NRF_POWER->GPREGRET2 = 0;
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  tftBegin();
+  // Backlight driven low before anything else: after the reset its pin floats,
+  // and through the module's Q1 a floating pin can light the panel.
+  pinMode(TFT_BL_PIN, OUTPUT);
+  digitalWrite(TFT_BL_PIN, LOW);
   // A press only wakes the chip; staying on takes the full 3 s hold, so a
-  // knock in the bag does not leave it running.
-  if (wokeFromOff) {
-    if (!holdToWake()) enterSystemOff();
-    screenClearAll();   // the progress bar is not a tracked text box
-  }
+  // knock in the bag does not leave it running. Nothing is shown until then:
+  // a short press on a board that is off should look like nothing happened.
+  if (wokeFromOff && !holdToWake()) enterSystemOff();
+  tftBegin();
 
   Serial.begin(921600);
   // Native USB CDC: Serial only becomes true once a host opens the port.
@@ -655,6 +666,8 @@ static void buildLiveMeta(bool wholeRing, CaptureMeta* m, uint32_t* fromOut) {
     m->rtMs = lastReactionMs;
     m->onsetUs = lastOnsetUs;
   }
+  // To the second, taken at dump/store time (~1-2 s after "go").
+  m->wallclock = epochAtBoot ? epochAtBoot + millis() / 1000 : 0;
   *fromOut = from;
 }
 
@@ -690,6 +703,10 @@ static void emitDumpHeader(const CaptureMeta& m) {
   if (m.id != 0) {
     Serial.print("STORED,");
     Serial.println(m.id);
+  }
+  if (m.wallclock != 0) {
+    Serial.print("WALLCLOCK,");
+    Serial.println(m.wallclock);
   }
   // ARM is a marker in exactly the sense ON/SET/GO are: an instant the board
   // decided, on the board's own clock. It is written down rather than left to
@@ -777,7 +794,9 @@ static uint32_t storeRun() {
   // Read the header back: a write that "succeeded" into a flash that ignored
   // it (write-protected, wrong mode) must not be reported as saved.
   CaptureMeta check;
-  if (!flashRead(base, &check, sizeof(check)) || check.magic != CAPTURE_MAGIC || check.id != m.id) {
+  if (!flashRead(base, &check, sizeof(check))) return 0;
+  if (check.magic != CAPTURE_MAGIC || check.id != m.id) {
+    flashFail("verify", (int)check.magic, base);
     return 0;
   }
   slotId[slot] = m.id;
@@ -1224,7 +1243,7 @@ static void serviceSequence() {
       Serial.println("SEQ,go");
       showGo();
       break;
-    case SEQ_TAIL:
+    case SEQ_TAIL: {
       seqState = SEQ_IDLE;
       evaluateAndReportResults();
       // Result on screen first, synchronously: the flash write below blocks
@@ -1232,12 +1251,18 @@ static void serviceSequence() {
       showResult();
       showResultFooter("saving...");
       displayPump(0xFFFFFFFFUL);
+      uint32_t storeT0 = millis();
       lastStoredId = storeRun();
+      uint32_t storeMs = millis() - storeT0;
       if (lastStoredId) {
         Serial.print("STORE,");
-        Serial.println(lastStoredId);
+        Serial.print(lastStoredId);
+        Serial.print(','); Serial.print(storeMs); Serial.println("ms");
       } else {
-        Serial.println("STORE,failed");
+        Serial.print("STORE,failed,"); Serial.print(flashErrStep);
+        Serial.print(','); Serial.print(flashErrCode);
+        Serial.print(",0x"); Serial.print(flashErrAddr, HEX);
+        Serial.print(','); Serial.print(storeMs); Serial.println("ms");
       }
       {
         char foot[27];
@@ -1247,6 +1272,7 @@ static void serviceSequence() {
       }
       dumpRecording(false, lastStoredId);
       break;
+    }
     default:
       break;
   }
@@ -1343,26 +1369,14 @@ static void showResultFooter(const char* text) {
 // setup() sees RESETREAS.OFF and asks for the 3 s hold before going on.
 // ===========================================================================
 
-// Called in setup() after a wake. The button is being held; show a bar that
-// fills over LONG_PRESS_MS (counted from boot, so the press that woke the chip
-// counts). Released early -> false, and the caller goes straight back off.
+// Called in setup() after a wake, display still off. True once the button
+// has been held LONG_PRESS_MS, counted from boot so the press that woke the
+// chip counts. Released early -> false, and the caller goes straight back off.
 static bool holdToWake() {
-  screenClearAll();
-  queueTextCentered(30, 3, C_ORANGE, "ProStart");
-  queueTextCentered(62, 1, C_GREY, "keep holding...");
-  queueFill(19, 84, 122, 12, C_GREY);
-  queueFill(20, 85, 120, 10, C_BLACK);
-  displayPump(0xFFFFFFFFUL);
-  int16_t drawn = 0;
   while (millis() < LONG_PRESS_MS) {
     if (digitalRead(BUTTON_PIN) == HIGH) {
       delay(BUTTON_DEBOUNCE_MS);
       if (digitalRead(BUTTON_PIN) == HIGH) return false;
-    }
-    int16_t want = (int16_t)(120UL * millis() / LONG_PRESS_MS);
-    if (want > drawn) {
-      tftFillRect(20 + drawn, 85, want - drawn, 10, C_GREEN);
-      drawn = want;
     }
     delay(10);
   }
@@ -1482,6 +1496,41 @@ static void handleSerial() {
       Serial.print("  y="); Serial.print(rawToG(rawY), 4);
       Serial.print("  z="); Serial.println(rawToG(rawZ), 4);
     }
+  } else if (c == 'T') {
+    // T<unix seconds>\n from the PC. Sanity-bounded: 2020..2100.
+    Serial.setTimeout(100);
+    long v = Serial.parseInt();
+    if (v > 1577836800L) {
+      epochAtBoot = (uint32_t)v - millis() / 1000;
+      Serial.print("TIME,");
+      Serial.println((uint32_t)v);
+    } else {
+      Serial.println("TIME,rejected");
+    }
+  } else if (c == 'E') {
+    // Diagnostic: erase every EMPTY slot sector by sector and report how long
+    // each erase took. Never touches a stored run.
+    if (seqState != SEQ_IDLE || !storageReady) return;
+    FLASH_WAIT_LIMIT_MS = 10000;
+    uint32_t worst = 0, total = 0, n = 0, slow = 0;
+    for (uint32_t sl = 0; sl < SLOT_COUNT; sl++) {
+      if (slotId[sl]) continue;
+      for (uint32_t a = sl * SLOT_BYTES; a < (sl + 1) * SLOT_BYTES; a += SECTOR_BYTES) {
+        flashMaxWaitMs = 0;
+        uint32_t t0 = millis();
+        bool ok = flashErase(a, SECTOR_BYTES);
+        uint32_t ms = millis() - t0;
+        if (!ok) { Serial.print("ERASETEST,fail,0x"); Serial.println(a, HEX); }
+        if (ms > worst) worst = ms;
+        if (ms > 100) { slow++; Serial.print("ERASETEST,slow,0x"); Serial.print(a, HEX); Serial.print(','); Serial.println(ms); }
+        total += ms; n++;
+      }
+    }
+    FLASH_WAIT_LIMIT_MS = 1000;
+    Serial.print("ERASETEST,sectors,"); Serial.print(n);
+    Serial.print(",mean_ms,"); Serial.print(n ? total / n : 0);
+    Serial.print(",worst_ms,"); Serial.print(worst);
+    Serial.print(",over100ms,"); Serial.println(slow);
   } else if (c == 'L' || c == 'F' || c == 'X') {
     // Flash access blocks; never in the middle of a start.
     if (seqState != SEQ_IDLE) return;

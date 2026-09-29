@@ -85,10 +85,31 @@ HEADER_KEYS = {
     "GAPS": "gaps",
     "MAXGAP": "max_gap_us",
     "STORED": "board_run_id",
+    "WALLCLOCK": "board_wallclock_unix",
 }
 
 # Same, but the value is text, not a number.
 TEXT_KEYS = {"VERDICT": "board_verdict"}
+
+
+def result_tag(header):
+    """The board's answer, short enough for a file name: '0.160s' for a valid
+    start, 'FS-0.045s' for a false start, 'nomove', 'error'."""
+    verdict = header.get("board_verdict", "")
+    rt = header.get("board_reaction_ms")
+    if verdict == "valid start" and isinstance(rt, (int, float)):
+        return f"{rt / 1000:.3f}s"
+    if verdict == "FALSE START" and isinstance(rt, (int, float)):
+        return f"FS{rt / 1000:+.3f}s"
+    if verdict == "no movement":
+        return "nomove"
+    return "error" if verdict else "noverdict"
+
+
+def send_time(ser):
+    """Give the board the PC's clock, so the runs it stores carry a date. It
+    keeps it only until the next power-off."""
+    ser.write(f"T{int(time.time())}\n".encode())
 
 
 def write_csv(path, header, rows):
@@ -119,7 +140,8 @@ def write_csv(path, header, rows):
             f.write(f"# arm_t_us: {header['arm_t_us']}\n")
             f.write(f"# arm_t_s: {(header['arm_t_us'] - t0) / 1e6:.6f}\n")
         for key in ("arm_peak_mg", "arm_capped", "preroll_samples", "truncated",
-                    "dropped", "clockstep_us", "gaps", "max_gap_us", "board_run_id"):
+                    "dropped", "clockstep_us", "gaps", "max_gap_us", "board_run_id",
+                    "board_wallclock_unix"):
             if key in header:
                 f.write(f"# {key}: {header[key]}\n")
         # And what the board decided, so the capture carries its own answer.
@@ -173,6 +195,7 @@ def main():
     ser = serial.Serial(port, args.baud, timeout=0.2)
     time.sleep(2.0)  # let the board finish its boot/reset before reading
     ser.reset_input_buffer()
+    send_time(ser)
     # Only one process can hold the serial port, and this one has to hold it
     # for the whole session to catch a dump the moment it arrives. So typed
     # keys are relayed straight through to the board - a passthrough, not a
@@ -221,7 +244,7 @@ def main():
                     print("!! dump contained no rows")
                     continue
                 stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                path = os.path.join(args.outdir, f"accel_{stamp}.csv")
+                path = os.path.join(args.outdir, f"accel_{stamp}_{result_tag(header)}.csv")
                 warn = write_csv(path, header, rows)
                 print(f"\nSaved {len(rows)} rows -> {path}")
                 for w in warn:
