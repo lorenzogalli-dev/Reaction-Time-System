@@ -55,12 +55,13 @@ static StartDetector detector;
 // on the QSPI flash (Storage.h) to be pulled later. Serial output is unchanged
 // and still complete - with no terminal open the core simply drops it.
 //
-//   off  --hold 3 s-->  READY  --press-->  3, 2, 1  -->  "On your marks" (beep)
+//   off  --hold 1.5 s (beep)-->  READY  --press-->  3, 2, 1  -->  "On your marks" (beep)
 //        --20-25 s-->  "Set" (beep)  --armed + 0.7-1.5 s-->  "Go" (beep)
 //        --1 s-->  RESULT (reaction time, or FALSE START with its time)
-//   RESULT --press--> READY.   Press during a start: abort, back to READY.
-//   Hold 3 s anywhere: "Nice session today!", then System OFF (~µA). A press
-//   wakes the chip, and it only stays on if the button is held the full 3 s.
+//   RESULT --press--> READY.   During a start, two presses within 2 s abort
+//   it (the first only shows "press again to cancel"), back to READY.
+//   Hold 1.5 s anywhere: beep, "Nice session today!", then System OFF (~µA).
+//   A press wakes the chip, and it only stays on if held the full 1.5 s.
 //   Plugging in / uploading / reset boots straight to READY.
 //
 // Sequence delays other than the countdown stay randomised so the rhythm
@@ -80,8 +81,8 @@ static StartDetector detector;
 // Idle (default from boot, only while no sequence is running): the board
 // streams decimated CSV rows continuously, no command needed - live preview.
 //   t_us,x_g,y_g,z_g
-// The button (BUTTON_PIN to GND) starts a sequence; pressing it again during
-// one aborts. Nothing is printed during a sequence except its progress lines
+// The button (BUTTON_PIN to GND) starts a sequence; two presses within
+// ABORT_CONFIRM_MS during one abort it. Nothing is printed during a sequence except its progress lines
 // SEQ,armed / SEQ,marks / SEQ,set / SEQ,gate,<ms>,<mg>,<how> / SEQ,go /
 // SEQ,abort,<why>.
 //   SEQ,armed  the button was pressed; a sequence is starting.
@@ -300,8 +301,12 @@ static const uint32_t BEEP_MS = 100;
 // Button -> "on your marks" is a fixed, visible 3-2-1 countdown since v5 (it
 // was a random 2-3 s). Nobody reacts to "on your marks", so nothing is lost.
 static const uint32_t COUNTDOWN_MS = 3000;
-// Held this long: power off (or, just woken, stay on).
-static const uint32_t LONG_PRESS_MS = 3000;
+// Held this long: power off (or, just woken, stay on). Both end with a beep.
+static const uint32_t LONG_PRESS_MS = 1500;
+// A start is aborted by a second press within this long of the first: one
+// stray press on a start that is running must not throw it away.
+static const uint32_t ABORT_CONFIRM_MS = 2000;
+static const uint32_t POWER_BEEP_MS = 150;
 // Left in the retained GPREGRET2 register when going off (see setup()).
 static const uint8_t SYSTEM_OFF_FLAG = 0xA5;
 // Back to 20-25 s on 2026-09-11, the original v4 value (it had been shortened
@@ -475,10 +480,18 @@ void setup() {
   // and through the module's Q1 a floating pin can light the panel.
   pinMode(TFT_BL_PIN, OUTPUT);
   digitalWrite(TFT_BL_PIN, LOW);
-  // A press only wakes the chip; staying on takes the full 3 s hold, so a
+  // A press only wakes the chip; staying on takes the full 1.5 s hold, so a
   // knock in the bag does not leave it running. Nothing is shown until then:
   // a short press on a board that is off should look like nothing happened.
-  if (wokeFromOff && !holdToWake()) enterSystemOff();
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUZZER_PIN_B, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN_B, LOW);
+  buzzerInit();
+  if (wokeFromOff) {
+    if (!holdToWake()) enterSystemOff();
+    powerBeep();
+  }
   tftBegin();
 
   Serial.begin(921600);
@@ -493,12 +506,6 @@ void setup() {
     unsigned long waitStart = millis();
     while (!Serial && millis() - waitStart < 3000) delay(10);
   }
-
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(BUZZER_PIN_B, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(BUZZER_PIN_B, LOW);
-  buzzerInit();
 
 #ifdef PIN_LSM6DS3TR_C_POWER
   // XIAO Sense IMU power-enable pin: if left low, begin() fails even with
@@ -587,8 +594,8 @@ void setup() {
   Serial.print(BEEP_FREQ_HZ);
   Serial.println(" Hz");
   Serial.println("  button -> 3-2-1 -> MARKS -> 20-25s -> SET -> armed+0.7-1.5s -> GO -> 1s -> dump");
-  Serial.println("  'a' or a second press aborts. 'd' dumps the ring as-is.");
-  Serial.println("  Hold the button 3 s to power off. 'L' list / 'F' fetch / 'X' erase stored runs.");
+  Serial.println("  'a' or two presses within 2 s abort. 'd' dumps the ring as-is.");
+  Serial.println("  Hold the button 1.5 s to power off. 'L' list / 'F' fetch / 'X' erase stored runs.");
 
   // Still holding the press that switched it on: its release is not a command.
   buttonSwallow = (digitalRead(BUTTON_PIN) == LOW);
@@ -968,6 +975,10 @@ static void buzzerDriveOn() {
 }
 
 static void buzzerDriveOff() {
+  // A disabled PWM never raises STOPPED, so waiting for it would hang the
+  // board for good - which is what an abort between two beeps did (every
+  // abort, and power off during a start, which aborts first).
+  if (BUZZER_PWM->ENABLE == 0) return;
   // Clear the short first, or the restart it schedules can outlive the stop.
   BUZZER_PWM->SHORTS = 0;
   BUZZER_PWM->EVENTS_STOPPED = 0;
@@ -1009,6 +1020,13 @@ static void beep(uint32_t* markerOut, bool* capturedOut) {
   buzzerOffUs = t + BEEP_MS * 1000UL;
   *markerOut = t;
   *capturedOut = true;
+}
+
+// Power on/off confirmation. Blocking and unstamped: never during a start.
+static void powerBeep() {
+  buzzerDriveOn();
+  delay(POWER_BEEP_MS);
+  buzzerDriveOff();
 }
 
 // Nothing in the sequence may call delay(). Sampling is paced by the DRDY
@@ -1366,7 +1384,7 @@ static void showResultFooter(const char* text) {
 // ===========================================================================
 // Power: "off" is the nRF52840's System OFF - everything stopped, RAM lost,
 // a few µA. The button's pin is armed to wake it, and waking is a reset:
-// setup() sees RESETREAS.OFF and asks for the 3 s hold before going on.
+// setup() sees RESETREAS.OFF and asks for the 1.5 s hold before going on.
 // ===========================================================================
 
 // Called in setup() after a wake, display still off. True once the button
@@ -1417,6 +1435,7 @@ static void enterSystemOff() {
 static void shutDown() {
   if (seqState != SEQ_IDLE) abortSequence("power off");
   Serial.println("POWER,off");
+  powerBeep();
   screenBegin();
   queueTextCentered(40, 2, C_WHITE, "Nice session");
   queueTextCentered(66, 2, C_ORANGE, "today!");
@@ -1439,13 +1458,14 @@ static void shortPress() {
 // so a press is seen within ~1.2 ms, and a bouncing mechanical contact on an
 // interrupt is a well-known way to flood a system.
 //
-// One button, three meanings. Abort acts on the PRESS - a spoiled start is
-// thrown away at once. The rest act on the RELEASE, because until then a
-// press cannot be told apart from the start of a 3 s hold (power off).
+// One button, three meanings. Abort acts on the PRESS - the second of two
+// within ABORT_CONFIRM_MS; the first only puts a hint on the screen. The rest act on the RELEASE, because until then a
+// press cannot be told apart from the start of a 1.5 s hold (power off).
 static void serviceButton() {
   static bool lastLevel = HIGH;          // HIGH = released (INPUT_PULLUP)
   static uint32_t lastChangeMs = 0, pressMs = 0;
   static bool pressUsed = false, longFired = false;
+  static uint32_t abortArmedMs = 0;       // 0 = no first press pending
   bool level = (digitalRead(BUTTON_PIN) == HIGH);
   uint32_t now = millis();
 
@@ -1456,13 +1476,25 @@ static void serviceButton() {
       pressMs = now;
       pressUsed = longFired = false;
       if (!buttonSwallow && seqState != SEQ_IDLE) {
-        abortSequence("button");
+        if (abortArmedMs != 0 && now - abortArmedMs <= ABORT_CONFIRM_MS) {
+          abortArmedMs = 0;
+          abortSequence("button");
+        } else {
+          abortArmedMs = now ? now : 1;
+          queueFill(0, 112, TFT_W, 8, C_BLACK);
+          queueTextCentered(113, 1, C_ORANGE, "press again to cancel");
+        }
         pressUsed = true;
       }
     } else {
       if (buttonSwallow) buttonSwallow = false;
       else if (!pressUsed && !longFired) shortPress();
     }
+  }
+
+  if (abortArmedMs != 0 && (seqState == SEQ_IDLE || now - abortArmedMs > ABORT_CONFIRM_MS)) {
+    abortArmedMs = 0;
+    if (seqState != SEQ_IDLE) queueFill(0, 112, TFT_W, 8, C_BLACK);   // hint gone
   }
 
   if (!lastLevel && !longFired && !buttonSwallow && now - pressMs >= LONG_PRESS_MS) {

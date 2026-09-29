@@ -10,13 +10,13 @@ the same evening; the user ran the whole flow by hand ("funziona tutto").
 Not yet used at the track.
 
 ### What it does
-`off --hold 3 s--> READY --press--> 3-2-1 --> "On your marks" (beep)
+`off --hold 1.5 s (beep)--> READY --press--> 3-2-1 --> "On your marks" (beep)
 --20-25 s--> "Set" (beep) --armed + 0.7-1.5 s--> "Go" (beep) --1 s-->`
 result (reaction time in s, or FALSE START with its signed time), stored on
-flash, dumped on serial as before. Press on the result -> READY. Press during
-a start -> abort. Hold 3 s anywhere -> "Nice session today!" and nRF52840
-System OFF; a press wakes it, and it stays on only if held the full 3 s (a
-progress bar shows it). Plugging in / upload / reset boots straight to READY,
+flash, dumped on serial as before. Press on the result -> READY. Two presses
+within 2 s during a start -> abort. Hold 1.5 s anywhere -> beep, "Nice session
+today!" and nRF52840 System OFF; a press wakes it, and it stays on only if
+held the full 1.5 s (dark until then, beep when accepted). Plugging in / upload / reset boots straight to READY,
 so the serial port does not vanish after every upload. When the board is
 off the port is gone: switch it on (or double-tap reset) before uploading.
 
@@ -119,6 +119,16 @@ the dump now comes after the ~1 s flash write.
 - Stored format is now v2 (+ wallclock). v1 runs on the flash read as empty
   but still hold their ids, so ids keep increasing (a first cut restarted at
   1; caught on the bench).
+
+### Fixed 2026-09-29 (late): abort froze the board
+- **Any abort between two beeps hung the board for good** (and power off
+  during a start, which aborts first): `buzzerDriveOff()` waited for
+  `EVENTS_STOPPED` on a PWM that was disabled, which never raises it. Now it
+  returns if `ENABLE == 0`. Checked over serial: b → marks → a → board answers.
+- Hold to power on/off is now **1.5 s** (`LONG_PRESS_MS`), each confirmed by
+  a 150 ms beep. Aborting a start takes **two presses within 2 s**
+  (`ABORT_CONFIRM_MS`); the first shows "press again to cancel" in the footer.
+  Serial 'a' still aborts at once.
 
 ### Open
 - Standalone session on a power bank, then `pull_captures.py`; power off/on.
