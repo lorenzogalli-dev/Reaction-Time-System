@@ -23,11 +23,27 @@ off the port is gone: switch it on (or double-tap reset) before uploading.
 Serial output is unchanged and complete; with no terminal open the mbed core
 drops it without blocking (USBCDC checks `_terminal_connected`).
 
-### Wiring (1.77" ST7735S 160x128, AZ-Delivery "Ver 3.1", header pins 1-8)
-GND->GND, VCC->**3V3**, SCK->D8, SDA->D10, RES->D5, RS->D6, CS->D7,
-LEDA->D4. Pins 9-14 (GT_* font chip) unconnected. Button D0 and buzzer
-D1/D2 as before. `TFT_BGR` / `TFT_ROTATION` in `Display.h` if a different
-panel batch comes out colour-swapped or upside down (this one did not).
+### Wiring (1.77" ST7735S 160x128, AZ-Delivery "Ver 3.1")
+
+| Display pin | Signal | XIAO nRF52840 Sense | Note |
+|---:|---|---|---|
+| 1 | GND | GND | |
+| 2 | VCC | **3V3** | not 5V |
+| 3 | SCK | D8 | SPI clock |
+| 4 | SDA | D10 | SPI MOSI |
+| 5 | RES | D5 | reset |
+| 6 | RS | D6 | data/command |
+| 7 | CS | D7 | chip select |
+| 8 | LEDA | D4 | backlight, through the module's Q1 |
+| 9-14 | GT_* / GND | — | font chip, unconnected |
+| — | button | D0 → GND | unchanged, INPUT_PULLUP |
+| — | buzzer (+) / (−) | D1 / D2 | unchanged, antiphase, no GND |
+
+Free: D3, D9 (SPI MISO, unused). Photos: `Docs/hardware/`
+(`tft_177_st7735_front.jpg`, `tft_177_st7735_back_pinout.jpg` with the pin
+table printed on the PCB, `breadboard_xiao_button_buzzer_before_display.jpg`).
+`TFT_BGR` / `TFT_ROTATION` in `Display.h` if a different panel batch comes
+out colour-swapped or upside down (this one did not).
 
 ### Files
 - `Display.h` — own ST7735 driver on `mbed::SPI` (8 MHz, MISO unused),
