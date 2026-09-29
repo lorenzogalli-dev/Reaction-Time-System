@@ -3,7 +3,62 @@
 Last updated: 2026-09-29. Written for an agent starting with no prior context.
 Sections are newest first.
 
-## READ THIS FIRST — 2026-09-29: ESP-NOW long range between two ESP32-C3, built and bench-verified; field test pending
+## READ THIS FIRST — 2026-09-29 (afternoon): ESP-NOW LR in the field dies between 75 and 100 m, and the reason is a fixed ~30 dB deficit, not the distance
+
+One walk on the track, 0-125 m every 25 m, A on the ground behind the block, B
+on a stick at about 1 m, **people moving in between**. Only run 1 of the plan
+was done: no repeats, no `ap on` at range, no crouched athlete. Files:
+`measurements/20260929/125103_A.csv` + `125113_B.csv`. Table from the new
+`Arduino/EspNowLrTest/analyse.py`, which counts delivery against what A
+actually sent. The live terminal counted only between the first and last packet
+seen, which overstates delivery at range, so trust the script.
+
+| dist | LR250 | LR500 | 11b 1M | RSSI | t0 within its 5 s slot |
+|---:|---:|---:|---:|---:|---|
+| 0 m | 100 % | 100 % | 100 % | −53 | all on try 1 |
+| 25 m | 97.0 | 99.5 | 96.5 | −80 | all on try 1 |
+| 50 m | 68.3 | 71.5 | 59.0 | −83…−88 | all, max 3 tries |
+| 75 m | **86.5** | 74.0 | 48.0 | −90 | all, max 3 tries |
+| 100 m | 3.5 | 10.6 | 5.5 | −92…−94 | 5 of 6 slots lost |
+| 125 m | 0 | 0 | 0 | – | all lost |
+
+One-way A→B. Round trip is a few points lower, and RSSI is symmetric in both
+directions to within 1-2 dB.
+
+**Pass criterion (100 m) not met.**
+
+**What it says:**
+- **LR helps on reception, but not on range.** At 75 m and the same RSSI,
+  LR250 delivers 86 % and 11b 48 %. But all three modes die at the same place,
+  around −92/−94 dBm. Against the 09-22 Wi-Fi-to-phone link, which was dead at
+  70 m, that is roughly 25 m more, not an order of magnitude.
+- **The signal starts ~30 dB down.** −53 dBm at 0 m, where 20 dBm TX in free
+  space would give about −20 at 1 m. From there it falls at free-space slope,
+  ~20 dB/decade (−53 → −80 → −94). So the track is not the problem; a constant
+  deficit is. On the bench, boards touching read −17/−23, so the deficit only
+  shows up in the real placement. Candidates: the SuperMini ceramic antenna, A
+  on the ground, orientation, people. This data cannot split them.
+- **The retry scheme works:** at 50-75 m, with 50-70 % packet delivery, every
+  t0 still got through within 3 tries. The product will retry for 15 s; here
+  each slot allowed 5 s.
+- **Variability is high, as on 09-22:** 50 m came out worse than 75 m for
+  LR250. One walk means a few dB of uncertainty on every row.
+
+**Needed:** ~10 dB for 100 m, ~15 dB for 150 m. The 30 dB deficit is where to
+find it.
+
+### Open, in order
+1. **Split the deficit, 15 min, at a fixed 25 m:** A on the ground vs raised
+   1 m, and B in two orientations, 30 s each. Terrain vs antenna. No new code.
+2. **External antenna, B first:** B sits at the finish with no size limit, and
+   gain there improves both directions (see 09-22). E.g. the XIAO ESP32-C3,
+   which ships with a u.FL rod antenna. Probably the single largest lever.
+3. **Re-walk with 2-3 repeats**, plus the `ap on` and crouched-athlete runs
+   that were skipped today.
+4. If the deficit turns out to be mostly the ground, rethink where A's antenna
+   sits on the block.
+
+## READ THIS FIRST — 2026-09-29: ESP-NOW long range between two ESP32-C3, built and bench-verified
 
 New rig: `Arduino/EspNowLrTest/` (firmware, `flash.sh`, `logger.py`, README with
 the full field procedure). It tests architecture E from the 09-22 section. Nothing
@@ -45,15 +100,13 @@ is on the Windows laptop):
   `python3` or `py`: those are other interpreters.
 
 ### Open
-- **The field test itself:** stations 0-200 m every 25 m, three plain runs, one
-  with `ap on` and the phone, one with a person crouched over A. The procedure
-  is in the README.
+- ~~The field test itself~~: one walk done, see the section above.
 - **ESP-NOW LR + BLE coexistence on B is untested.** It is *not* implied by the
   Wi-Fi result: Wi-Fi AP and ESP-NOW share one MAC on one channel, while BLE
   time-shares the radio through the coexistence arbiter, and B is deaf to LR
   during BLE connection events. Test it before choosing BLE for the phone link;
   it needs a bigger app partition, since the sketch is at 77 %.
-- The analysis script: to be written against the real field CSVs.
+- ~~The analysis script~~: `analyse.py`, see the section above.
 
 ## READ THIS FIRST — 2026-09-24 (later): one MCU at the start instead of two? Discussed, not decided, nothing changed
 

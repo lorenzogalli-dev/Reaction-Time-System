@@ -24,6 +24,7 @@ which gives the jitter of the hop that will carry the t0.
 | `EspNowLrTest/app.cpp` | the firmware, identical on both boards |
 | `flash.sh` | compile and upload (Mac) |
 | `logger.py` | runs on each laptop, Mac or Windows: logs to CSV and shows live numbers |
+| `analyse.py` | per-station table from one walk: `python3 analyse.py <A.csv> <B.csv>` |
 | `measurements/<date>/` | one CSV per laptop per run, `HHMMSS_A.csv` / `HHMMSS_B.csv` |
 
 The role (A or B) is stored in the board's flash and set by the logger: start
