@@ -1,7 +1,58 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-09-29. Written for an agent starting with no prior context.
+Last updated: 2026-10-07. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-10-07: the start unit ported to ESP32-C3 SuperMini + BMI270, compiles, never run
+
+The team wants two MCUs instead of three: drop the XIAO at the start and
+use the ESP32 that already has to do ESP-NOW, with an external **BMI270**
+breakout. The user chose: C3 SuperMini, keep the BMI270, 800 Hz. The port is
+in `Arduino/AlgorithmRealTimeESP32/`; `Arduino/AlgorithmRealTime/` (XIAO) is
+untouched and stays the reference until the port passes its tests.
+
+**Read `Arduino/AlgorithmRealTimeESP32/INFO.md` first**: it has the wiring
+table, the build steps, the XIAO→ESP32 differences and the tests in order,
+each with a pass criterion. In short:
+
+- Builds with `--fqbn esp32:esp32:nologo_esp32c3_super_mini` (27% flash,
+  45% RAM). `partitions.csv` in the sketch folder adds a 25-slot `runs`
+  partition by itself.
+- Same behaviour, screens, serial protocol and stored format as v5.
+  `StartDetector.h` / `AicPicker.h` are byte-identical.
+- New: `Bmi270.h`, a register-level driver. It uploads Bosch's 8 KB config
+  blob, `Bmi270Config.h` (BSD-3, BMI270_SensorAPI v2.86.1), and reads back
+  ODR and range. The data-ready timestamp is now taken **in the ISR**
+  (esp_timer, 1 µs). The buzzer uses LEDC running continuously plus GPIO-matrix
+  routing and inversion, so it is still 2 register writes at the beep, and the
+  pins rest HIGH. Storage uses the internal flash. "Off" is deep sleep, woken
+  by a button on GPIO1. The dump gains `SENSOR,bmi270` / `ODR,800`.
+- Pins (in `Pins.h`):
+
+  | Signal | GPIO |
+  |---|---|
+  | I2C SDA / SCL | 0 / 3 (the colleague's choice) |
+  | BMI270 INT1 | 2 (**must be wired**) |
+  | Button | 1 |
+  | Piezo (+) / (−) | 8 / 9 |
+  | TFT SCK / MOSI / CS / DC / RES / BL | 4 / 6 / 7 / 5 / 10 / 20 |
+
+  BMI270 CS goes to 3V3 and SDO to GND (address 0x68).
+- C3 USB serial with a laptop attached but no terminal open: writes would
+  block, where the XIAO's core dropped them. Fixed with
+  `setTxTimeoutMs(5)` plus `serialRoomFor()`: a dump nobody reads gives up
+  after 200 ms.
+
+### Open
+- Hardware tests 1–7 in INFO.md, none run yet. Start with the boot banner, then
+  `verify_rate.py`, then check `DROPPED` (BMI270 data-ready edge behaviour,
+  non-latched, is unverified).
+- Before ESP32 data can be compared with XIAO data: the BMI270 filter's fixed
+  delay (a different onset offset than the LSM6DS3's), the thresholds (more
+  noise: measure `settled_mg`, re-run `sweep_threshold.py`), and the buzzer
+  latency, still unmeasured.
+- Then ESP-NOW LR in this same sketch, and repeat the rate test with the radio
+  transmitting (single core).
 
 ## READ THIS FIRST — 2026-09-29 (night): AlgorithmRealTime v5 runs standalone — display, one button, runs kept on flash
 

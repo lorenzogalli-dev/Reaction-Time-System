@@ -1,0 +1,8 @@
+# ESP32-C3 SuperMini, 4 MB. Picked up by the build automatically (sketch folder).
+# runs: 25 x 80 KB slots + 4 KB counter = 0x1F5000, see Storage.h.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x1C0000,
+runs,     data, 0x40,     0x1D0000, 0x1F5000,
+coredump, data, coredump, 0x3F0000, 0x10000,

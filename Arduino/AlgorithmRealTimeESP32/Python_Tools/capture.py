@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+capture.py - writes to disk what AlgorithmRealTime.ino dumps. Nothing else.
+
+This is deliberately dumb. Through v3 the host owned the recording: it held
+the state, it sent the o/s/g markers on a human's keypress, and it decided
+when a capture began and ended. That put a person's reaction time inside the
+measurement of a person's reaction time - on Data/accel_20260907_160108.csv
+the "go" marker lands ~90 ms after the movement it was meant to mark.
+
+In v4 the firmware owns all of it: the button, the randomised delays, the
+three beeps, the marker timestamps and the recorded window. This script opens
+the port, prints the board's progress lines so you can follow a run, and
+writes each dump to a CSV. It makes no timing decisions, so it cannot corrupt
+any. Keep it that way - anything that needs to *decide* something belongs in
+the firmware (if it is about when) or in start_detector.py (if it is about
+what the data means).
+
+Usage:
+    python3 Arduino/AlgorithmRealTimeESP32/Python_Tools/capture.py                 # autodetect port, run until Ctrl-C
+    python3 Arduino/AlgorithmRealTimeESP32/Python_Tools/capture.py --port /dev/cu.usbmodem101 --outdir Data
+"""
+
+import argparse
+import datetime
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+# Repo root's Data/, not wherever this script happens to be launched from -
+# .../Arduino/AlgorithmRealTimeESP32/Python_Tools/capture.py -> repo root is three
+# levels up. A relative "Data" default silently wrote into whatever the
+# current directory was, which is how 45 captures ended up nested inside
+# Python_Tools/Data instead of the top-level Data/ the rest of the tooling
+# (and Data/README.md) expects.
+DEFAULT_OUTDIR = Path(__file__).resolve().parents[3] / "Data"
+
+
+def autodetect_port():
+    from serial.tools import list_ports
+    ports = list(list_ports.comports())
+    for p in ports:
+        # The XIAO enumerates as a USB CDC device; on macOS that is
+        # cu.usbmodem*, on Linux ttyACM*.
+        if "usbmodem" in p.device or "ttyACM" in p.device:
+            return p.device
+        # On Windows there is no such naming, so match a COM port that
+        # describes itself as USB Serial / Seeed / J-Link.
+        if "COM" in p.device and ("USB" in (p.description or "") or "Serial" in (p.description or "")):
+            return p.device
+    # Last resort on Windows: a single COM port that is not COM1, which is
+    # usually an internal one.
+    for p in ports:
+        if p.device.startswith("COM") and p.device != "COM1":
+            return p.device
+    return None
+
+
+# Header lines the firmware emits between DUMP_START and the rows. Value is
+# the comment key written into the CSV.
+HEADER_KEYS = {
+    "ON": "on_t_us",
+    "SET": "set_t_us",
+    "GO": "go_t_us",
+    "PREROLL": "preroll_samples",
+    "TRUNCATED": "truncated",
+    "DROPPED": "dropped",
+    "CLOCKSTEP": "clockstep_us",
+    # The board's arming instant and its own verdict. Written down rather than
+    # left to be recomputed offline: re-deriving the arming from the samples is
+    # not guaranteed to land on the same instant (the board works in float32,
+    # numpy in float64), and without the verdict the board's answer survives
+    # only in this terminal - so a capture reopened tomorrow has nothing to
+    # check the offline analysis against.
+    "ARM": "arm_t_us",
+    "ARMMG": "arm_peak_mg",
+    "ARMCAP": "arm_capped",
+    "RTMS": "board_reaction_ms",
+    "ONSET": "board_onset_t_us",
+    # v5: sample intervals over 1.5x nominal since the button (a display draw
+    # that stalled the sampler would show here), and the run's id on the
+    # board's flash.
+    "GAPS": "gaps",
+    "MAXGAP": "max_gap_us",
+    "STORED": "board_run_id",
+    "WALLCLOCK": "board_wallclock_unix",
+    # ESP32 port: the rate this capture was configured for.
+    "ODR": "odr_hz",
+}
+
+# Same, but the value is text, not a number.
+TEXT_KEYS = {"VERDICT": "board_verdict", "SENSOR": "sensor"}
+
+
+def result_tag(header):
+    """The board's answer, short enough for a file name: '0.160s' for a valid
+    start, 'FS-0.045s' for a false start, 'nomove', 'error'."""
+    verdict = header.get("board_verdict", "")
+    rt = header.get("board_reaction_ms")
+    if verdict == "valid start" and isinstance(rt, (int, float)):
+        return f"{rt / 1000:.3f}s"
+    if verdict == "FALSE START" and isinstance(rt, (int, float)):
+        return f"FS{rt / 1000:+.3f}s"
+    if verdict == "no movement":
+        return "nomove"
+    return "error" if verdict else "noverdict"
+
+
+def send_time(ser):
+    """Give the board the PC's clock, so the runs it stores carry a date. It
+    keeps it only until the next power-off."""
+    ser.write(f"T{int(time.time())}\n".encode())
+
+
+def write_csv(path, header, rows):
+    """Write one dump. Markers go in the leading comment block, not appended
+    after the rows the way accel_live.py had to do it - the firmware now sends
+    them *before* the data, so there is no reason to keep the append hack that
+    already cost one bug (a reader that stopped at the first non-comment line
+    and silently found no markers at all)."""
+    t0 = rows[0][0]
+    on_us = header.get("on_t_us", 0)
+    set_us = header.get("set_t_us", 0)
+    go_us = header.get("go_t_us", 0)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# AccelStream v4 capture\n")
+        f.write(f"# written_utc: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n")
+        f.write("# t_us is the board's raw micros() reading for that sample.\n")
+        f.write("# t_s is relative to the first row of this file.\n")
+        f.write("# on/set/go are the firmware's own beep timestamps, on the same\n")
+        f.write("# micros() clock as every sample - no host or keypress latency.\n")
+        for key in ("on_t_us", "set_t_us", "go_t_us"):
+            f.write(f"# {key}: {header.get(key, 0)}\n")
+            us = header.get(key, 0)
+            if us:
+                f.write(f"# {key[:-5]}_t_s: {(us - t0) / 1e6:.6f}\n")
+        # The board's own arming instant, in the same form as on/set/go.
+        if "arm_t_us" in header:
+            f.write(f"# arm_t_us: {header['arm_t_us']}\n")
+            f.write(f"# arm_t_s: {(header['arm_t_us'] - t0) / 1e6:.6f}\n")
+        # ESP32 port: which sensor and rate, so these never pass for XIAO data.
+        for key in ("sensor", "odr_hz"):
+            if key in header:
+                f.write(f"# {key}: {header[key]}\n")
+        for key in ("arm_peak_mg", "arm_capped", "preroll_samples", "truncated",
+                    "dropped", "clockstep_us", "gaps", "max_gap_us", "board_run_id",
+                    "board_wallclock_unix"):
+            if key in header:
+                f.write(f"# {key}: {header[key]}\n")
+        # And what the board decided, so the capture carries its own answer.
+        for key in ("board_verdict", "board_reaction_ms", "board_onset_t_us"):
+            if key in header:
+                f.write(f"# {key}: {header[key]}\n")
+        f.write("t_s,t_us,x_g,y_g,z_g\n")
+        for t_us, x, y, z in rows:
+            f.write(f"{(t_us - t0) / 1e6:.6f},{t_us},{x},{y},{z}\n")
+
+    # Anything other than a clean run is worth saying out loud rather than
+    # leaving in a comment line nobody reads.
+    warn = []
+    if header.get("clockstep_us", 0) > 100:
+        warn.append(f"micros() resolves only ~{header['clockstep_us']} us - "
+                    "wrong Arduino core, timestamps are ~1 ms granular")
+    if header.get("dropped", 0):
+        warn.append(f"{header['dropped']} sample(s) recovered by the data-ready watchdog")
+    if header.get("gaps", 0):
+        warn.append(f"{header['gaps']} gap(s) in the sampling, longest "
+                    f"{header.get('max_gap_us', '?')} us")
+    if header.get("truncated", 0):
+        warn.append("ring wrapped: less pre-set history than intended "
+                    f"({header.get('preroll_samples', '?')} samples)")
+    if not go_us:
+        warn.append("no 'go' marker in this dump")
+    if header.get("arm_capped"):
+        warn.append("armed on the cap: the athlete never settled - the verdict "
+                    "stands but is worth reviewing")
+    return warn
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", help="serial port (default: autodetected)")
+    ap.add_argument("--baud", type=int, default=921600)
+    ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR),
+                    help="where to write the CSVs (default: the repo's top-level Data/)")
+    args = ap.parse_args()
+
+    import serial
+
+    port = args.port or autodetect_port()
+    if not port:
+        print("No serial port found - plug in the board.", file=sys.stderr)
+        sys.exit(1)
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"Opening {port} @ {args.baud} baud...")
+    ser = serial.Serial(port, args.baud, timeout=0.2)
+    time.sleep(2.0)  # let the board finish its boot/reset before reading
+    ser.reset_input_buffer()
+    send_time(ser)
+    # Only one process can hold the serial port, and this one has to hold it
+    # for the whole session to catch a dump the moment it arrives. So typed
+    # keys are relayed straight through to the board - a passthrough, not a
+    # feature: this script still decides nothing. It is what lets you run the
+    # sequence with no button wired yet.
+    def relay_stdin():
+        for line in sys.stdin:
+            cmd = line.strip()
+            cmd = "b" if cmd == "" else cmd[0]
+            try:
+                ser.write(cmd.encode())
+            except Exception:                         # port closed on exit
+                return
+            print(f"[sent] {cmd!r}")
+
+    threading.Thread(target=relay_stdin, daemon=True).start()
+
+    print("Listening. Press the board's button to start a sequence, or press")
+    print("Enter here to send 'b' (same thing). 'a'+Enter aborts, 'p'+Enter")
+    print("prints one reading. Ctrl-C to quit.\n")
+
+    in_dump = False
+    header = {}
+    rows = []
+    try:
+        while True:
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            if line.startswith("DUMP_START"):
+                in_dump, header, rows = True, {}, []
+                continue
+
+            if not in_dump:
+                # Idle preview rows are 4 comma-separated numbers and are pure
+                # noise here; everything else is banner or SEQ progress and is
+                # exactly what you want to watch during a run.
+                if line.count(",") != 3 or line.startswith("SEQ,"):
+                    print(f"[board] {line}")
+                continue
+
+            if line == "DUMP_END":
+                in_dump = False
+                if not rows:
+                    print("!! dump contained no rows")
+                    continue
+                stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(args.outdir, f"accel_{stamp}_{result_tag(header)}.csv")
+                warn = write_csv(path, header, rows)
+                print(f"\nSaved {len(rows)} rows -> {path}")
+                for w in warn:
+                    print(f"  !! {w}")
+                print()
+                continue
+
+            key, _, val = line.partition(",")
+            if key in TEXT_KEYS:
+                header[TEXT_KEYS[key]] = val.strip()
+                continue
+            if key in HEADER_KEYS:
+                try:
+                    # ARMMG and RTMS are not integers; keep the float rather
+                    # than dropping the line the way int() alone used to.
+                    header[HEADER_KEYS[key]] = float(val) if "." in val else int(val)
+                except ValueError:
+                    pass
+                continue
+
+            parts = line.split(",")
+            if len(parts) == 4:
+                try:
+                    rows.append((int(parts[0]), parts[1], parts[2], parts[3]))
+                except ValueError:
+                    print(f"!! malformed row skipped: {line!r}")
+            else:
+                print(f"!! unexpected line inside dump: {line!r}")
+    except KeyboardInterrupt:
+        print("\nBye.")
+    finally:
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()
