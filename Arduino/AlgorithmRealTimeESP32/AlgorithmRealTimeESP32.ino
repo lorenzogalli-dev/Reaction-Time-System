@@ -29,6 +29,9 @@ static StartDetector detector;
 //     GPIO9, which cannot wake deep sleep), then a restart.
 //   - Dump header gains SENSOR,bmi270 and ODR,800 so a capture says where it
 //     came from.
+//   - Samples come out of the BMI270's FIFO, not its data registers, and
+//     INT1 is only a clock (2026-10-07, after the first block starts lost 63
+//     samples at "set" and 3 every 2 s to loop stalls). See serviceSampling().
 // StartDetector.h and AicPicker.h are byte-identical to the XIAO's. Wiring,
 // build and what still has to be measured: INFO.md in this folder.
 // Below, the XIAO history is kept as it was; "D0", "QSPI", "System OFF" in it
@@ -139,7 +142,9 @@ static StartDetector detector;
 //   GO,<t_us or 0>        beep 3, "go" - the reaction-time reference
 //   PREROLL,<n>           samples present BEFORE the "set" instant
 //   TRUNCATED,<0|1>       1 = the ring wrapped, the pre-roll is short
-//   DROPPED,<n>           samples the data-ready watchdog had to recover
+//   DROPPED,<n>           samples with no data-ready stamp of their own
+//                         (ESP32: interpolated/extrapolated on the sensor's
+//                         period, see serviceSampling)
 //   CLOCKSTEP,<us>        measured micros() resolution of this build
 //   GAPS,<n>              sample intervals over 1.5x nominal since the button
 //   MAXGAP,<us>           the longest of them
@@ -202,14 +207,12 @@ static const uint32_t SAMPLE_PERIOD_US = 1000000UL / ACCEL_ODR_HZ;
 
 // The IMU's data-ready line: BMI270 INT1 -> IMU_INT1_PIN (Pins.h).
 
-// DRDY is level-latched: it goes high when a sample is ready and only drops
-// once the output registers are read. So a single missed edge is permanent -
-// no read means no falling edge means no next rising edge, and sampling would
-// stop dead. This watchdog bounds that: if no edge arrives for three sample
-// periods, read anyway (which clears DRDY and lets edges resume) and count it.
-// It also covers startup, where DRDY can already be high before
-// attachInterrupt() is in place and there is no edge left to catch.
-static const uint32_t DRDY_STALL_TIMEOUT_US = 3 * SAMPLE_PERIOD_US;
+// XIAO: DRDY was level-latched and a missed edge stopped sampling until a
+// watchdog read. ESP32: the BMI270's non-latched data-ready keeps pulsing
+// whether or not anything is read (the 2026-10-07 captures show fresh edges
+// right after an 80 ms stall), and the samples come from the FIFO, so there
+// is no edge to lose. What is left of the watchdog is in serviceSampling():
+// a frame with no stamp for 3 periods gets an extrapolated one.
 
 // +/-16 g: a real push-off rigidly mounted on the block is expected around
 // 1-3 g, but a 2026-09-07 bench test (a hard hand hit, well above a real
@@ -378,11 +381,30 @@ static uint32_t lastOnsetUs = 0;
 static bool imuReady = false;
 static uint32_t idleSampleIndex = 0;
 
-// Set by the data-ready ISR, cleared by the main loop. drdyT is the instant
-// the ISR ran, on the same micros() clock as everything else.
-static volatile bool drdyPending = false;
-static volatile uint32_t drdyT = 0;
-static uint32_t lastSampleUs = 0;
+// Every data-ready edge, stamped by the ISR into a queue: one stamp per
+// sample the BMI270 wrote to its FIFO. The loop pairs them up oldest first.
+// Counters are free-running; the slot is the counter mod STAMP_Q.
+static const uint32_t STAMP_Q = 1024;              // power of 2, ~1.28 s
+static volatile uint32_t stampQ[STAMP_Q];
+static volatile uint32_t stampHead = 0;            // ISR only
+static uint32_t stampTail = 0;                     // loop only
+
+// Frames already read out of the FIFO, waiting for their stamp (the ISR runs
+// a few us after the frame lands, so the newest one can be read first).
+static const uint16_t PEND_Q = 1024;
+static int16_t pendX[PEND_Q], pendY[PEND_Q], pendZ[PEND_Q];
+static uint16_t pendHead = 0, pendCount = 0;
+
+// Timestamp given to the last sample handed on, and the sensor's period
+// measured from consecutive stamps, in 1/256 us (starts at nominal).
+static uint32_t lastStampT = 0;
+static uint32_t periodQ8 = 0;
+static uint32_t lastFifoPollUs = 0;
+// Samples handed on in one go, worst case since the button: how long the
+// loop stalled, and what the FIFO absorbed. Printed with the verdict.
+static uint32_t maxBacklog = 0;
+// FIFO or stamp queue overran and had to be restarted: samples were lost.
+static uint32_t fifoResyncs = 0;
 
 // Samples whose true instant is unknown because the watchdog had to recover
 // them rather than an edge delivering them. Reported with every dump: a
@@ -456,16 +478,55 @@ static bool onCaptured = false, setCaptured = false, goCaptured = false;
 // ISR fell back to a 1024 Hz tick on that core, see below); here micros() is
 // esp_timer_get_time(), 1 us and ISR-safe, so the stamp is taken a few us
 // after the BMI270 raised INT1 instead of whenever the loop got round to the
-// flag. If a second edge arrives before the loop reads, the stamp moves to it
-// - and so does the data, since the registers hold the newest sample.
+// flag. Every edge is queued, so a busy loop no longer loses any: the sample
+// itself waits in the BMI270's FIFO and the stamp waits here.
 //
 // XIAO note, kept for the history: "Deliberately does NOT timestamp. micros()
 // called from interrupt context on this core does not have microsecond
 // resolution - it falls back to a 1024 Hz counter, so every timestamp lands on
 // a ~976.6 us grid."
 static void IRAM_ATTR drdyIsr() {
-  drdyT = (uint32_t)esp_timer_get_time();
-  drdyPending = true;
+  uint32_t h = stampHead;
+  stampQ[h & (STAMP_Q - 1)] = (uint32_t)esp_timer_get_time();
+  stampHead = h + 1;
+}
+
+// Lines the FIFO and the stamp queue up: right after an edge, empty both, so
+// the next frame and the next stamp belong to the same edge. Off by one here
+// would put every timestamp one period (1.25 ms) late, so the window is
+// checked rather than assumed: the flush must land before the next edge.
+// Also the recovery after either queue overran (a loop stalled > ~1.2 s,
+// which only the flash write and the dump do, both outside a start).
+static bool fifoResync() {
+  pendHead = pendCount = 0;
+  if (periodQ8 == 0) periodQ8 = SAMPLE_PERIOD_US << 8;
+  for (int attempt = 0; attempt < 20; attempt++) {
+    uint32_t h0 = stampHead;
+    uint32_t w0 = micros();
+    while (stampHead == h0) {
+      if ((uint32_t)(micros() - w0) > 20000) goto noEdges;
+    }
+    uint32_t te = stampQ[(stampHead - 1) & (STAMP_Q - 1)];
+    delayMicroseconds(30);          // the frame is in the FIFO by now
+    bmiFifoFlush();
+    noInterrupts();
+    bool inTime = (uint32_t)(micros() - te) < SAMPLE_PERIOD_US - 200;
+    if (inTime) stampTail = stampHead;
+    interrupts();
+    if (inTime) {
+      lastStampT = te;
+      lastFifoPollUs = micros();
+      return true;
+    }
+  }
+noEdges:
+  // INT1 dead (unwired?): samples still flow, on extrapolated timestamps,
+  // every one counted in DROPPED.
+  bmiFifoFlush();
+  stampTail = stampHead;
+  lastStampT = micros();
+  lastFifoPollUs = lastStampT;
+  return false;
 }
 
 // Survives esp_restart(), not a power-up (whose garbage is rejected by the
@@ -521,15 +582,9 @@ void setup() {
     Serial.print(bmiErrorValue, HEX);
     Serial.println(")");
   } else {
-    // DRDY may already be high from a sample taken during init, in which case
-    // there is no rising edge left for attachInterrupt() to catch. One
-    // throwaway read clears it so edges start cleanly.
-    int16_t discardX, discardY, discardZ;
-    readSampleRaw(&discardX, &discardY, &discardZ);
-    lastSampleUs = micros();
-
     pinMode(IMU_INT1_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(IMU_INT1_PIN), drdyIsr, RISING);
+    if (!fifoResync()) Serial.println("WARNING: no data-ready edges on INT1 - timestamps are extrapolated");
 
     Serial.print("IMU OK - BMI270 accel ");
     Serial.print(ACCEL_ODR_HZ);
@@ -691,8 +746,8 @@ static void emitDumpHeader(const CaptureMeta& m) {
   Serial.println(m.preroll);
   Serial.print("TRUNCATED,");
   Serial.println(m.truncated);
-  // Non-zero means the data-ready watchdog had to recover samples, so some
-  // timestamps in this capture are only good to DRDY_STALL_TIMEOUT_US. The
+  // Non-zero means some samples had no data-ready stamp of their own and got
+  // one interpolated on the sensor's period (see serviceSampling). The
   // host treats an unrecognised 2-field line as banner text, so this is safe
   // to add to the protocol.
   Serial.print("DROPPED,");
@@ -837,33 +892,8 @@ static bool emitStoredRun(uint32_t slot) {
   return true;
 }
 
-// Returns true when it read a sample - the display may draw right after one,
-// never between two (see loop()).
-static bool serviceSampling() {
-  if (!imuReady) return false;
-
-  uint32_t t;
-  if (drdyPending) {
-    // ESP32: the ISR's own stamp (see drdyIsr). Read with interrupts off so
-    // the flag and the stamp come from the same edge.
-    noInterrupts();
-    t = drdyT;
-    drdyPending = false;
-    interrupts();
-  } else if ((uint32_t)(micros() - lastSampleUs) > DRDY_STALL_TIMEOUT_US) {
-    // Watchdog path - see DRDY_STALL_TIMEOUT_US. Reading clears the latched
-    // line so edges resume. The sample is kept (it is real data) but its
-    // instant is only known to within the timeout, so it is counted.
-    t = micros();
-    droppedSamples++;
-  } else {
-    return false;
-  }
-
-  int16_t rawX, rawY, rawZ;
-  readSampleRaw(&rawX, &rawY, &rawZ);
-  lastSampleUs = micros();
-
+// One sample, timestamped, into the ring and the detector.
+static void storeSample(uint32_t t, int16_t rawX, int16_t rawY, int16_t rawZ) {
   if (seqState != SEQ_IDLE) {
     uint32_t dt = t - prevSampleT;
     if (dt > SAMPLE_PERIOD_US + SAMPLE_PERIOD_US / 2) {
@@ -904,7 +934,125 @@ static bool serviceSampling() {
       }
     }
   }
+}
+
+// Pulls whatever the FIFO holds into the pending queue. False if it overran.
+static bool pullFifo() {
+  int32_t n = bmiFifoFrames();
+  lastFifoPollUs = micros();
+  if (n <= 0) return true;
+  // Full means the oldest frames were overwritten: frames and stamps no
+  // longer line up, and the only honest fix is to start again.
+  if ((uint32_t)n >= BMI_FIFO_MAX_FRAMES - 1) return false;
+  while (n > 0 && pendCount < PEND_Q) {
+    uint16_t room = PEND_Q - pendCount;
+    uint16_t k = (uint16_t)min((int32_t)BMI_FIFO_READ_FRAMES, n);
+    if (k > room) k = room;
+    int16_t x[BMI_FIFO_READ_FRAMES], y[BMI_FIFO_READ_FRAMES], z[BMI_FIFO_READ_FRAMES];
+    if (!bmiFifoRead(k, x, y, z)) return true;     // bus hiccup: try next loop
+    for (uint16_t i = 0; i < k; i++) {
+      uint16_t slot = (pendHead + pendCount) % PEND_Q;
+      pendX[slot] = x[i]; pendY[slot] = y[i]; pendZ[slot] = z[i];
+      pendCount++;
+    }
+    n -= k;
+  }
   return true;
+}
+
+// How far a stamp may sit from a whole number of periods after the last one
+// and still be that edge's own. Real stamps sit within ~1 us; an edge that
+// waited out a stretch with interrupts off is stamped late, by up to a
+// period, and must not be believed.
+static const uint32_t STAMP_PHASE_TOL_US = 200;
+
+// Returns true when it handed on at least one sample - the display may draw
+// right after, never between two (see loop()).
+//
+// ESP32, 2026-10-07: the samples come out of the BMI270's FIFO, and INT1 only
+// tells the time. The first block starts read the data registers on each
+// edge and lost every sample the loop was too busy to read: 63 in the ~80 ms
+// the detector's pre-roll replay takes at "set" (no FPU on the C3), and 3
+// every 2.000 s to something outside this sketch. Now the sensor keeps every
+// sample until it is read (1.28 s of room) and the ISR keeps every edge's
+// stamp, so a stall only delays samples, it cannot lose them.
+//
+// Pairing, oldest first: a stamp k sensor periods after the last one is
+// that frame's own when k == 1. k > 1 means k-1 edges were never stamped
+// (ISR held off): this frame gets the time interpolated between the two
+// neighbours, on the sensor's own clock, and DROPPED counts it. k == 0 is
+// an edge already accounted for; a stamp off the period grid was delayed and
+// is not used. With no stamp at all for 3 periods, the frame is extrapolated.
+static bool serviceSampling() {
+  if (!imuReady) return false;
+
+  if ((uint32_t)(stampHead - stampTail) > STAMP_Q) {
+    fifoResync();
+    fifoResyncs++;
+    return false;
+  }
+  if (stampHead != stampTail || pendCount > 0 ||
+      (uint32_t)(micros() - lastFifoPollUs) > SAMPLE_PERIOD_US) {
+    if (!pullFifo()) {
+      fifoResync();
+      fifoResyncs++;
+      return false;
+    }
+  }
+
+  uint32_t handed = 0;
+  uint32_t backlog = pendCount;
+  while (pendCount > 0) {
+    uint32_t t;
+    if (stampHead != stampTail) {
+      uint32_t st = stampQ[stampTail & (STAMP_Q - 1)];
+      uint32_t d = st - lastStampT;
+      // At or before the last sample (half a period of slack): an edge
+      // already accounted for. Also keeps an older stamp from wrapping.
+      if ((int32_t)d < (int32_t)(periodQ8 >> 9)) {
+        stampTail++;
+        continue;
+      }
+      uint32_t k = ((uint64_t)d * 256 + periodQ8 / 2) / periodQ8;
+      int32_t phase = (int32_t)(d - (uint32_t)(((uint64_t)k * periodQ8) >> 8));
+      if (phase > (int32_t)STAMP_PHASE_TOL_US || phase < -(int32_t)STAMP_PHASE_TOL_US) {
+        stampTail++;                               // not this frame's edge
+        continue;
+      }
+      if (k == 1) {
+        t = st;
+        stampTail++;
+        // Sensor period from clean neighbours, smoothed over ~64 samples.
+        int32_t err = (int32_t)(d << 8) - (int32_t)periodQ8;
+        periodQ8 += err / 64;
+      } else {
+        t = lastStampT + d / k;
+        droppedSamples++;
+      }
+    } else if ((uint32_t)(micros() - lastStampT) > 3 * SAMPLE_PERIOD_US + (periodQ8 >> 8)) {
+      t = lastStampT + (periodQ8 >> 8);
+      droppedSamples++;
+    } else {
+      break;                                       // its stamp is on the way
+    }
+    uint16_t slot = pendHead;
+    pendHead = (pendHead + 1) % PEND_Q;
+    pendCount--;
+    lastStampT = t;
+    storeSample(t, pendX[slot], pendY[slot], pendZ[slot]);
+    handed++;
+  }
+  if (seqState != SEQ_IDLE && backlog > maxBacklog) maxBacklog = backlog;
+  return handed > 0;
+}
+
+// Hands on everything the sensor has produced up to now, so that the ring is
+// complete at a sequence boundary ("set", the verdict). Normally one sample.
+static void drainSampling() {
+  uint32_t t0 = micros();
+  do {
+    serviceSampling();
+  } while ((pendCount > 0 || bmiFifoFrames() > 0) && (uint32_t)(micros() - t0) < 5000);
 }
 
 // --- buzzer drive ----------------------------------------------------------
@@ -1161,6 +1309,13 @@ static void evaluateAndReportResults() {
     Serial.println("NOTE          : armed on the cap, athlete never settled -");
     Serial.println("                verdict stands but is worth reviewing");
   }
+  // Proof the FIFO did its job: how far behind the loop fell, and that no
+  // sample went missing anyway.
+  Serial.print("Sampling      : backlog max "); Serial.print(maxBacklog);
+  Serial.print(" samples ("); Serial.print(maxBacklog * SAMPLE_PERIOD_US / 1000);
+  Serial.print(" ms), "); Serial.print(droppedSamples);
+  Serial.print(" interpolated, "); Serial.print(gapCount);
+  Serial.print(" gaps, "); Serial.print(fifoResyncs); Serial.println(" resyncs");
   if (detector.events_dropped > 0) {
     Serial.print("NOTE          : "); Serial.print(detector.events_dropped);
     Serial.println(" further event(s) past MAX_EVENTS were not recorded");
@@ -1183,6 +1338,8 @@ static void startSequence() {
   onCaptured = setCaptured = goCaptured = false;
   droppedSamples = 0;
   gapCount = maxGapUs = 0;
+  maxBacklog = 0;
+  fifoResyncs = 0;
   showingResult = false;
   seqStartUs = seed;
   seqState = SEQ_WAIT_MARKS;
@@ -1249,6 +1406,7 @@ static void serviceSequence() {
       break;
     case SEQ_WAIT_SET:
       beep(&setT, &setCaptured);
+      drainSampling();
       // No buffer to start: the ring already holds the last ~13.9 s. "Set"
       // only records where in it the judged window begins.
       setSampleIdx = recWritten;
@@ -1269,6 +1427,7 @@ static void serviceSequence() {
       showGo();
       break;
     case SEQ_TAIL: {
+      drainSampling();
       seqState = SEQ_IDLE;
       evaluateAndReportResults();
       // Result on screen first, synchronously: the flash write below blocks

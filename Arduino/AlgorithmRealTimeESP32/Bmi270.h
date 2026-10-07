@@ -20,7 +20,14 @@
 //                    not the LSM6DS3's: see INFO.md, it has to be measured.
 //   +/-16 g          2048 LSB/g = 0.488 mg/LSB, the same resolution the
 //                    LSM6DS3 had at 16 g, so the thresholds keep their units.
-//   INT1 = data-ready, push-pull, active high, non-latched.
+//   INT1 = data-ready, push-pull, active high, non-latched. Used ONLY as a
+//                    clock: the ISR stamps each edge, nothing reads on it.
+//   FIFO             accel only, headerless (6 bytes/frame), filtered data
+//                    (the same filter path as the data registers, so the
+//                    group delay does not change), overwrite when full.
+//                    6144 bytes = 1024 frames = 1.28 s at 800 Hz. Every
+//                    sample goes through it, so a main loop that stalls for
+//                    up to ~1 s loses nothing; see serviceSampling().
 // ---------------------------------------------------------------------------
 #include <Wire.h>
 #include "Pins.h"
@@ -35,8 +42,13 @@ enum : uint8_t {
   BMI_ACC_X_LSB       = 0x0C,   // X/Y/Z, 6 bytes, little endian
   BMI_INT_STATUS_1    = 0x1D,
   BMI_INTERNAL_STATUS = 0x21,   // low nibble 0x1 = config loaded, running
+  BMI_FIFO_LENGTH_0   = 0x24,   // byte count, 14 bits over 0x24/0x25
+  BMI_FIFO_DATA       = 0x26,
   BMI_ACC_CONF        = 0x40,
   BMI_ACC_RANGE       = 0x41,
+  BMI_FIFO_DOWNS      = 0x45,
+  BMI_FIFO_CONFIG_0   = 0x48,
+  BMI_FIFO_CONFIG_1   = 0x49,
   BMI_INT1_IO_CTRL    = 0x53,
   BMI_INT_LATCH       = 0x55,
   BMI_INT_MAP_DATA    = 0x58,
@@ -55,6 +67,14 @@ static const uint8_t BMI_ACC_PERF      = 0x80;
 static const uint8_t BMI_ACC_RANGE_16G = 0x03;
 
 static const uint8_t BMI_ACC_CONF_VALUE = BMI_ACC_PERF | (BMI_ACC_BWP_NORM << 4) | BMI_ACC_ODR_800;
+
+static const uint8_t  BMI_FIFO_DOWNS_VALUE = 0x80;   // acc_fifo_filt_data, no downsampling
+static const uint8_t  BMI_FIFO_CONF0_VALUE = 0x00;   // overwrite oldest when full, no sensortime
+static const uint8_t  BMI_FIFO_CONF1_VALUE = 0x40;   // acc_en, header off
+static const uint16_t BMI_FIFO_FRAME_BYTES = 6;
+static const uint16_t BMI_FIFO_MAX_FRAMES  = 6144 / BMI_FIFO_FRAME_BYTES;
+// Frames per FIFO_DATA read: Wire's buffer on this core is 128 bytes.
+static const uint16_t BMI_FIFO_READ_FRAMES = 20;
 
 // Why the last bmiBegin() failed, for the serial banner.
 static const char* bmiError = "";
@@ -159,6 +179,9 @@ static bool bmiBegin() {
   bmiWrite(BMI_INT1_IO_CTRL, 0x0A);             // output_en | active high, push-pull
   bmiWrite(BMI_INT_LATCH, 0x00);                // non-latched
   bmiWrite(BMI_INT_MAP_DATA, 0x04);             // drdy -> INT1
+  bmiWrite(BMI_FIFO_DOWNS, BMI_FIFO_DOWNS_VALUE);
+  bmiWrite(BMI_FIFO_CONFIG_0, BMI_FIFO_CONF0_VALUE);
+  bmiWrite(BMI_FIFO_CONFIG_1, BMI_FIFO_CONF1_VALUE);
   bmiWrite(BMI_PWR_CONF, 0x02);                 // adv_power_save off, fifo_self_wakeup on
   delay(2);
 
@@ -168,6 +191,10 @@ static bool bmiBegin() {
   if (conf != BMI_ACC_CONF_VALUE) return bmiFail("ACC_CONF read back", conf);
   uint8_t range = bmiRead8(BMI_ACC_RANGE);
   if (range != BMI_ACC_RANGE_16G) return bmiFail("ACC_RANGE read back", range);
+  uint8_t fifo1 = bmiRead8(BMI_FIFO_CONFIG_1);
+  if (fifo1 != BMI_FIFO_CONF1_VALUE) return bmiFail("FIFO_CONFIG_1 read back", fifo1);
+  uint8_t downs = bmiRead8(BMI_FIFO_DOWNS);
+  if (downs != BMI_FIFO_DOWNS_VALUE) return bmiFail("FIFO_DOWNS read back", downs);
   uint8_t err = bmiRead8(BMI_ERR_REG);
   if (err != 0) return bmiFail("ERR_REG", err);
   return true;
@@ -180,6 +207,31 @@ static void bmiReadAccelRaw(int16_t* x, int16_t* y, int16_t* z) {
   *x = (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
   *y = (int16_t)((uint16_t)b[2] | ((uint16_t)b[3] << 8));
   *z = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
+}
+
+// Whole frames waiting in the FIFO, or -1 if the bus did not answer.
+static int32_t bmiFifoFrames() {
+  uint8_t b[2];
+  if (!bmiRead(BMI_FIFO_LENGTH_0, b, 2)) return -1;
+  uint16_t bytes = (uint16_t)b[0] | ((uint16_t)(b[1] & 0x3F) << 8);
+  return bytes / BMI_FIFO_FRAME_BYTES;
+}
+
+// Pops n (<= BMI_FIFO_READ_FRAMES) frames, oldest first, into x/y/z.
+static bool bmiFifoRead(uint16_t n, int16_t* x, int16_t* y, int16_t* z) {
+  uint8_t b[BMI_FIFO_READ_FRAMES * BMI_FIFO_FRAME_BYTES];
+  if (!bmiRead(BMI_FIFO_DATA, b, n * BMI_FIFO_FRAME_BYTES)) return false;
+  for (uint16_t i = 0; i < n; i++) {
+    const uint8_t* f = &b[i * BMI_FIFO_FRAME_BYTES];
+    x[i] = (int16_t)((uint16_t)f[0] | ((uint16_t)f[1] << 8));
+    y[i] = (int16_t)((uint16_t)f[2] | ((uint16_t)f[3] << 8));
+    z[i] = (int16_t)((uint16_t)f[4] | ((uint16_t)f[5] << 8));
+  }
+  return true;
+}
+
+static bool bmiFifoFlush() {
+  return bmiWrite(BMI_CMD, 0xB0);
 }
 
 // Before "off" (light sleep): the BMI270 is powered straight from 3V3 and would keep

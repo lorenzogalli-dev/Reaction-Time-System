@@ -116,10 +116,14 @@ Each step has a pass criterion. Do not move on until it passes.
    If DROPPED > 0, the BMI270's data-ready edges are being missed. Report it,
    because the read/INT behaviour may need changing.
 3. **Start on the bench**, with `b` and with the button:
-   - The dump has `GAPS,1`, `MAXGAP` ~12 ms. That one gap is the pre-roll
-     replay at "set", the same as on the XIAO.
-   - More gaps around "Set"/"Go" means the display is stealing samples.
-     Lower `DRAW_BUDGET_US`.
+   - The dump has **`GAPS,0`** and `DROPPED,0`. Since the FIFO change
+     (below) a busy loop can no longer lose samples, so not even the pre-roll
+     replay at "set" leaves a gap any more.
+   - The result block prints `Sampling : backlog max N samples (M ms), ...`.
+     Expect N ~64 (the ~80 ms replay at "set"): that is the FIFO absorbing
+     the stall. `resyncs` must be 0.
+   - `GAPS` > 0 with a small backlog would mean the BMI270 itself stopped
+     producing samples (not the loop). Report it.
 4. **Storage.** Run 2–3 starts and power cycle. Then:
    - `pull_captures.py` gets them all;
    - `L` lists them;
@@ -135,6 +139,27 @@ Each step has a pass criterion. Do not move on until it passes.
 6. **No host.** Plug into a laptop with no terminal open and run a start. After
    the result, the board must answer the button within ~1 s.
 7. **Real starts.** Block starts with an athlete: `GAPS,1`, sensible verdicts.
+
+## Samples come from the FIFO (2026-10-07)
+
+The first block starts (`Data/block_starts_071026/`, captured by the
+colleague) lost samples to the loop: ~63 at "set" (the pre-roll replay takes
+~80 ms here, the C3 has no FPU) and 3 every 2.000 s, a stall that is not in
+this sketch. One of those holes fell on a push-off. Now:
+- the BMI270 FIFO holds every sample (1.28 s of room), read in bursts;
+- INT1 is only a clock: the ISR queues one stamp per edge, and each FIFO
+  frame is paired with its own stamp (`serviceSampling()`);
+- a stamp the ISR could not take is interpolated on the sensor's period and
+  counted in `DROPPED`; an overrun (only possible in a >1.2 s stall: the
+  flash write and the dump, never during a start) restarts both queues and
+  shows as a gap.
+
+Checked in simulation against the real pairing code (80 ms, 5 ms and 0.7 s
+stalls, with and without interrupts): every sample, in order, within 1 µs.
+Not yet run on hardware.
+
+Use **this folder's** `Python_Tools/capture.py`, not the XIAO's: the XIAO's
+one warns about `SENSOR`/`ODR` and leaves them out of the CSV.
 
 ## Before this data can be compared with the XIAO's
 
