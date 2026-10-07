@@ -3,6 +3,74 @@
 Last updated: 2026-10-07. Written for an agent starting with no prior context.
 Sections are newest first.
 
+## READ THIS FIRST — 2026-10-07 (night): first ESP32 block starts, samples now from the FIFO, BMI270 init taken from the colleague's board
+
+The section below ("compiles, never run") is out of date: the colleague ran
+the ESP32 start unit on their PCB on 07/10. Three things happened after it.
+Details are in `Arduino/AlgorithmRealTimeESP32/INFO.md`; this is the summary.
+
+### 1. First data from the ESP32 (commit `9f4dbdb`)
+4 block starts in `Arduino/AlgorithmRealTimeESP32/Data/block_starts_071026/`,
+plus the schematic, layout and 3D view in `Arduino/AlgorithmRealTimeESP32/pcb/`
+(no I2C pull-ups on the PCB: at 400 kHz it relies on the breakout's).
+- 803.2 Hz, ISR stamp jitter 0.6 µs, `DROPPED` 0.
+- **~80 ms hole at "set"**: `setupDetectorFromPreroll()` replays ~2400
+  samples in one call, and the C3 has no FPU (on the XIAO it takes ~12 ms).
+- **~5 ms hole (3 samples) every 2.000 s.** The cause is not in the sketch
+  (core/RTOS or the BMI270 itself). One fell on an onset (run 173110).
+- Resting noise ~5.5 mg, against ~2 mg on the XIAO.
+- The colleague used the XIAO's `capture.py` (harmless `SENSOR`/`ODR`
+  warnings). From now on, use the one in `AlgorithmRealTimeESP32/Python_Tools/`.
+
+These runs were made with the pre-FIFO sketch and the colleague's own
+`Bmi270.h` (see 3).
+
+### 2. Samples from the BMI270 FIFO (commit `d00f1ef`)
+The fix for both holes: every sample goes through the FIFO (1.28 s of room),
+INT1 is only a clock (the ISR queues one stamp per edge) and each frame is
+paired with its own stamp. The set replay is left as it is: the FIFO absorbs
+it. Checked in simulation; **never run on hardware.**
+
+### 3. BMI270 init as on the colleague's board (commit `b842e4b`)
+The colleague told us that our `Bmi270.h` did not work on their board and
+that they had changed it. Their file (based on `5abff46`, before the FIFO)
+was compared line by line. The changes that matter:
+- **no `i2cBusRecover()` before `Wire.begin`**;
+- `delay(10)` after `Wire.begin`;
+- 5 ms after the soft reset instead of 2;
+- every write checked, debug prints.
+
+All four are now in the FIFO version, with the prints in English and
+only during init (`BMI270,<step>,0x..` lines at boot), never on the sample
+path. Registers and the sample path are unchanged. Compiles (27% flash,
+48% RAM). **Not run on hardware.**
+
+Which of the first three changes made their board work is not known. Ask
+the colleague what `IMU error - BMI270: <step>` said with the old file.
+Without the recovery, a reset during a read (upload, reset button, crash) can
+leave SDA held low: the boot then shows `chip id` 0xFF, and unplugging the
+power fixes it. Re-enable the recovery only when the init is stable, one
+change at a time.
+
+**The colleague must not use their own file:** it has no FIFO functions,
+and the current `.ino` would not compile with it.
+
+### Open, in order
+1. The next ESP32 capture with the current repo (`.ino` + `Bmi270.h`): pass =
+   `GAPS,0`, `DROPPED,0`, no resyncs. If gaps remain with a small FIFO
+   backlog, it is the BMI270 itself that pauses.
+2. The rest of INFO.md "Before this data can be compared": the filter's fixed
+   delay, `settled_mg` and `sweep_threshold.py` (more noise), the buzzer
+   latency.
+3. ESP-NOW LR in this sketch, and the rate test repeated with the radio on.
+
+### XIAO, same day (commit `8013690`)
+25 block starts with v5 in `Arduino/AlgorithmRealTime/Data/block_starts_071026/`
+(plus two bench runs from 29/09 in `Data/board/`). They match the Python era:
+863.6 Hz, 22 µs jitter, 1 gap at set, board == offline detector. The median
+reaction time is higher (173 ms), but that is the athlete and the setup, not
+timing: push-off time is unchanged. This is the reference the ESP32 has to match.
+
 ## READ THIS FIRST — 2026-10-07: the start unit ported to ESP32-C3 SuperMini + BMI270, compiles, never run
 
 The team wants two MCUs instead of three: drop the XIAO at the start and
