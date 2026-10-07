@@ -118,6 +118,9 @@ static bool bmiFail(const char* why, uint8_t value) {
 // A reset of the C3 in the middle of a read can leave the BMI270 holding SDA
 // low, and then nothing on the bus answers until power is cycled. Nine clocks
 // let it finish the byte it was sending and release the line.
+// NOT called at the moment: the colleague's board only came up on 07/10 with
+// it left out (together with the two longer delays in bmiBegin), and which of
+// the three it was is not known yet. Keep it out until that is measured.
 static void i2cBusRecover() {
   pinMode(IMU_SDA_PIN, INPUT_PULLUP);
   pinMode(IMU_SCL_PIN, INPUT_PULLUP);
@@ -131,26 +134,43 @@ static void i2cBusRecover() {
   pinMode(IMU_SCL_PIN, INPUT_PULLUP);
 }
 
+// Init-time only: one line per step on serial, so a board that does not come
+// up says where it stopped. Never used on the sample path.
+static void bmiLog(const char* step, uint8_t value) {
+  Serial.printf("BMI270,%s,0x%02X\n", step, value);
+}
+
+// Writes one register and fails bmiBegin() with the step name if the bus
+// does not ACK.
+static bool bmiInitWrite(const char* step, uint8_t reg, uint8_t v) {
+  if (bmiWrite(reg, v)) return true;
+  bmiLog(step, v);
+  return bmiFail(step, v);
+}
+
 // Full power-up: soft reset, config upload, accelerometer only. ~200 ms.
+// Delays and per-write checks as in the colleague's version that worked on
+// the PCB on 07/10 (10 ms after Wire.begin, 5 ms after the soft reset).
 static bool bmiBegin() {
-  i2cBusRecover();
   // The internal pull-ups (~45 kOhm) are what Wire enables; at 400 kHz they
-  // are only enough if the breakout carries its own. INFO.md says how to tell.
+  // are only enough if the breakout carries its own (the PCB has none).
   Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN, 400000);
+  delay(10);
 
   uint8_t id = bmiRead8(BMI_CHIP_ID);
+  bmiLog("chip_id", id);
   if (id != BMI_CHIP_ID_VALUE) return bmiFail("chip id (wiring, 0x68/0x69, CS high?)", id);
 
-  bmiWrite(BMI_CMD, 0xB6);          // soft reset
-  delay(2);
+  if (!bmiInitWrite("soft reset", BMI_CMD, 0xB6)) return false;
+  delay(5);
 
   // Config upload, Bosch's sequence: advanced power save off (it otherwise
   // needs 450 us between writes), INIT_CTRL 0, blob in bursts at INIT_ADDR
   // (counted in 16-bit words), INIT_CTRL 1, then wait for the chip to report
   // it is running it.
-  if (!bmiWrite(BMI_PWR_CONF, 0x00)) return bmiFail("PWR_CONF write", 0);
+  if (!bmiInitWrite("PWR_CONF write", BMI_PWR_CONF, 0x00)) return false;
   delayMicroseconds(450);
-  bmiWrite(BMI_INIT_CTRL, 0x00);
+  if (!bmiInitWrite("INIT_CTRL 0", BMI_INIT_CTRL, 0x00)) return false;
   // 32 data bytes per burst: Wire's buffer on this core is 128, and the
   // register byte has to fit in the same transmission.
   const uint16_t CHUNK = 32;
@@ -158,10 +178,11 @@ static bool bmiBegin() {
     uint8_t addr[2] = {(uint8_t)((i / 2) & 0x0F), (uint8_t)((i / 2) >> 4)};
     if (!bmiWriteBurst(BMI_INIT_ADDR_0, addr, 2) ||
         !bmiWriteBurst(BMI_INIT_DATA, &bmi270_config_file[i], CHUNK)) {
+      bmiLog("config upload", (uint8_t)(i >> 8));
       return bmiFail("config upload", (uint8_t)(i >> 8));
     }
   }
-  bmiWrite(BMI_INIT_CTRL, 0x01);
+  if (!bmiInitWrite("INIT_CTRL 1", BMI_INIT_CTRL, 0x01)) return false;
 
   uint8_t st = 0;
   uint32_t t0 = millis();
@@ -170,32 +191,40 @@ static bool bmiBegin() {
     st = bmiRead8(BMI_INTERNAL_STATUS) & 0x0F;
     if (st == 0x01) break;
   }
+  bmiLog("internal_status", st);
   if (st != 0x01) return bmiFail("INTERNAL_STATUS (config not accepted)", st);
 
   // Accelerometer only, performance mode.
-  bmiWrite(BMI_PWR_CTRL, 0x04);                 // acc_en
-  bmiWrite(BMI_ACC_CONF, BMI_ACC_CONF_VALUE);
-  bmiWrite(BMI_ACC_RANGE, BMI_ACC_RANGE_16G);
-  bmiWrite(BMI_INT1_IO_CTRL, 0x0A);             // output_en | active high, push-pull
-  bmiWrite(BMI_INT_LATCH, 0x00);                // non-latched
-  bmiWrite(BMI_INT_MAP_DATA, 0x04);             // drdy -> INT1
-  bmiWrite(BMI_FIFO_DOWNS, BMI_FIFO_DOWNS_VALUE);
-  bmiWrite(BMI_FIFO_CONFIG_0, BMI_FIFO_CONF0_VALUE);
-  bmiWrite(BMI_FIFO_CONFIG_1, BMI_FIFO_CONF1_VALUE);
-  bmiWrite(BMI_PWR_CONF, 0x02);                 // adv_power_save off, fifo_self_wakeup on
+  if (!bmiInitWrite("PWR_CTRL", BMI_PWR_CTRL, 0x04) ||                 // acc_en
+      !bmiInitWrite("ACC_CONF", BMI_ACC_CONF, BMI_ACC_CONF_VALUE) ||
+      !bmiInitWrite("ACC_RANGE", BMI_ACC_RANGE, BMI_ACC_RANGE_16G) ||
+      !bmiInitWrite("INT1_IO_CTRL", BMI_INT1_IO_CTRL, 0x0A) ||        // output_en | active high, push-pull
+      !bmiInitWrite("INT_LATCH", BMI_INT_LATCH, 0x00) ||              // non-latched
+      !bmiInitWrite("INT_MAP_DATA", BMI_INT_MAP_DATA, 0x04) ||        // drdy -> INT1
+      !bmiInitWrite("FIFO_DOWNS", BMI_FIFO_DOWNS, BMI_FIFO_DOWNS_VALUE) ||
+      !bmiInitWrite("FIFO_CONFIG_0", BMI_FIFO_CONFIG_0, BMI_FIFO_CONF0_VALUE) ||
+      !bmiInitWrite("FIFO_CONFIG_1", BMI_FIFO_CONFIG_1, BMI_FIFO_CONF1_VALUE) ||
+      !bmiInitWrite("PWR_CONF final", BMI_PWR_CONF, 0x02)) {          // adv_power_save off, fifo_self_wakeup on
+    return false;
+  }
   delay(2);
 
   // Read back what the measurement depends on: a register the chip refused
   // (an invalid ODR/bandwidth combination is silently replaced) must not pass.
   uint8_t conf = bmiRead8(BMI_ACC_CONF);
+  bmiLog("acc_conf", conf);
   if (conf != BMI_ACC_CONF_VALUE) return bmiFail("ACC_CONF read back", conf);
   uint8_t range = bmiRead8(BMI_ACC_RANGE);
+  bmiLog("acc_range", range);
   if (range != BMI_ACC_RANGE_16G) return bmiFail("ACC_RANGE read back", range);
   uint8_t fifo1 = bmiRead8(BMI_FIFO_CONFIG_1);
+  bmiLog("fifo_config_1", fifo1);
   if (fifo1 != BMI_FIFO_CONF1_VALUE) return bmiFail("FIFO_CONFIG_1 read back", fifo1);
   uint8_t downs = bmiRead8(BMI_FIFO_DOWNS);
+  bmiLog("fifo_downs", downs);
   if (downs != BMI_FIFO_DOWNS_VALUE) return bmiFail("FIFO_DOWNS read back", downs);
   uint8_t err = bmiRead8(BMI_ERR_REG);
+  bmiLog("err_reg", err);
   if (err != 0) return bmiFail("ERR_REG", err);
   return true;
 }

@@ -104,8 +104,22 @@ Each step has a pass criterion. Do not move on until it passes.
    - `flash: ... 0/25 run slots used`.
 
    If you get `IMU error - BMI270: <step>`, the step names the problem:
-   - `chip id` → wiring, address or CS;
-   - `INTERNAL_STATUS` → config upload.
+   - `chip id` → wiring, address or CS. If it reads `0xFF` right after an
+     upload or a reset, unplug and replug the power first: the bus recovery at
+     boot is off (see below), so a BMI270 caught mid-read can still be
+     holding SDA low;
+   - `INTERNAL_STATUS` → config upload;
+   - any other name → that register write was not ACKed.
+
+   The init also prints one `BMI270,<step>,0x..` line per step (chip id,
+   internal status, read-backs), so a board that does not come up shows
+   where it stopped.
+
+   Init as in the colleague's version that worked on the PCB on 07/10:
+   10 ms after `Wire.begin`, 5 ms after the soft reset, and no
+   `i2cBusRecover()` before `Wire.begin`. Which of the three made the
+   difference is not known; re-enable the recovery only once the init is
+   stable, and one change at a time.
 2. **Rate.** Run `python3 Arduino/AlgorithmRealTimeESP32/Python_Tools/verify_rate.py`.
    Pass:
    - rate within 5% of 800 (the real value is the BMI270 oscillator's; write it down);
