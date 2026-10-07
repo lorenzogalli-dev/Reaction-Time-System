@@ -139,8 +139,11 @@ static void tftBegin() {
     // No MISO: the display never answers. 8 MHz is what the XIAO ran, so the
     // draw costs measured there (GAPS, DRAW_BUDGET_US) carry over; the panel
     // itself is specified to ~15 MHz if more speed is ever needed.
+    // Mode 3, not 0: SCK is on GPIO8, which also sinks the SuperMini's blue
+    // LED from 3V3. Mode 0 idles the clock LOW and would keep the LED lit; mode
+    // 3 idles it HIGH. The ST7735 samples on the rising edge in both.
     SPI.begin(TFT_SCK_PIN, -1, TFT_MOSI_PIN, -1);
-    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE3));
     tftReady = true;
   }
 

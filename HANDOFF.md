@@ -25,17 +25,23 @@ each with a pass criterion. In short:
   ODR and range. The data-ready timestamp is now taken **in the ISR**
   (esp_timer, 1 µs). The buzzer uses LEDC running continuously plus GPIO-matrix
   routing and inversion, so it is still 2 register writes at the beep, and the
-  pins rest HIGH. Storage uses the internal flash. "Off" is deep sleep, woken
-  by a button on GPIO1. The dump gains `SENSOR,bmi270` / `ODR,800`.
-- Pins (in `Pins.h`):
+  pins rest HIGH. Storage uses the internal flash. "Off" is light sleep,
+  woken by the button on GPIO9. The dump gains `SENSOR,bmi270` / `ODR,800`.
+- Pins (in `Pins.h`), changed the same day to the user's board layout:
 
   | Signal | GPIO |
   |---|---|
   | I2C SDA / SCL | 0 / 3 (the colleague's choice) |
-  | BMI270 INT1 | 2 (**must be wired**) |
-  | Button | 1 |
-  | Piezo (+) / (−) | 8 / 9 |
-  | TFT SCK / MOSI / CS / DC / RES / BL | 4 / 6 / 7 / 5 / 10 / 20 |
+  | BMI270 INT1 | 20 (**must be wired**; not 21, the ROM's boot-log TX) |
+  | Button | 9 (= BOOT) |
+  | Piezo (+) / (−) | 1 / 2 |
+  | TFT SCK / MOSI / CS / DC(RS) / RES / BL(LEDA) | 8 / 10 / 7 / 6 / 5 / 4 |
+
+  Consequences: GPIO9 cannot wake deep sleep, so "off" is now **light
+  sleep**, and an accepted 1.5 s hold restarts the chip after the release
+  (held across a reset, GPIO9 enters download mode). SCK on GPIO8 shares the
+  blue LED, so the display runs SPI mode 3 (clock idles HIGH, LED off).
+  Mode 3 on this panel is unverified; fallback `SPI_MODE0`.
 
   BMI270 CS goes to 3V3 and SDO to GND (address 0x68).
 - C3 USB serial with a laptop attached but no terminal open: writes would

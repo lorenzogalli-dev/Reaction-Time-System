@@ -182,7 +182,7 @@ static void bmiReadAccelRaw(int16_t* x, int16_t* y, int16_t* z) {
   *z = (int16_t)((uint16_t)b[4] | ((uint16_t)b[5] << 8));
 }
 
-// Before deep sleep: the BMI270 is powered straight from 3V3 and would keep
+// Before "off" (light sleep): the BMI270 is powered straight from 3V3 and would keep
 // sampling at 800 Hz (~0.2 mA). Accelerometer off + advanced power save is
 // a few uA. The next boot does a full bmiBegin() anyway.
 static void bmiSleep() {

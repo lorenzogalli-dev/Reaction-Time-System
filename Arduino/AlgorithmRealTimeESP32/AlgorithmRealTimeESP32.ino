@@ -5,6 +5,8 @@
 #include "Display.h"
 #include "Storage.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
+#include "esp_attr.h"
 #include "esp_rom_gpio.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -23,7 +25,8 @@ static StartDetector detector;
 //   - Buzzer: nRF PWM -> LEDC + GPIO-matrix inversion (still two register
 //     writes at the instant of the beep). Pins rest HIGH, not LOW.
 //   - Display: mbed::SPI -> SPIClass. Storage: QSPI -> internal flash.
-//   - Off: nRF System OFF -> ESP32 deep sleep, woken by the button.
+//   - Off: nRF System OFF -> ESP32 light sleep, woken by the button (on
+//     GPIO9, which cannot wake deep sleep), then a restart.
 //   - Dump header gains SENSOR,bmi270 and ODR,800 so a capture says where it
 //     came from.
 // StartDetector.h and AicPicker.h are byte-identical to the XIAO's. Wiring,
@@ -277,7 +280,7 @@ static const uint32_t TAIL_AFTER_GO_MS = 1000;
 //              already cannot supply.
 //   PWM      - not tone(). See beep() for why that matters to the measurement.
 //
-// WIRING: buzzer (+) -> GPIO8, buzzer (-) -> GPIO9. No connection to GND.
+// WIRING: buzzer (+) -> GPIO1, buzzer (-) -> GPIO2. No connection to GND.
 // 4000 Hz is this buzzer's measured resonance, not a round number. A frequency
 // sweep on 2026-09-11 (Arduino/BuzzerSweep) found a clear peak at 4000 Hz with
 // weaker secondary modes at 1600 and 4700; the previous 3000 Hz sat off the
@@ -465,30 +468,28 @@ static void IRAM_ATTR drdyIsr() {
   drdyPending = true;
 }
 
+// Survives esp_restart(), not a power-up (whose garbage is rejected by the
+// magic value): tells setup() that the restart is a switch-on from "off"
+// (see enterSystemOff).
+static RTC_NOINIT_ATTR uint32_t wakeMagic;
+static const uint32_t WAKE_MAGIC = 0x50524F31;   // "PRO1"
+
 void setup() {
-  // Why this boot happened, read before anything else. A GPIO wake = a
-  // button press woke the chip from deep sleep (see enterSystemOff);
-  // everything else - plugging in, an upload, the reset button - is a
-  // deliberate "on".
-  bool wokeFromOff = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
+  // Why this boot happened, read before anything else. A restart from
+  // enterSystemOff = the button switched the board back on (hold and beep are
+  // already done); everything else - plugging in, an upload, the reset
+  // button - is a deliberate "on" too, just not from a button.
+  bool wokeFromOff = (esp_reset_reason() == ESP_RST_SW && wakeMagic == WAKE_MAGIC);
+  wakeMagic = 0;
   // Pads frozen for the sleep (enterSystemOff) are handed back first.
-  gpio_deep_sleep_hold_dis();
   gpio_hold_dis((gpio_num_t)TFT_BL_PIN);
-  gpio_hold_dis((gpio_num_t)BUTTON_PIN);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   // Backlight driven low before anything else: after the reset its pin floats,
   // and through the module's Q1 a floating pin can light the panel.
   pinMode(TFT_BL_PIN, OUTPUT);
   digitalWrite(TFT_BL_PIN, LOW);
-  // A press only wakes the chip; staying on takes the full 1.5 s hold, so a
-  // knock in the bag does not leave it running. Nothing is shown until then:
-  // a short press on a board that is off should look like nothing happened.
   buzzerInit();
-  if (wokeFromOff) {
-    if (!holdToWake()) enterSystemOff();
-    powerBeep();
-  }
   tftBegin();
 
   // USB Serial/JTAG (HWCDC): the baud rate is ignored, USB sets the speed.
@@ -945,9 +946,9 @@ static bool serviceSampling() {
 // phase of the 4 kHz wave relative to that instant is random (0-125 us);
 // on the XIAO the sequence restarted from a fixed phase.
 //
-// Rest HIGH, not LOW as on the XIAO: GPIO8 also drives the SuperMini's blue
-// LED to 3V3, which LOW would light the whole time. Both pins at the same level
-// is what keeps the piezo free of DC bias; which level does not matter.
+// Rest HIGH, not LOW as on the XIAO: chosen when the buzzer was on GPIO8, which
+// also drives the SuperMini's blue LED to 3V3. On GPIO1/2 either level would
+// do; both pins at the same level is what keeps the piezo free of DC bias.
 static const ledc_timer_t   BUZZER_TIMER = LEDC_TIMER_3;     // far end, as PWM2 was
 static const ledc_channel_t BUZZER_CH    = LEDC_CHANNEL_5;
 static const uint32_t BUZZER_SIG = LEDC_LS_SIG_OUT0_IDX + BUZZER_CH;
@@ -1388,18 +1389,32 @@ static void showResultFooter(const char* text) {
 }
 
 // ===========================================================================
-// Power: "off" is the ESP32-C3's deep sleep - CPU and RAM off, woken by the
-// button. Waking is a reset: setup() sees a GPIO wake-up and asks for the
-// 1.5 s hold before going on. NOT a few uA as on the XIAO: the SuperMini's
-// red power LED and its regulator stay on (see INFO.md).
+// Power: "off" is the ESP32-C3's light sleep - CPU paused, RAM kept, woken by
+// the button. Not deep sleep: only GPIO0-5 can wake that, and the button is on
+// GPIO9. A press must then be held 1.5 s (dark until then, beep when accepted)
+// or the chip goes straight back to sleep. Accepted -> wait for the release
+// and restart, so "on" always runs the same setup() as a power-up. The release
+// comes first because GPIO9 is the BOOT strap: held across the reset it would
+// enter download mode. Light sleep costs more than deep sleep (~0.1-0.2 mA),
+// but the SuperMini's red power LED, always on, costs more than either.
 // ===========================================================================
 
-// Called in setup() after a wake, display still off. True once the button
-// has been held LONG_PRESS_MS, counted from boot so the press that woke the
-// chip counts (the C3 adds its own ~0.1-0.3 s of boot before this runs, so
-// the hold felt is a little longer). Released early -> false, back to sleep.
+static void waitButtonRelease() {
+  for (;;) {
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+      delay(BUTTON_DEBOUNCE_MS);
+      if (digitalRead(BUTTON_PIN) == HIGH) return;
+    }
+    delay(5);
+  }
+}
+
+// After a wake, display still off. True once the button has been held
+// LONG_PRESS_MS from the wake (light sleep wakes in ~1 ms, so the press that
+// woke the chip counts in full). Released early -> false, back to sleep.
 static bool holdToWake() {
-  while (millis() < LONG_PRESS_MS) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < LONG_PRESS_MS) {
     if (digitalRead(BUTTON_PIN) == HIGH) {
       delay(BUTTON_DEBOUNCE_MS);
       if (digitalRead(BUTTON_PIN) == HIGH) return false;
@@ -1411,29 +1426,35 @@ static bool holdToWake() {
 
 static void enterSystemOff() {
   tftSleep();
-  // The backlight pin would float in deep sleep, and through the module's Q1
-  // a floating pin can light the panel: freeze it LOW (tftSleep drove it so).
+  // Freeze the backlight LOW: a pad left to the sleep's own configuration
+  // could float, and through the module's Q1 a floating pin lights the panel.
   gpio_hold_en((gpio_num_t)TFT_BL_PIN);
-  gpio_deep_sleep_hold_en();
-  if (imuReady) bmiSleep();         // the BMI270 is on 3V3, not on a GPIO
+  if (imuReady) {
+    detachInterrupt(digitalPinToInterrupt(IMU_INT1_PIN));
+    bmiSleep();                     // the BMI270 is on 3V3, not on a GPIO
+  }
   buzzerDriveOff();
   ledc_stop(LEDC_LOW_SPEED_MODE, BUZZER_CH, 1);
-  // Wait for the release: armed while still held, the press that asked for
-  // "off" would wake the chip again at once.
-  for (;;) {
-    if (digitalRead(BUTTON_PIN) == HIGH) {
-      delay(BUTTON_DEBOUNCE_MS);
-      if (digitalRead(BUTTON_PIN) == HIGH) break;
-    }
-    delay(5);
-  }
-  // GPIO0-5 keep their pull-ups through deep sleep on the C3; a LOW level on
-  // the button pin is what wakes it.
-  gpio_pullup_en((gpio_num_t)BUTTON_PIN);
-  gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
   Serial.flush();
-  esp_deep_sleep_start();
+  // The button keeps its normal input + pull-up through the sleep, and a LOW
+  // level on it is the wake-up.
+  gpio_sleep_sel_dis((gpio_num_t)BUTTON_PIN);
+  gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  for (;;) {
+    // Armed while still held, the press that asked for "off" (or a short one
+    // that did not make it to 1.5 s) would wake the chip again at once.
+    waitButtonRelease();
+    esp_light_sleep_start();
+    if (holdToWake()) break;
+  }
+  gpio_wakeup_disable((gpio_num_t)BUTTON_PIN);
+  buzzerInit();
+  powerBeep();
+  waitButtonRelease();
+  gpio_hold_dis((gpio_num_t)TFT_BL_PIN);
+  wakeMagic = WAKE_MAGIC;
+  esp_restart();
 }
 
 static void shutDown() {

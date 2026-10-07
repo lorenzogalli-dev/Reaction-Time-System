@@ -20,8 +20,13 @@ port only does what the XIAO did. ESP-NOW is the next step, after the tests belo
   arduino-cli upload  --fqbn esp32:esp32:nologo_esp32c3_super_mini -p /dev/cu.usbmodemXXXX Arduino/AlgorithmRealTimeESP32
   ```
   (`arduino-cli` is inside the Arduino IDE app; see BUILD.md.) Last build: 27% flash, 45% RAM.
-- If the board is off (deep sleep) the USB port is gone. Switch it on, or hold
-  BOOT, tap RESET, release BOOT, then upload.
+- If the board is off (light sleep) the USB port is gone. Switch it on, or hold
+  the button (or BOOT, same pin), tap RESET, release, then upload.
+- On this Mac (2026-10-07) Arduino's `ctags` is x86 and there is no Rosetta.
+  `--build-property tools.ctags.pattern=/usr/bin/true` is not enough for this
+  sketch: it relies on the prototypes ctags generates. Either install Rosetta
+  (`softwareupdate --install-rosetta`), which the IDE needs too, or compile a
+  scratch copy with the prototypes added (how the pin change was checked).
 - Python tools: `Python_Tools/` here, not the XIAO's. Their default is 800 Hz,
   and they write `sensor: bmi270` / `odr_hz: 800` into every CSV.
 
@@ -33,36 +38,40 @@ port only does what the XIAO did. ESP-NOW is the next step, after the tests belo
 | BMI270 | GND | GND | |
 | BMI270 | SDA | **GPIO0** | |
 | BMI270 | SCL | **GPIO3** | |
-| BMI270 | INT1 | **GPIO2** | data-ready. **Required**: the sampling runs off it |
+| BMI270 | INT1 | **GPIO20** | data-ready. **Required**: the sampling runs off it |
 | BMI270 | SDO | GND | address **0x68** (SDO to 3V3 makes it 0x69) |
 | BMI270 | CS | **3V3** | selects I2C; a floating CS can switch the chip to SPI |
 | BMI270 | INT2, OCS, OSDO, SCX, SDX | — | unconnected |
 | Display | 1 GND | GND | |
 | Display | 2 VCC | 3V3 | not 5V |
-| Display | 3 SCK | **GPIO4** | |
-| Display | 4 SDA | **GPIO6** | SPI MOSI, not I2C |
-| Display | 5 RES | **GPIO10** | |
-| Display | 6 RS | **GPIO5** | data/command |
+| Display | 3 SCK | **GPIO8** | |
+| Display | 4 SDA | **GPIO10** | SPI MOSI, not I2C |
+| Display | 5 RES | **GPIO5** | |
+| Display | 6 RS | **GPIO6** | data/command |
 | Display | 7 CS | **GPIO7** | |
-| Display | 8 LEDA | **GPIO20** | backlight |
+| Display | 8 LEDA | **GPIO4** | backlight |
 | Display | 9–14 | — | unconnected |
-| Button | one side / other | **GPIO1** / GND | INPUT_PULLUP |
-| Piezo | (+) / (−) | **GPIO8** / **GPIO9** | antiphase, no GND |
+| Button | one side / other | **GPIO9** / GND | INPUT_PULLUP, same pin as BOOT |
+| Piezo | (+) / (−) | **GPIO1** / **GPIO2** | antiphase, no GND |
 
 Free: GPIO21. All pins are in `Pins.h`.
 
-Why this map:
-- **Button on GPIO1.** Only GPIO0–5 can wake the C3 from deep sleep, and 0 and
-  3 are taken by I2C.
-- **Piezo on 8/9.** These are strapping pins, but a piezo is a capacitor and
-  does not pull them at reset. Side effects:
-  - The blue LED on GPIO8 glows during every beep.
-  - **Do not press BOOT** (GPIO9) while the firmware runs.
-  - The pins rest HIGH, not LOW, so the LED stays off at rest.
-- **SPI on 4/6/7.** These are the board's own SCK/MOSI/SS. The display's
-  "SDA/SCK" labels are SPI, despite the names.
-- **INT1 on GPIO2.** It is a strapping pin, but it only matters for download
-  mode, and the BMI270 keeps INT1 high-Z until it is configured.
+Why this map (the user's layout, 2026-10-07; an earlier one had the button on
+1, INT1 on 2, the piezo on 8/9 and the display on 4/5/6/7/10/20):
+- **Button on GPIO9**, the BOOT pin. Only GPIO0–5 can wake the C3 from deep
+  sleep, so "off" is **light sleep**, which any pin can wake. Side effect:
+  the button held while plugging in or resetting enters download mode (dark
+  screen). Release and reset.
+- **INT1 on GPIO20, not 21.** The ROM prints its boot log on GPIO21 at every
+  reset; a BMI270 still configured from before the reset would drive INT1
+  against it. GPIO20 is an input at boot.
+- **Piezo on 1/2.** GPIO2 is a strapping pin, but a piezo is a capacitor and
+  does not pull it at reset.
+- **SCK on GPIO8**, which also sinks the blue LED from 3V3. The display runs
+  in **SPI mode 3** so the clock idles HIGH and the LED stays off between
+  draws (it flickers while drawing). If the panel shows garbage in mode 3,
+  go back to `SPI_MODE0` in `Display.h` and accept the LED.
+- SPI goes through the GPIO matrix (8 MHz, well within its limit).
 - **I2C pull-ups.** Only the C3's internal ones (~45 kΩ) are enabled. Measure
   SDA→3V3 on the breakout with power off: 2–10 kΩ means it has its own
   pull-ups. With no pull-ups, add 4.7 kΩ from SDA and from SCL to 3V3.
@@ -77,7 +86,7 @@ Why this map:
 | Buzzer | nRF PWM, antiphase | LEDC always running + GPIO-matrix routing/inversion; still 2 register writes at the beep. Wave phase at the beep is random, 0–125 µs |
 | Display | mbed::SPI 8 MHz | SPIClass 8 MHz, same queue and budget |
 | Storage | external QSPI, nrfx | internal flash, `runs` partition, same 25 × 80 KB slots and format |
-| Off | System OFF, few µA | deep sleep. The SuperMini's red power LED stays on (~mA). BMI270 suspended, backlight held LOW |
+| Off | System OFF, few µA | light sleep (button on GPIO9 cannot wake deep sleep); "on" = restart after the 1.5 s hold. The SuperMini's red power LED stays on (~mA). BMI270 suspended, backlight held LOW |
 | Serial with no terminal | the core drops the data | bounded: writes block ≤ 100 ms, a dump stops if nobody reads for 200 ms (the run is on flash anyway) |
 | Dump header | — | + `SENSOR,bmi270`, `ODR,800` |
 
@@ -118,7 +127,10 @@ Each step has a pass criterion. Do not move on until it passes.
 5. **Power.**
    - Hold 1.5 s: beep, "Nice session today!", screen dark, backlight off.
    - A short press stays off.
-   - A 1.5 s hold switches on, with a beep.
+   - A 1.5 s hold switches on, with a beep; the screen comes up after the
+     release (the board restarts once the button is up, see `enterSystemOff`).
+   - Blue LED off while idle; it only flickers while the screen redraws
+     (SPI mode 3). Screen garbled → `SPI_MODE0` in `Display.h`.
    - Measure the current drawn while off.
 6. **No host.** Plug into a laptop with no terminal open and run a start. After
    the result, the board must answer the button within ~1 s.
