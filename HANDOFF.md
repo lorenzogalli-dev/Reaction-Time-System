@@ -1,7 +1,34 @@
 # HANDOFF — Prostart live IMU data view & sensor evaluation
 
-Last updated: 2026-10-07. Written for an agent starting with no prior context.
+Last updated: 2026-10-08. Written for an agent starting with no prior context.
 Sections are newest first.
+
+## READ THIS FIRST — 2026-10-08: the FIFO version works on hardware
+
+The colleague ran the current repo (`.ino` + `Bmi270.h`, FIFO + new init) on
+their PCB: 2 block starts in
+`Arduino/AlgorithmRealTimeESP32/Data/block_starts_081026/`, plus their plot of
+run 010815 (`plot_010815_aic_pick.jpeg`).
+- Init OK: no `IMU error` at boot.
+- **803.6 Hz, `gaps` 0, `dropped` 0, max interval 1250 µs**, stamp jitter
+  0.55 µs. Both holes of 07/10 (~80 ms at "set", ~5 ms every 2 s) are gone.
+  Open item 1 below is closed.
+- Resting noise 2.8 / 2.3 / 2.9 mg (x/y/z), down from 3.5 / 2.4 / 5.5 on
+  07/10, close to the XIAO's ~2 mg. Which change lowered it is not known.
+- Board == offline detector on both runs, same sample: 177.5 ms and 163.8 ms.
+
+The colleague asked whether AIC should have moved the 010815 line ~5 ms back.
+No: in the 12 ms before it the horizontal signal is 0.6–3.1 mg (rest
+3.2 ± 1.7 mg), then 38 → 188 mg in two samples. On a step that sharp AIC
+and STA/LTA land on the same sample (AIC +0.0 ms). On the 010908 ramp
+AIC moved it -2.5 ms, as it should. The rise that seems to start earlier on
+the plot is matplotlib's line between samples. What does shift every onset is
+the BMI270 filter's fixed delay (`bwp=normal`), still unmeasured.
+
+### Open, in order
+1. The BMI270 filter delay, `settled_mg` and `sweep_threshold.py`, the buzzer
+   latency (INFO.md "Before this data can be compared").
+2. ESP-NOW LR in this sketch, and the rate test repeated with the radio on.
 
 ## READ THIS FIRST — 2026-10-07 (night): first ESP32 block starts, samples now from the FIFO, BMI270 init taken from the colleague's board
 
